@@ -137,8 +137,10 @@ pub struct UsageSnapshot {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub today_tokens: u64,
     pub seven_day_tokens: u64,
     pub cache_hit_rate: Option<f64>,
+    pub failed_requests: u64,
     pub sampled_at: i64,
 }
 

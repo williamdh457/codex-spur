@@ -191,7 +191,11 @@ async fn refresh_quota_for_state(
 
 #[tauri::command]
 async fn get_usage_snapshot(state: State<'_, AppState>) -> Result<domain::UsageSnapshot, String> {
-    Ok(state.proxy.read().await.metrics.snapshot())
+    state
+        .storage
+        .usage_snapshot()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

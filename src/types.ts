@@ -114,8 +114,10 @@ export type UsageSnapshot = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  todayTokens: number;
   sevenDayTokens: number;
   cacheHitRate: number | null;
+  failedRequests: number;
   sampledAt: number;
 };
 

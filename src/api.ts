@@ -116,7 +116,7 @@ export async function listPoolMemberIds(poolId: string): Promise<string[]> {
 
 export async function getUsageSnapshot(): Promise<UsageSnapshot> {
   if (!isTauriRuntime()) {
-    return { requestCount: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, sevenDayTokens: 0, cacheHitRate: null, sampledAt: Date.now() };
+    return { requestCount: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, todayTokens: 0, sevenDayTokens: 0, cacheHitRate: null, failedRequests: 0, sampledAt: Date.now() };
   }
   return invoke<UsageSnapshot>("get_usage_snapshot");
 }

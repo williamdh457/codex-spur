@@ -700,11 +700,13 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "apple-native-keyring-store",
  "axum",
  "directories",
  "getrandom 0.4.3",
  "hex",
  "keyring",
+ "keyring-core",
  "reqwest",
  "secrecy",
  "serde",

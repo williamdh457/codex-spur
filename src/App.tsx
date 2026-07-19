@@ -364,10 +364,10 @@ function UsagePage() {
       <div className="panel__header"><div><h2>本地代理用量</h2><p>按 Codex Spur 本地代理统计；token 是请求体长度估算值，直到上游返回 usage 才会显示精确值。</p></div><button type="button" className="button button--secondary" onClick={() => void reload()}>刷新</button></div>
       <div className="usage-grid">
         <UsageMetric label="请求数" value={format(usage.requestCount)} note="当前代理进程" />
-        <UsageMetric label="今日 token" value={format(usage.totalTokens)} note="本次本地运行" />
+        <UsageMetric label="今日 token" value={format(usage.todayTokens)} note="本地日统计" />
         <UsageMetric label="总 token" value={format(usage.totalTokens)} note="本地累计" />
         <UsageMetric label="7 日 token" value={format(usage.sevenDayTokens)} note="本地累计暂未分日" />
-        <UsageMetric label="缓存命中率" value={usage.cacheHitRate === null ? "暂无数据" : `${(usage.cacheHitRate * 100).toFixed(1)}%`} note="当前未启用缓存统计" />
+        <UsageMetric label="缓存命中率" value={usage.cacheHitRate === null ? "暂无数据" : `${(usage.cacheHitRate * 100).toFixed(1)}%`} note="上游返回 usage 后统计" />
       </div>
       <div className="usage-chart" role="img" aria-label="最近请求用量趋势"><div className="usage-chart__bars"><span style={{ height: `${Math.max(12, Math.min(100, usage.requestCount * 8 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.inputTokens / 20 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.outputTokens / 20 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.totalTokens / 20 + 12))}%` }} /></div><div className="usage-chart__labels"><span>请求</span><span>输入</span><span>输出</span><span>合计</span></div></div>
     </section>

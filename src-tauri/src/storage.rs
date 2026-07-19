@@ -43,6 +43,15 @@ pub struct Lease {
     pub credential_id: String,
 }
 
+pub struct UsageDelta {
+    pub request_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_observations: i64,
+    pub cache_hits: i64,
+    pub failed_requests: i64,
+}
+
 #[allow(dead_code)]
 pub struct Storage {
     pub pool: SqlitePool,
@@ -435,11 +444,28 @@ impl Storage {
                 return Ok(Some(Lease { credential_id: row.get("credential_id") }));
             }
         }
-        let row = sqlx::query("SELECT pm.credential_id FROM pool_members pm JOIN credentials c ON c.id = pm.credential_id WHERE pm.pool_id = ? AND pm.enabled = 1 AND c.healthy = 1 ORDER BY (SELECT COUNT(*) FROM account_leases l WHERE l.credential_id = pm.credential_id AND l.released_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)), pm.priority DESC, pm.created_at LIMIT 1")
-            .bind(pool_id).fetch_optional(&self.pool).await?;
-        let Some(row) = row else { return Ok(None) };
-        let credential_id: String = row.get("credential_id");
-        let id = uuid::Uuid::new_v4().to_string();
+        let candidates = sqlx::query("SELECT pm.credential_id, MAX(pm.weight, 1) AS weight FROM pool_members pm JOIN credentials c ON c.id = pm.credential_id WHERE pm.pool_id = ? AND pm.enabled = 1 AND c.healthy = 1 ORDER BY (SELECT COUNT(*) FROM account_leases l WHERE l.credential_id = pm.credential_id AND l.released_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)), pm.priority DESC, pm.created_at LIMIT 3")
+            .bind(pool_id).fetch_all(&self.pool).await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let total_weight: i64 = candidates
+            .iter()
+            .map(|row| row.get::<i64, _>("weight").max(1))
+            .sum();
+        let selection_seed = uuid::Uuid::new_v4();
+        let mut ticket = u64::from_le_bytes(selection_seed.as_bytes()[..8].try_into().unwrap())
+            % total_weight as u64;
+        let mut credential_id = candidates[0].get::<String, _>("credential_id");
+        for row in candidates {
+            let weight = row.get::<i64, _>("weight").max(1) as u64;
+            if ticket < weight {
+                credential_id = row.get("credential_id");
+                break;
+            }
+            ticket -= weight;
+        }
+        let id = selection_seed.to_string();
         let affinity = affinity_key.map(ToOwned::to_owned);
         sqlx::query("INSERT INTO account_leases (id, pool_id, credential_id, affinity_key, expires_at) VALUES (?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, '+' || ? || ' seconds'))")
             .bind(&id).bind(pool_id).bind(&credential_id).bind(&affinity).bind(ttl_secs).execute(&self.pool).await?;
@@ -455,6 +481,51 @@ impl Storage {
         sqlx::query("UPDATE credentials SET healthy = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(healthy as i64).bind(error).bind(id).execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn record_usage(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        delta: &UsageDelta,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO usage_events (day, provider_id, model_id, request_count, input_tokens, output_tokens, cache_observations, cache_hits, failed_requests) VALUES (date('now','localtime'), ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(day, provider_id, model_id) DO UPDATE SET request_count = request_count + excluded.request_count, input_tokens = input_tokens + excluded.input_tokens, output_tokens = output_tokens + excluded.output_tokens, cache_observations = cache_observations + excluded.cache_observations, cache_hits = cache_hits + excluded.cache_hits, failed_requests = failed_requests + excluded.failed_requests, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(provider_id)
+        .bind(model_id)
+        .bind(delta.request_count)
+        .bind(delta.input_tokens)
+        .bind(delta.output_tokens)
+        .bind(delta.cache_observations)
+        .bind(delta.cache_hits)
+        .bind(delta.failed_requests)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn usage_snapshot(&self) -> Result<crate::domain::UsageSnapshot, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(request_count), 0) AS request_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_observations), 0) AS cache_observations, COALESCE(SUM(cache_hits), 0) AS cache_hits, COALESCE(SUM(failed_requests), 0) AS failed_requests, COALESCE(SUM(CASE WHEN day = date('now','localtime') THEN input_tokens + output_tokens ELSE 0 END), 0) AS today_tokens, COALESCE(SUM(CASE WHEN day >= date('now','localtime', '-6 day') THEN input_tokens + output_tokens ELSE 0 END), 0) AS seven_day_tokens FROM usage_events",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let cache_observations = row.get::<i64, _>("cache_observations");
+        let cache_hit_rate = (cache_observations > 0)
+            .then(|| row.get::<i64, _>("cache_hits") as f64 / cache_observations as f64);
+        Ok(crate::domain::UsageSnapshot {
+            request_count: row.get::<i64, _>("request_count") as u64,
+            input_tokens: row.get::<i64, _>("input_tokens") as u64,
+            output_tokens: row.get::<i64, _>("output_tokens") as u64,
+            total_tokens: (row.get::<i64, _>("input_tokens") + row.get::<i64, _>("output_tokens"))
+                as u64,
+            today_tokens: row.get::<i64, _>("today_tokens") as u64,
+            seven_day_tokens: row.get::<i64, _>("seven_day_tokens") as u64,
+            cache_hit_rate,
+            failed_requests: row.get::<i64, _>("failed_requests") as u64,
+            sampled_at: chrono_like_now(),
+        })
     }
 
     pub async fn save_quota_snapshot(
@@ -585,4 +656,11 @@ fn mask_identity(value: &str) -> String {
         .rev()
         .collect();
     format!("{prefix}••••{suffix}")
+}
+
+fn chrono_like_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default()
 }

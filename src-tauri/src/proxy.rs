@@ -4,7 +4,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -27,7 +26,7 @@ use crate::{
     catalog::{RouteTarget, SharedCatalog, SharedRoutes},
     credentials::SecretMaterial,
     providers,
-    storage::Storage,
+    storage::{Storage, UsageDelta},
     vault::SecretVault,
 };
 
@@ -91,32 +90,11 @@ impl UsageMetrics {
             }
         }
     }
-
-    pub fn snapshot(&self) -> crate::domain::UsageSnapshot {
-        let input_tokens = self.input_tokens.load(Ordering::Relaxed);
-        let output_tokens = self.output_tokens.load(Ordering::Relaxed);
-        let cache_observations = self.cache_observations.load(Ordering::Relaxed);
-        let cache_hit_rate = (cache_observations > 0)
-            .then(|| self.cache_hits.load(Ordering::Relaxed) as f64 / cache_observations as f64);
-        crate::domain::UsageSnapshot {
-            request_count: self.request_count.load(Ordering::Relaxed),
-            input_tokens,
-            output_tokens,
-            total_tokens: input_tokens + output_tokens,
-            seven_day_tokens: input_tokens + output_tokens,
-            cache_hit_rate,
-            sampled_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|value| value.as_secs() as i64)
-                .unwrap_or_default(),
-        }
-    }
 }
 
 pub struct ProxyRuntime {
     pub port: u16,
     pub secret: Arc<String>,
-    pub metrics: Arc<UsageMetrics>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -177,6 +155,29 @@ async fn models(State(state): State<ProxyState>, headers: HeaderMap) -> Response
     Json(catalog).into_response()
 }
 
+fn estimated_tokens(value: &Value) -> i64 {
+    serde_json::to_string(value)
+        .map(|text| (text.len() as i64 / 4).max(1))
+        .unwrap_or(0)
+}
+
+fn response_usage(value: &Value) -> (i64, i64, i64) {
+    let output = value
+        .pointer("/usage/output_tokens")
+        .or_else(|| value.pointer("/usage/completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| estimated_tokens(value));
+    let cached = value
+        .pointer("/usage/input_tokens_details/cached_tokens")
+        .or_else(|| value.pointer("/usage/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_i64);
+    (
+        output,
+        i64::from(cached.is_some()),
+        i64::from(cached.unwrap_or(0) > 0),
+    )
+}
+
 async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: Bytes) -> Response {
     if !authorized(&headers, &state.secret) {
         return error_response(
@@ -195,7 +196,6 @@ async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: By
             )
         }
     };
-    state.metrics.record_request(&parsed);
     let affinity = affinity_key(&headers, &parsed);
     let model = parsed
         .get("model")
@@ -217,6 +217,22 @@ async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: By
             "The selected provider does not have a Base URL.",
         );
     }
+    state.metrics.record_request(&parsed);
+    let _ = state
+        .storage
+        .record_usage(
+            &target.provider_id,
+            &target.upstream_model,
+            &UsageDelta {
+                request_count: 1,
+                input_tokens: estimated_tokens(&parsed),
+                output_tokens: 0,
+                cache_observations: 0,
+                cache_hits: 0,
+                failed_requests: 0,
+            },
+        )
+        .await;
     map_reasoning(&target, &mut parsed);
     if let Some(object) = parsed.as_object_mut() {
         object.insert("model".into(), Value::String(target.upstream_model.clone()));
@@ -276,7 +292,14 @@ async fn forward_responses_compatible(
             }
             continue;
         }
-        return passthrough(response, &state.metrics).await;
+        return passthrough(
+            response,
+            &state.metrics,
+            &state.storage,
+            &target.provider_id,
+            &target.upstream_model,
+        )
+        .await;
     }
     error_response(
         StatusCode::BAD_GATEWAY,
@@ -291,21 +314,14 @@ async fn forward_chat_compatible(
     request_body: Value,
     affinity_key: Option<&str>,
 ) -> Response {
-    if request_body
+    let wants_stream = request_body
         .get("stream")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "chat_stream_adapter_pending",
-            "This Chat Completions route currently supports non-streaming health and execution requests only.",
-        );
-    }
+        .unwrap_or(false);
     let chat_body = json!({
         "model": target.upstream_model,
         "messages": response_input_to_messages(request_body.get("input")),
-        "stream": false,
+        "stream": wants_stream,
         "tools": request_body.get("tools").cloned().unwrap_or(Value::Array(Vec::new())),
     });
     let endpoint = endpoint(&target.base_url, &target.provider_id, "chat/completions");
@@ -350,6 +366,16 @@ async fn forward_chat_compatible(
             }
             continue;
         }
+        if wants_stream {
+            return adapt_chat_stream(
+                upstream,
+                &state.metrics,
+                &state.storage,
+                &target.provider_id,
+                &target.upstream_model,
+            )
+            .await;
+        }
         let payload = match upstream.json::<Value>().await {
             Ok(payload) => payload,
             Err(error) => {
@@ -368,6 +394,22 @@ async fn forward_chat_compatible(
                 .into_response();
         }
         state.metrics.record_response(&payload);
+        let (output_tokens, cache_observations, cache_hits) = response_usage(&payload);
+        let _ = state
+            .storage
+            .record_usage(
+                &target.provider_id,
+                &target.upstream_model,
+                &UsageDelta {
+                    request_count: 0,
+                    input_tokens: 0,
+                    output_tokens,
+                    cache_observations,
+                    cache_hits,
+                    failed_requests: i64::from(!status.is_success()),
+                },
+            )
+            .await;
         let text = payload
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -397,6 +439,112 @@ async fn forward_chat_compatible(
         "upstream_retry_exhausted",
         "All eligible accounts failed",
     )
+}
+
+async fn adapt_chat_stream(
+    upstream: reqwest::Response,
+    metrics: &UsageMetrics,
+    storage: &Storage,
+    provider_id: &str,
+    model_id: &str,
+) -> Response {
+    let status = upstream.status();
+    let body = match upstream.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_body_error",
+                &error.to_string(),
+            )
+        }
+    };
+    if !status.is_success() {
+        let payload = serde_json::from_str::<Value>(&body)
+            .unwrap_or_else(|_| json!({"error": {"message": "上游流式请求失败"}}));
+        let _ = storage
+            .record_usage(
+                provider_id,
+                model_id,
+                &UsageDelta {
+                    request_count: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_observations: 0,
+                    cache_hits: 0,
+                    failed_requests: 1,
+                },
+            )
+            .await;
+        return (
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(payload),
+        )
+            .into_response();
+    }
+    let mut text = String::new();
+    let mut usage = Value::Null;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(payload) = serde_json::from_str::<Value>(data) {
+            if let Some(delta) = payload
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                text.push_str(delta);
+            }
+            if let Some(next_usage) = payload.get("usage") {
+                usage = next_usage.clone();
+            }
+        }
+    }
+    let response_id = format!("resp_{}", Uuid::new_v4());
+    let completed = json!({
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+            "model": model_id,
+            "output": [{"id": format!("msg_{response_id}"), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+            "usage": usage
+        }
+    });
+    metrics.record_response(&json!({"usage": usage}));
+    let (output_tokens, cache_observations, cache_hits) = response_usage(&json!({"usage": usage}));
+    let _ = storage
+        .record_usage(
+            provider_id,
+            model_id,
+            &UsageDelta {
+                request_count: 0,
+                input_tokens: 0,
+                output_tokens,
+                cache_observations,
+                cache_hits,
+                failed_requests: 0,
+            },
+        )
+        .await;
+    let delta = json!({"type": "response.output_text.delta", "item_id": format!("msg_{response_id}"), "output_index": 0, "content_index": 0, "delta": text});
+    let stream = format!("event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n", serde_json::to_string(&delta).unwrap_or_default(), serde_json::to_string(&completed).unwrap_or_default());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(stream))
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_response_error",
+                "Failed to build streaming response",
+            )
+        })
 }
 
 async fn upstream_auth(
@@ -563,7 +711,13 @@ fn endpoint(base_url: &str, provider_id: &str, path: &str) -> String {
     }
 }
 
-async fn passthrough(response: reqwest::Response, metrics: &UsageMetrics) -> Response {
+async fn passthrough(
+    response: reqwest::Response,
+    metrics: &UsageMetrics,
+    storage: &Storage,
+    provider_id: &str,
+    model_id: &str,
+) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = response
@@ -575,10 +729,40 @@ async fn passthrough(response: reqwest::Response, metrics: &UsageMetrics) -> Res
         Ok(bytes) => {
             if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
                 metrics.record_response(&body);
+                let (output_tokens, cache_observations, cache_hits) = response_usage(&body);
+                let _ = storage
+                    .record_usage(
+                        provider_id,
+                        model_id,
+                        &UsageDelta {
+                            request_count: 0,
+                            input_tokens: 0,
+                            output_tokens,
+                            cache_observations,
+                            cache_hits,
+                            failed_requests: i64::from(!status.is_success()),
+                        },
+                    )
+                    .await;
             } else {
+                let output_tokens = bytes.len() as i64 / 4;
                 metrics
                     .output_tokens
-                    .fetch_add(bytes.len() as u64 / 4, Ordering::Relaxed);
+                    .fetch_add(output_tokens as u64, Ordering::Relaxed);
+                let _ = storage
+                    .record_usage(
+                        provider_id,
+                        model_id,
+                        &UsageDelta {
+                            request_count: 0,
+                            input_tokens: 0,
+                            output_tokens,
+                            cache_observations: 0,
+                            cache_hits: 0,
+                            failed_requests: i64::from(!status.is_success()),
+                        },
+                    )
+                    .await;
             }
             let mut builder = Response::builder().status(status);
             if let Some(content_type) = content_type {
@@ -662,7 +846,6 @@ pub async fn start(
     Ok(ProxyRuntime {
         port: address.port(),
         secret,
-        metrics,
         shutdown: Mutex::new(Some(shutdown_tx)),
     })
 }
