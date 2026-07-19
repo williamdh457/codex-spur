@@ -131,11 +131,12 @@ The inspector is contextual and may be hidden. It opens for model mapping, accou
 Primary destinations:
 
 1. Overview
-2. Providers
-3. Models
-4. Accounts
-5. Diagnostics
-6. Settings
+2. Models
+3. Usage
+4. Diagnostics
+5. Settings
+
+Provider and account-pool configuration is intentionally consolidated into the Overview provider sheet. Do not duplicate Providers or Accounts as primary sidebar destinations.
 
 Navigation rows are 32px high with 8px horizontal padding. Use specific labels; avoid vague categories such as “Manage.”
 

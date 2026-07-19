@@ -132,6 +132,18 @@ pub struct OpenAiQuotaSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageSnapshot {
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub seven_day_tokens: u64,
+    pub cache_hit_rate: Option<f64>,
+    pub sampled_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppSnapshot {
     pub proxy: ProxyStatus,
     pub binding: CodexBindingStatus,

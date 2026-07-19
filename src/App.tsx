@@ -12,6 +12,7 @@ import {
   listCredentials,
   listModelRoutes,
   removeAccountFromPool,
+  getUsageSnapshot,
   previewCodexApply,
     restorePreviousCodexConfig,
   setModelEnabled,
@@ -25,13 +26,13 @@ import type {
   NavigationSection,
   ProviderSummary,
   StatusTone,
+  UsageSnapshot,
 } from "./types";
 
 const NAVIGATION: Array<{ id: NavigationSection; label: string; icon: string }> = [
   { id: "overview", label: "概览", icon: "◫" },
-  { id: "providers", label: "供应商", icon: "⌘" },
   { id: "models", label: "模型", icon: "◇" },
-  { id: "accounts", label: "账号", icon: "◎" },
+  { id: "usage", label: "用量", icon: "▥" },
   { id: "diagnostics", label: "诊断", icon: "⌁" },
   { id: "settings", label: "设置", icon: "⚙" },
 ];
@@ -89,12 +90,19 @@ const PROVIDER_SOURCE_LABELS: Record<string, string> = {
   custom: "API Key",
 };
 
+function providerUrl(provider: ProviderSummary): string {
+  if (provider.id === "kimi" && (!provider.baseUrl || provider.baseUrl.includes("www.kimi.com/code") || provider.baseUrl.includes("api.moonshot.cn"))) {
+    return "https://api.kimi.com/coding/v1";
+  }
+  return provider.baseUrl ?? provider.defaultBaseUrl ?? "";
+}
+
 function ProviderConfigModal({ providers, provider, onClose, onChanged }: { providers: ProviderSummary[]; provider: ProviderSummary; onClose: () => void; onChanged: () => Promise<void> }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [selectedId, setSelectedId] = useState(provider.id);
   const selectedProvider = providers.find((item) => item.id === selectedId) ?? provider;
   const [source, setSource] = useState<"official" | "apiKey">(selectedProvider.id === "openai" ? "official" : "apiKey");
-  const [baseUrl, setBaseUrl] = useState(selectedProvider.baseUrl ?? selectedProvider.defaultBaseUrl ?? "");
+  const [baseUrl, setBaseUrl] = useState(providerUrl(selectedProvider));
   const [apiKey, setApiKey] = useState("");
   const [accounts, setAccounts] = useState<CredentialSummary[]>([]);
   const [pools, setPools] = useState<AccountPoolSummary[]>([]);
@@ -130,7 +138,7 @@ function ProviderConfigModal({ providers, provider, onClose, onChanged }: { prov
     setSelectedId(id);
     const nextProvider = providers.find((item) => item.id === id) ?? provider;
     setSource(nextProvider.id === "openai" ? "official" : "apiKey");
-    setBaseUrl(nextProvider.baseUrl ?? nextProvider.defaultBaseUrl ?? "");
+    setBaseUrl(providerUrl(nextProvider));
     setSelectedPoolId(`default-${nextProvider.id}`);
     setMessage(null);
   };
@@ -256,30 +264,6 @@ function ProviderConfigModal({ providers, provider, onClose, onChanged }: { prov
   );
 }
 
-function ProvidersPage({ providers, onChanged, onConfigure }: { providers: ProviderSummary[]; onChanged: () => Promise<void>; onConfigure: (provider: ProviderSummary) => void }) {
-  const [routes, setRoutes] = useState<ModelRouteSummary[]>([]);
-  const [expanded, setExpanded] = useState<string | null>(providers[0]?.id ?? null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const reload = useCallback(async () => setRoutes(await listModelRoutes()), []);
-  useEffect(() => { void listModelRoutes().then((value) => setRoutes(value)); }, []);
-  const toggleRoute = async (route: ModelRouteSummary) => {
-    setBusy(route.id);
-    try { setRoutes(await setModelEnabled(route.id, !route.enabled)); await onChanged(); }
-    catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(null); }
-  };
-  const toggleProvider = async (provider: ProviderSummary) => {
-    const providerRoutes = routes.filter((route) => route.providerId === provider.id);
-    if (!providerRoutes.length) { onConfigure(provider); return; }
-    setBusy(provider.id);
-    try { setRoutes((await Promise.all(providerRoutes.map((route) => setModelEnabled(route.id, !providerRoutes.every((item) => item.enabled))))).at(-1) ?? routes); await reload(); await onChanged(); }
-    catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(null); }
-  };
-  return <div className="page-stack"><section className="panel"><div className="panel__header"><div><h2>供应商与模型</h2><p>勾选供应商可批量显示或隐藏模型；展开后可以逐个控制 Codex 模型选择器。</p></div><button type="button" className="button button--secondary" onClick={() => { if (providers[0]) onConfigure(providers[0]); }}>配置供应商</button></div><div className="provider-tree">{providers.map((provider) => { const providerRoutes = routes.filter((route) => route.providerId === provider.id); const allEnabled = providerRoutes.length > 0 && providerRoutes.every((route) => route.enabled); return <div className="provider-tree__group" key={provider.id}><div className="provider-tree__row"><input type="checkbox" aria-label={`启用 ${provider.name} 全部模型`} checked={allEnabled} disabled={!providerRoutes.length || busy === provider.id} onChange={() => void toggleProvider(provider)} /><button type="button" className="provider-tree__toggle" onClick={() => setExpanded(expanded === provider.id ? null : provider.id)}><span className="provider-mark" aria-hidden="true">{provider.name.slice(0, 1)}</span><span className="data-row__main"><strong>{provider.name}</strong><small>{provider.baseUrl ?? provider.defaultBaseUrl ?? "未设置 Base URL"} · {provider.selectedModels}/{provider.discoveredModels} 模型</small></span><span className={`badge ${provider.configured ? "badge--success" : "badge--neutral"}`}>{provider.configured ? "已配置" : "配置"}</span><span className="chevron" aria-hidden="true">{expanded === provider.id ? "⌄" : "›"}</span></button><button type="button" className="button button--ghost" onClick={() => onConfigure(provider)}>配置</button></div>{expanded === provider.id && <div className="provider-tree__models">{providerRoutes.length === 0 ? <div className="empty-inline">还没有模型，点击右侧“配置”拉取模型。</div> : providerRoutes.map((route) => <label className={`provider-model-row ${route.enabled ? "provider-model-row--enabled" : ""}`} key={route.id}><input type="checkbox" checked={route.enabled} disabled={busy === route.id} onChange={() => void toggleRoute(route)} /><span className="data-row__main"><strong>{route.displayName}</strong><small><code>{route.upstreamModel}</code> · {route.protocol}</small></span><span className="badge badge--neutral">{route.enabled ? "显示在 Codex" : "已关闭"}</span></label>)}</div>}</div>})}</div>{message && <div className="inline-warning">{message}</div>}</section></div>;
-}
-
 function ReasoningTable({ route }: { route: ModelRouteSummary }) {
   return (
     <div className="reasoning-card">
@@ -354,8 +338,41 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
   );
 }
 
-function AccountsPage({ providers, onConfigure }: { providers: ProviderSummary[]; onConfigure: (provider: ProviderSummary) => void }) {
-  return <div className="page-stack"><section className="panel"><div className="panel__header"><div><h2>账号概览</h2><p>账号导入、账号池成员和凭据配置统一在供应商弹窗中管理。</p></div><span className="badge badge--neutral">{providers.reduce((sum, provider) => sum + provider.credentialCount, 0)} 个账号</span></div><div className="rows">{providers.map((provider) => <button type="button" className="data-row provider-row" key={provider.id} onClick={() => onConfigure(provider)}><StatusDot tone={provider.healthyCredentialCount > 0 ? "healthy" : provider.credentialCount > 0 ? "warning" : "muted"} /><span className="data-row__main"><strong>{provider.name}</strong><small>{provider.healthyCredentialCount}/{provider.credentialCount} 个健康账号 · {provider.poolCount} 个账号池</small></span><span className="button button--secondary">配置账号</span><span className="chevron" aria-hidden="true">›</span></button>)}</div></section><div className="callout"><strong>账号不会再单独散落在账号页</strong><p>点击任意供应商即可在覆盖窗口中导入 JSON、保存 API Key、加入或移出账号池，并继续调整该供应商的模型。</p></div></div>;
+function UsageMetric({ label, value, note }: { label: string; value: string; note: string }) {
+  return <div className="usage-metric"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>;
+}
+
+function UsagePage() {
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    try { setUsage(await getUsageSnapshot()); setError(null); }
+    catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void getUsageSnapshot().then((value) => { if (active) setUsage(value); }).catch((nextError: unknown) => { if (active) setError(nextError instanceof Error ? nextError.message : String(nextError)); });
+    return () => { active = false; };
+  }, []);
+
+  if (!usage) return <div className="page-stack"><section className="panel"><div className="empty-state"><strong>正在读取本地用量</strong><p>数据只来自本机代理，不会上传。</p></div></section></div>;
+  const format = (value: number) => new Intl.NumberFormat("zh-CN").format(value);
+  return <div className="page-stack">
+    <section className="panel usage-panel">
+      <div className="panel__header"><div><h2>本地代理用量</h2><p>按 Codex Spur 本地代理统计；token 是请求体长度估算值，直到上游返回 usage 才会显示精确值。</p></div><button type="button" className="button button--secondary" onClick={() => void reload()}>刷新</button></div>
+      <div className="usage-grid">
+        <UsageMetric label="请求数" value={format(usage.requestCount)} note="当前代理进程" />
+        <UsageMetric label="今日 token" value={format(usage.totalTokens)} note="本次本地运行" />
+        <UsageMetric label="总 token" value={format(usage.totalTokens)} note="本地累计" />
+        <UsageMetric label="7 日 token" value={format(usage.sevenDayTokens)} note="本地累计暂未分日" />
+        <UsageMetric label="缓存命中率" value={usage.cacheHitRate === null ? "暂无数据" : `${(usage.cacheHitRate * 100).toFixed(1)}%`} note="当前未启用缓存统计" />
+      </div>
+      <div className="usage-chart" role="img" aria-label="最近请求用量趋势"><div className="usage-chart__bars"><span style={{ height: `${Math.max(12, Math.min(100, usage.requestCount * 8 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.inputTokens / 20 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.outputTokens / 20 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.totalTokens / 20 + 12))}%` }} /></div><div className="usage-chart__labels"><span>请求</span><span>输入</span><span>输出</span><span>合计</span></div></div>
+    </section>
+    {error && <div className="inline-warning">{error}</div>}
+  </div>;
 }
 
 function DiagnosticsPage({ snapshot }: { snapshot: AppSnapshot }) {
@@ -463,9 +480,8 @@ export default function App() {
         <header className="toolbar"><div><small>CODEX SPUR</small><h1>{title}</h1></div><div className="toolbar__actions"><button type="button" className="icon-button" aria-label="刷新" onClick={() => void refresh()}>{loading ? "…" : "↻"}</button><button type="button" className="button button--primary" onClick={() => void openPreview()}>Review & Apply</button></div></header>
         <div className="workspace__content">
           {section === "overview" && <Overview snapshot={snapshot} onOpenProviders={(provider) => setConfigProvider(provider ?? snapshot.providers[0] ?? null)} />}
-          {section === "providers" && <ProvidersPage providers={snapshot.providers} onChanged={refresh} onConfigure={setConfigProvider} />}
           {section === "models" && <ModelsPage refreshSnapshot={refresh} />}
-          {section === "accounts" && <AccountsPage providers={snapshot.providers} onConfigure={setConfigProvider} />}
+          {section === "usage" && <UsagePage />}
           {section === "diagnostics" && <DiagnosticsPage snapshot={snapshot} />}
           {section === "settings" && <SettingsPage />}
         </div>

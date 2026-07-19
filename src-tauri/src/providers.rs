@@ -97,6 +97,22 @@ pub async fn discover_official_models(
     Ok(models)
 }
 
+fn kimi_coding_models() -> Vec<DiscoveredProviderModel> {
+    [
+        ("kimi-k2.5", "Kimi K2.5"),
+        ("kimi-k2-0905-preview", "Kimi K2 0905 Preview"),
+        ("kimi-k2-turbo-preview", "Kimi K2 Turbo Preview"),
+    ]
+    .into_iter()
+    .map(|(id, display_name)| DiscoveredProviderModel {
+        id: id.into(),
+        display_name: display_name.into(),
+        owned_by: Some("Moonshot AI".into()),
+        created_at: None,
+    })
+    .collect()
+}
+
 pub async fn discover_models(
     provider_id: &str,
     base_url: &str,
@@ -119,17 +135,27 @@ pub async fn discover_models(
             value.parse().context("API key 无法生成 Authorization")?,
         );
     }
-    let response = client.get(endpoint).headers(headers).send().await?;
+    let response = client.get(&endpoint).headers(headers).send().await?;
     let status = response.status();
-    let body: Value = response.json().await.context("模型列表返回不是 JSON")?;
+    let raw_body = response.text().await?;
+    let body = serde_json::from_str::<Value>(&raw_body).ok();
     if !status.is_success() {
+        if provider_id == "kimi" && status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(kimi_coding_models());
+        }
         let message = body
-            .get("error")
+            .as_ref()
+            .and_then(|value| value.get("error"))
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
-            .unwrap_or("上游模型列表请求失败");
-        return Err(anyhow!("{} ({})", message, status));
+            .unwrap_or_else(|| raw_body.lines().next().unwrap_or("上游模型列表请求失败"));
+        return Err(anyhow!(
+            "模型列表请求失败（{}）：{}",
+            status,
+            message.chars().take(240).collect::<String>()
+        ));
     }
+    let body = body.ok_or_else(|| anyhow!("模型列表返回不是 JSON（{}）。Kimi for Coding 请使用 https://api.kimi.com/coding/v1，而不是 www.kimi.com/code/v1。", status))?;
     let values = body
         .get("data")
         .or_else(|| body.get("models"))

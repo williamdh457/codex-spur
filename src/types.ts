@@ -1,8 +1,7 @@
 export type NavigationSection =
   | "overview"
-  | "providers"
   | "models"
-  | "accounts"
+  | "usage"
   | "diagnostics"
   | "settings";
 
@@ -108,6 +107,16 @@ export type OpenAiQuotaSnapshot = {
   sevenDay: QuotaWindow | null;
   resetCredits: ResetCreditsSummary | null;
   fetchedAt: number;
+};
+
+export type UsageSnapshot = {
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  sevenDayTokens: number;
+  cacheHitRate: number | null;
+  sampledAt: number;
 };
 
 export type AppSnapshot = {

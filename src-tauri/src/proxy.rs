@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -31,12 +38,85 @@ struct ProxyState {
     routes: SharedRoutes,
     storage: Arc<Storage>,
     vault: Arc<SecretVault>,
+    metrics: Arc<UsageMetrics>,
     client: reqwest::Client,
+}
+
+pub struct UsageMetrics {
+    request_count: AtomicU64,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_observations: AtomicU64,
+}
+
+impl UsageMetrics {
+    pub fn new() -> Self {
+        Self {
+            request_count: AtomicU64::new(0),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_observations: AtomicU64::new(0),
+        }
+    }
+
+    fn record_request(&self, body: &Value) {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        let estimated = serde_json::to_string(body)
+            .map(|text| (text.len() as u64 / 4).max(1))
+            .unwrap_or(0);
+        self.input_tokens.fetch_add(estimated, Ordering::Relaxed);
+    }
+
+    fn record_response(&self, body: &Value) {
+        let output = body
+            .pointer("/usage/output_tokens")
+            .or_else(|| body.pointer("/usage/completion_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                serde_json::to_string(body)
+                    .map(|text| text.len() as u64 / 4)
+                    .unwrap_or(0)
+            });
+        self.output_tokens.fetch_add(output, Ordering::Relaxed);
+        if let Some(cached) = body
+            .pointer("/usage/input_tokens_details/cached_tokens")
+            .or_else(|| body.pointer("/usage/prompt_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64)
+        {
+            self.cache_observations.fetch_add(1, Ordering::Relaxed);
+            if cached > 0 {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> crate::domain::UsageSnapshot {
+        let input_tokens = self.input_tokens.load(Ordering::Relaxed);
+        let output_tokens = self.output_tokens.load(Ordering::Relaxed);
+        let cache_observations = self.cache_observations.load(Ordering::Relaxed);
+        let cache_hit_rate = (cache_observations > 0)
+            .then(|| self.cache_hits.load(Ordering::Relaxed) as f64 / cache_observations as f64);
+        crate::domain::UsageSnapshot {
+            request_count: self.request_count.load(Ordering::Relaxed),
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            seven_day_tokens: input_tokens + output_tokens,
+            cache_hit_rate,
+            sampled_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_secs() as i64)
+                .unwrap_or_default(),
+        }
+    }
 }
 
 pub struct ProxyRuntime {
     pub port: u16,
     pub secret: Arc<String>,
+    pub metrics: Arc<UsageMetrics>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -115,6 +195,7 @@ async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: By
             )
         }
     };
+    state.metrics.record_request(&parsed);
     let affinity = affinity_key(&headers, &parsed);
     let model = parsed
         .get("model")
@@ -195,7 +276,7 @@ async fn forward_responses_compatible(
             }
             continue;
         }
-        return passthrough(response).await;
+        return passthrough(response, &state.metrics).await;
     }
     error_response(
         StatusCode::BAD_GATEWAY,
@@ -286,6 +367,7 @@ async fn forward_chat_compatible(
             )
                 .into_response();
         }
+        state.metrics.record_response(&payload);
         let text = payload
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -481,7 +563,7 @@ fn endpoint(base_url: &str, provider_id: &str, path: &str) -> String {
     }
 }
 
-async fn passthrough(response: reqwest::Response) -> Response {
+async fn passthrough(response: reqwest::Response, metrics: &UsageMetrics) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = response
@@ -491,6 +573,13 @@ async fn passthrough(response: reqwest::Response) -> Response {
         .map(ToOwned::to_owned);
     match response.bytes().await {
         Ok(bytes) => {
+            if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                metrics.record_response(&body);
+            } else {
+                metrics
+                    .output_tokens
+                    .fetch_add(bytes.len() as u64 / 4, Ordering::Relaxed);
+            }
             let mut builder = Response::builder().status(status);
             if let Some(content_type) = content_type {
                 builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -543,12 +632,14 @@ pub async fn start(
             Err(error) => return Err(error.into()),
         }
     };
+    let metrics = Arc::new(UsageMetrics::new());
     let state = ProxyState {
         catalog,
         secret: Arc::clone(&secret),
         routes,
         storage,
         vault,
+        metrics: Arc::clone(&metrics),
         client: reqwest::Client::builder()
             .user_agent("Codex-Spur/0.1")
             .build()?,
@@ -571,6 +662,7 @@ pub async fn start(
     Ok(ProxyRuntime {
         port: address.port(),
         secret,
+        metrics,
         shutdown: Mutex::new(Some(shutdown_tx)),
     })
 }

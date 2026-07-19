@@ -75,14 +75,14 @@ impl Storage {
 
     async fn ensure_provider_presets(&self) -> Result<(), sqlx::Error> {
         for (id, name, region, protocol) in [
-            ("kimi", "Kimi", "中国 / Global", "Responses preferred"),
+            ("kimi", "Kimi", "中国 / Global", "Chat Completions"),
             ("deepseek", "DeepSeek", "Global", "Chat Completions"),
             ("minimax", "MiniMax", "中国 / Global", "Responses preferred"),
             ("openai", "OpenAI", "Official", "Responses"),
             ("custom", "自定义供应商", "Custom", "OpenAI-compatible"),
         ] {
             sqlx::query(
-                "INSERT INTO providers (id, name, region, protocol) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                "INSERT INTO providers (id, name, region, protocol) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, region = excluded.region, protocol = excluded.protocol",
             )
             .bind(id)
             .bind(name)
@@ -119,7 +119,7 @@ impl Storage {
                 base_url: row.get("base_url"),
                 default_base_url: match row.get::<String, _>("id").as_str() {
                     "openai" => Some("https://chatgpt.com/backend-api/codex".into()),
-                    "kimi" => Some("https://api.moonshot.cn/v1".into()),
+                    "kimi" => Some("https://api.kimi.com/coding/v1".into()),
                     "deepseek" => Some("https://api.deepseek.com/v1".into()),
                     "minimax" => Some("https://api.minimaxi.com/v1".into()),
                     _ => None,

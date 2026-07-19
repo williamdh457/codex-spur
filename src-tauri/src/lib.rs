@@ -190,6 +190,11 @@ async fn refresh_quota_for_state(
 }
 
 #[tauri::command]
+async fn get_usage_snapshot(state: State<'_, AppState>) -> Result<domain::UsageSnapshot, String> {
+    Ok(state.proxy.read().await.metrics.snapshot())
+}
+
+#[tauri::command]
 async fn get_app_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, String> {
     let providers = state
         .storage
@@ -732,6 +737,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
+            get_usage_snapshot,
             preview_codex_apply,
             apply_codex_config,
             restore_previous_codex_config,

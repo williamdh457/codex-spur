@@ -7,6 +7,7 @@ import type {
   CredentialSummary,
   ModelRouteSummary,
   OpenAiQuotaSnapshot,
+  UsageSnapshot,
 } from "./types";
 
 const browserFallback: AppSnapshot = {
@@ -25,7 +26,7 @@ const browserFallback: AppSnapshot = {
   },
   providers: [
     { id: "openai", name: "OpenAI", region: "Official", protocol: "Responses", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://chatgpt.com/backend-api/codex", supportsOfficialAccount: true, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
-    { id: "kimi", name: "Kimi", region: "中国 / Global", protocol: "Responses preferred", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://api.moonshot.cn/v1", supportsOfficialAccount: false, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
+    { id: "kimi", name: "Kimi", region: "中国 / Global", protocol: "Chat Completions", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://api.kimi.com/coding/v1", supportsOfficialAccount: false, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
     { id: "deepseek", name: "DeepSeek", region: "Global", protocol: "Chat Completions", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://api.deepseek.com/v1", supportsOfficialAccount: false, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
     { id: "minimax", name: "MiniMax", region: "中国 / Global", protocol: "Responses preferred", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://api.minimaxi.com/v1", supportsOfficialAccount: false, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
   ],
@@ -111,6 +112,13 @@ export async function removeAccountFromPool(poolId: string, credentialId: string
 
 export async function listPoolMemberIds(poolId: string): Promise<string[]> {
   return isTauriRuntime() ? invoke<string[]>("list_pool_member_ids", { poolId }) : [];
+}
+
+export async function getUsageSnapshot(): Promise<UsageSnapshot> {
+  if (!isTauriRuntime()) {
+    return { requestCount: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, sevenDayTokens: 0, cacheHitRate: null, sampledAt: Date.now() };
+  }
+  return invoke<UsageSnapshot>("get_usage_snapshot");
 }
 
 export async function refreshOpenAiQuota(credentialId: string): Promise<OpenAiQuotaSnapshot> {
