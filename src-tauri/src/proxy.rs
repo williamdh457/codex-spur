@@ -632,43 +632,20 @@ async fn adapt_chat_stream(
         )
             .into_response();
     }
-    let mut text = String::new();
-    let mut raw_usage: Option<Value> = None;
-    for line in body.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        if let Ok(payload) = serde_json::from_str::<Value>(data) {
-            if let Some(delta) = payload
-                .pointer("/choices/0/delta/content")
-                .and_then(Value::as_str)
-            {
-                text.push_str(delta);
-            }
-            if let Some(next_usage) = payload.get("usage").filter(|value| !value.is_null()) {
-                raw_usage = Some(next_usage.clone());
-            }
-        }
-    }
-    // Codex Desktop deserializes ResponseCompleted.usage and requires input_tokens
-    // (Responses shape). Chat Completions only has prompt_tokens — map like CC Switch.
-    let usage = chat_usage_to_responses_usage(raw_usage.as_ref());
-    let response_id = format!("resp_{}", Uuid::new_v4());
-    let completed = json!({
-        "type": "response.completed",
-        "response": {
-            "id": response_id,
-            "object": "response",
-            "status": "completed",
-            "model": model_id,
-            "output": [{"id": format!("msg_{response_id}"), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}],
-            "usage": usage
-        }
-    });
+
+    // Chat Completions SSE → Responses SSE with the full lifecycle Desktop needs.
+    // Skipping created/in_progress/item/content_part events makes ChatGPT Desktop
+    // drop the turn as "stopped after 0s" even when upstream returned text.
+    let parsed = parse_chat_completions_sse(&body);
+    let stream = chat_text_to_responses_sse(
+        &parsed.response_id,
+        model_id,
+        parsed.created_at,
+        &parsed.text,
+        &parsed.reasoning,
+        parsed.usage.as_ref(),
+    );
+    let usage = chat_usage_to_responses_usage(parsed.usage.as_ref());
     metrics.record_response(&json!({"usage": usage}));
     let (output_tokens, cache_observations, cache_hits) = response_usage(&json!({"usage": usage}));
     let _ = storage
@@ -685,11 +662,10 @@ async fn adapt_chat_stream(
             },
         )
         .await;
-    let delta = json!({"type": "response.output_text.delta", "item_id": format!("msg_{response_id}"), "output_index": 0, "content_index": 0, "delta": text});
-    let stream = format!("event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n", serde_json::to_string(&delta).unwrap_or_default(), serde_json::to_string(&completed).unwrap_or_default());
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(stream))
         .unwrap_or_else(|_| {
             error_response(
@@ -698,6 +674,301 @@ async fn adapt_chat_stream(
                 "Failed to build streaming response",
             )
         })
+}
+
+#[derive(Debug, Default)]
+struct ParsedChatSse {
+    response_id: String,
+    created_at: u64,
+    text: String,
+    reasoning: String,
+    usage: Option<Value>,
+}
+
+/// Collect text / reasoning / usage from a buffered Chat Completions SSE body.
+fn parse_chat_completions_sse(body: &str) -> ParsedChatSse {
+    let mut parsed = ParsedChatSse {
+        response_id: format!("resp_{}", Uuid::new_v4()),
+        ..ParsedChatSse::default()
+    };
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if let Some(id) = payload.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                // Normalize chatcmpl_* → resp_* so Desktop sees a Responses id.
+                parsed.response_id = if id.starts_with("resp_") {
+                    id.to_string()
+                } else if let Some(rest) = id.strip_prefix("chatcmpl-").or_else(|| id.strip_prefix("chatcmpl_"))
+                {
+                    format!("resp_{rest}")
+                } else {
+                    format!("resp_{id}")
+                };
+            }
+        }
+        if let Some(created) = payload.get("created").and_then(Value::as_u64) {
+            parsed.created_at = created;
+        }
+        if let Some(delta) = payload.get("choices").and_then(Value::as_array).and_then(|c| c.first())
+        {
+            if let Some(delta_obj) = delta.get("delta") {
+                if let Some(content) = delta_obj.get("content").and_then(Value::as_str) {
+                    parsed.text.push_str(content);
+                }
+                // DeepSeek / reasoners stream thinking into these fields.
+                for key in ["reasoning_content", "reasoning", "reasoning_text"] {
+                    if let Some(chunk) = delta_obj.get(key).and_then(Value::as_str) {
+                        parsed.reasoning.push_str(chunk);
+                    }
+                }
+            }
+        }
+        if let Some(next_usage) = payload.get("usage").filter(|value| !value.is_null()) {
+            parsed.usage = Some(next_usage.clone());
+        }
+    }
+    if parsed.created_at == 0 {
+        parsed.created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+    parsed
+}
+
+fn sse_event(event: &str, data: &Value) -> String {
+    format!(
+        "event: {event}\ndata: {}\n\n",
+        serde_json::to_string(data).unwrap_or_else(|_| "{}".into())
+    )
+}
+
+/// Build the Responses SSE lifecycle Desktop expects (CC Switch / Nice Switch shape).
+///
+/// Minimal complete sequence for a text answer (optional reasoning first):
+/// `response.created` → `response.in_progress` →
+/// [reasoning item lifecycle] →
+/// `output_item.added` → `content_part.added` → `output_text.delta` →
+/// `output_text.done` → `content_part.done` → `output_item.done` →
+/// `response.completed`
+///
+/// Emitting only `output_text.delta` + `completed` makes ChatGPT Desktop show
+/// "stopped after 0s" with no assistant bubble.
+fn chat_text_to_responses_sse(
+    response_id: &str,
+    model: &str,
+    created_at: u64,
+    text: &str,
+    reasoning: &str,
+    raw_usage: Option<&Value>,
+) -> String {
+    let usage = chat_usage_to_responses_usage(raw_usage);
+    let mut out = String::with_capacity(text.len().saturating_mul(2) + 2048);
+    let mut output_items: Vec<Value> = Vec::new();
+    let mut next_output_index: u32 = 0;
+
+    let base_in_progress = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "in_progress",
+        "model": model,
+        "output": [],
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "output_tokens_details": { "reasoning_tokens": 0 }
+        }
+    });
+    out.push_str(&sse_event(
+        "response.created",
+        &json!({ "type": "response.created", "response": base_in_progress }),
+    ));
+    out.push_str(&sse_event(
+        "response.in_progress",
+        &json!({ "type": "response.in_progress", "response": base_in_progress }),
+    ));
+
+    // Optional reasoning item (DeepSeek reasoner / thinking models).
+    let reasoning = reasoning.trim();
+    if !reasoning.is_empty() {
+        let item_id = format!("rs_{response_id}");
+        let output_index = next_output_index;
+        next_output_index += 1;
+        out.push_str(&sse_event(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": []
+                }
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.reasoning_summary_part.added",
+            &json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": "" }
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "delta": reasoning
+            }),
+        ));
+        let reasoning_item = json!({
+            "id": item_id,
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": reasoning }]
+        });
+        out.push_str(&sse_event(
+            "response.reasoning_summary_text.done",
+            &json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "text": reasoning
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.reasoning_summary_part.done",
+            &json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": reasoning }
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": reasoning_item
+            }),
+        ));
+        output_items.push(reasoning_item);
+    }
+
+    // Assistant message item — always emit when we have text, or when there was no
+    // reasoning either (empty reply still needs a completed message for Desktop).
+    let has_text = !text.is_empty();
+    if has_text || output_items.is_empty() {
+        let item_id = format!("{response_id}_msg");
+        let output_index = next_output_index;
+        out.push_str(&sse_event(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.content_part.added",
+            &json!({
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": "", "annotations": [] }
+            }),
+        ));
+        if has_text {
+            out.push_str(&sse_event(
+                "response.output_text.delta",
+                &json!({
+                    "type": "response.output_text.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": text
+                }),
+            ));
+        }
+        out.push_str(&sse_event(
+            "response.output_text.done",
+            &json!({
+                "type": "response.output_text.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": text
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.content_part.done",
+            &json!({
+                "type": "response.content_part.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": text, "annotations": [] }
+            }),
+        ));
+        let message_item = json!({
+            "id": item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+        });
+        out.push_str(&sse_event(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": message_item
+            }),
+        ));
+        output_items.push(message_item);
+    }
+
+    let completed_response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": output_items,
+        "usage": usage
+    });
+    out.push_str(&sse_event(
+        "response.completed",
+        &json!({ "type": "response.completed", "response": completed_response }),
+    ));
+    // Responses API does not use Chat Completions' `data: [DONE]`.
+    out
 }
 
 struct AffinityInputs {
@@ -1681,6 +1952,94 @@ mod tests {
             "deepseek-v4-flash",
         );
         assert!(non_stream.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn chat_sse_lifecycle_matches_desktop_expectations() {
+        // ChatGPT Desktop drops turns that skip created/item/content_part events
+        // ("你在 0s 后停止了"). Match Nice Switch / CC Switch envelope.
+        let stream = chat_text_to_responses_sse(
+            "resp_test1",
+            "deepseek-v4-flash",
+            1_700_000_000,
+            "Hello",
+            "",
+            Some(&json!({
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "total_tokens": 6
+            })),
+        );
+
+        let events: Vec<&str> = stream
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "unexpected event order: {events:?}"
+        );
+        assert!(!stream.contains("data: [DONE]"), "Responses SSE must not use Chat [DONE]");
+        assert!(stream.contains("\"created_at\":1700000000"));
+        assert!(stream.contains("\"input_tokens\":4"));
+        assert!(stream.contains("\"delta\":\"Hello\""));
+        assert!(stream.contains("\"text\":\"Hello\""));
+        assert!(stream.contains("resp_test1_msg"));
+        // created/in_progress carry empty output; completed carries the message item.
+        assert!(stream.contains("\"status\":\"completed\""));
+    }
+
+    #[test]
+    fn chat_sse_includes_reasoning_before_message() {
+        let stream = chat_text_to_responses_sse(
+            "resp_r1",
+            "deepseek-v4-flash",
+            42,
+            "pong",
+            "Need context.",
+            None,
+        );
+        let events: Vec<&str> = stream
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert!(events.contains(&"response.reasoning_summary_text.delta"));
+        let reasoning_pos = stream.find("\"type\":\"reasoning\"").expect("reasoning item");
+        let message_pos = stream.find("\"type\":\"message\"").expect("message item");
+        assert!(
+            reasoning_pos < message_pos,
+            "reasoning must precede assistant message"
+        );
+        assert!(stream.contains("Need context."));
+        assert!(stream.contains("\"text\":\"pong\""));
+    }
+
+    #[test]
+    fn parse_chat_sse_collects_text_reasoning_and_usage() {
+        let body = r#"
+data: {"id":"chatcmpl_abc","created":99,"choices":[{"delta":{"reasoning_content":"think "}}]}
+
+data: {"id":"chatcmpl_abc","created":99,"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}
+
+data: [DONE]
+"#;
+        let parsed = parse_chat_completions_sse(body);
+        assert_eq!(parsed.response_id, "resp_abc");
+        assert_eq!(parsed.created_at, 99);
+        assert_eq!(parsed.text, "hi");
+        assert_eq!(parsed.reasoning, "think ");
+        assert_eq!(parsed.usage.as_ref().unwrap()["prompt_tokens"], 3);
     }
 
     #[test]
