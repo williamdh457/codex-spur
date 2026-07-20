@@ -22,10 +22,30 @@
 <p align="center">
   <a href="https://github.com/williamdh457/codex-spur/releases/latest">Download DMG</a>
   ·
+  <a href="#if-macos-says-app-is-damaged">“App is damaged?” Fix</a>
+  ·
   <a href="./CHANGELOG.md">Changelog</a>
   ·
   <a href="./LICENSE">MIT License</a>
 </p>
+
+---
+
+> [!IMPORTANT]
+> ### If macOS says **“Codex Spur is damaged and can’t be opened”**
+>
+> **The download is almost never corrupt.** Public Release DMGs are **ad-hoc signed and not notarized**, so Gatekeeper treats the quarantine flag from a browser download as “damaged.”
+>
+> **Fastest fix** (after dragging the app into Applications):
+>
+> ```bash
+> xattr -cr "/Applications/Codex Spur.app"
+> open "/Applications/Codex Spur.app"
+> ```
+>
+> Or: **right-click the app → Open → Open** · or **System Settings → Privacy & Security → Open Anyway**.
+>
+> Full options (and what does *not* work without a $99 Developer ID): [§ If macOS says “app is damaged”](#if-macos-says-app-is-damaged)
 
 ---
 
@@ -132,18 +152,71 @@ Typical data directory:
 
 1. Open the [latest Release](https://github.com/williamdh457/codex-spur/releases/latest) and download  
    `Codex.Spur_0.1.1_aarch64.dmg` (GitHub may normalize spaces in the asset name)
-2. Open the DMG and drag **Codex Spur** into Applications
-3. **First launch (unsigned builds):** macOS may say the app is **damaged** or cannot be opened. That is almost always **Gatekeeper quarantine**, not a corrupt download:
-   - Prefer: right-click the app → **Open** → confirm, **or**  
-     **System Settings → Privacy & Security → Open Anyway**
-   - If it still says damaged, clear quarantine once:
-     ```bash
-     xattr -cr "/Applications/Codex Spur.app"
-     ```
-     then open the app again (or right-click → Open).
+2. Open the DMG and drag **Codex Spur** into **Applications**
+3. Open the app (see [“app is damaged”](#if-macos-says-app-is-damaged) if macOS blocks the first launch)
 4. Leave the menu-bar process running while you use Spur-backed models
 
-> Public GitHub DMGs are usually **ad-hoc signed and not notarized**. That is enough for local development; downloaded copies get a quarantine flag and Gatekeeper blocks them until you open once or clear `xattr`. A permanent fix for other users requires an **Apple Developer Program** membership ($99/year), a **Developer ID Application** certificate, and **notarization + staple** before upload.
+### If macOS says “app is damaged”
+
+macOS may show one of:
+
+- *“Codex Spur” is damaged and can’t be opened. You should move it to the Trash.*
+- *Apple cannot check it for malicious software*
+- *The developer cannot be verified*
+
+**Cause:** the GitHub DMG is **ad-hoc signed / not notarized**. Downloads get a `com.apple.quarantine` flag; Gatekeeper then blocks launch and often mislabels it as “damaged.” This is **not** a bad zip and **not** a broken Apple ID on your Mac.
+
+#### Workarounds (recommended)
+
+Try in order:
+
+| # | Method | What to do |
+|---|--------|------------|
+| 1 | **Clear quarantine** (most reliable) | After install to Applications, run the commands below |
+| 2 | **Right-click → Open** | Finder → right-click **Codex Spur** → **Open** → **Open** (do not double-click the first time) |
+| 3 | **Privacy & Security** | **System Settings → Privacy & Security** → scroll to the block message → **Open Anyway** |
+| 4 | **Build from source** | Local `npm run bundle:dmg` builds usually have **no** browser quarantine flag |
+
+**Method 1 — Terminal (copy-paste):**
+
+```bash
+# After dragging Codex Spur into Applications:
+xattr -cr "/Applications/Codex Spur.app"
+open "/Applications/Codex Spur.app"
+```
+
+Only remove the quarantine flag (equivalent intent):
+
+```bash
+xattr -d com.apple.quarantine "/Applications/Codex Spur.app" 2>/dev/null
+open "/Applications/Codex Spur.app"
+```
+
+If the app is still on the Desktop / Downloads instead of Applications, use that path instead of `/Applications/...`.
+
+#### What this is *not*
+
+| Approach | Notes |
+|----------|--------|
+| Re-downloading the DMG forever | Same quarantine every time from the browser |
+| Free Apple ID “signing” | Cannot produce a **Developer ID + notarized** public download |
+| `sudo spctl --master-disable` | Turns Gatekeeper off system-wide — **do not** do this for Spur |
+| Cracking / faking notarization | Illegal and useless long-term |
+
+#### Permanent fix (maintainers / “double-click just works”)
+
+For strangers to open the DMG with no `xattr` step you need:
+
+1. [Apple Developer Program](https://developer.apple.com/programs/) (~$99/year)
+2. **Developer ID Application** certificate in Keychain
+3. Tauri **code sign + notarize + staple** before `gh release create`  
+   (see [Tauri macOS code signing](https://v2.tauri.app/distribute/sign/macos/))
+
+| Goal | Free / unsigned Release | Developer ID + notarized |
+|------|-------------------------|---------------------------|
+| Run after you built locally | Usually fine | Fine |
+| Open GitHub download with one double-click | Need `xattr` / right-click Open | Yes |
+| Silence Gatekeeper for everyone | No reliable free path | Yes |
 
 ### Uninstall
 

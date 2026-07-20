@@ -22,10 +22,30 @@
 <p align="center">
   <a href="https://github.com/williamdh457/codex-spur/releases/latest">下载 DMG</a>
   ·
+  <a href="#首次打开提示应用已损坏">「应用已损坏」处理</a>
+  ·
   <a href="./CHANGELOG.md">更新日志</a>
   ·
   <a href="./LICENSE">MIT 许可</a>
 </p>
+
+---
+
+> [!IMPORTANT]
+> ### 首次打开提示 **「应用已损坏，无法打开」**？
+>
+> **几乎不是安装包坏了。** 公开 Release 的 DMG 是 **ad-hoc 签名、未做 Apple 公证（notarize）**。浏览器下载会带上隔离属性（quarantine），Gatekeeper 会拦截，并常误报成「已损坏」。
+>
+> **最快处理**（先把 App 拖进「应用程序」）：
+>
+> ```bash
+> xattr -cr "/Applications/Codex Spur.app"
+> open "/Applications/Codex Spur.app"
+> ```
+>
+> 或：对 App **右键 → 打开 → 打开** · 或 **系统设置 → 隐私与安全性 → 仍要打开**。
+>
+> 完整步骤与「要不要买开发者账号」见：[§ 首次打开提示「应用已损坏」](#首次打开提示应用已损坏)
 
 ---
 
@@ -110,22 +130,77 @@ none · minimal · low · medium · high · xhigh · max · ultra
 
 ### 从 Release 安装
 
-1. 打开 [Releases](https://github.com/williamdh457/codex-spur/releases/latest) 下载 DMG  
-2. 拖入「应用程序」  
-3. **首次打开若提示「应用已损坏」**：多数情况下不是文件真坏了，而是未签名/未公证 + 隔离属性（Gatekeeper）。处理顺序：
-   - 右键 App → **打开** → 仍要打开；或「系统设置 → 隐私与安全性 → 仍要打开」
-   - 仍不行时在终端执行一次：
-     ```bash
-     xattr -cr "/Applications/Codex Spur.app"
-     ```
-     然后再打开  
+1. 打开 [Releases](https://github.com/williamdh457/codex-spur/releases/latest) 下载 DMG（例如 `Codex.Spur_0.1.1_aarch64.dmg`）  
+2. 打开 DMG，把 **Codex Spur** 拖进 **「应用程序」**  
+3. 打开 App（若被拦截，见下方 [「应用已损坏」](#首次打开提示应用已损坏)）  
 4. 使用第三方模型时保持菜单栏进程在线  
 
-> GitHub 公开 DMG 通常是 **ad-hoc 签名、未公证**。要让别人下载后双击即开，需要 Apple 开发者账号（约 $99/年）+ Developer ID 签名 + 公证（notarize）并 staple。免费 Apple ID 无法彻底解决「从网上下载就损坏」的问题。
+### 首次打开提示「应用已损坏」
+
+系统可能显示：
+
+- *“Codex Spur”已损坏，无法打开。你应该将它移到废纸篓。*
+- *无法验证开发者* / *Apple 无法检查是否包含恶意软件*
+
+**原因：** GitHub 上的 DMG 目前是 **ad-hoc 签名、未公证**。从浏览器下载会带上 `com.apple.quarantine`，Gatekeeper 拦截后常误写成「已损坏」。  
+**不是** 文件损坏，**也不是** 你本机 Apple ID「坏了」。
+
+#### 推荐绕过方式（按顺序试）
+
+| # | 方法 | 操作 |
+|---|------|------|
+| 1 | **清除隔离属性**（最稳） | App 已在「应用程序」后，在终端执行下方命令 |
+| 2 | **右键打开** | Finder 中对 **Codex Spur** **右键 → 打开 → 打开**（首次不要双击） |
+| 3 | **隐私与安全性** | **系统设置 → 隐私与安全性** → 找到拦截提示 → **仍要打开** |
+| 4 | **从源码本地打包** | 本机 `npm run bundle:dmg` 一般没有浏览器下载的 quarantine |
+
+**方法 1 — 终端（复制粘贴）：**
+
+```bash
+# 先把 Codex Spur 拖进「应用程序」，再执行：
+xattr -cr "/Applications/Codex Spur.app"
+open "/Applications/Codex Spur.app"
+```
+
+只删 quarantine 标记也可以：
+
+```bash
+xattr -d com.apple.quarantine "/Applications/Codex Spur.app" 2>/dev/null
+open "/Applications/Codex Spur.app"
+```
+
+若 App 还在「下载」或桌面，把路径改成实际位置即可。
+
+#### 不建议 / 无效的做法
+
+| 做法 | 说明 |
+|------|------|
+| 反复重新下载 DMG | 每次浏览器下载都会重新打 quarantine |
+| 指望免费 Apple ID 对外签名 | 做不到公开分发用的 **Developer ID + 公证** |
+| `sudo spctl --master-disable` | 全局关闭 Gatekeeper，**不要**为 Spur 这么干 |
+| 伪造公证 / 盗用证书 | 违法，且证书会被吊销 |
+
+#### 想彻底「双击就能开」（维护者 / 付费方案）
+
+让陌生人下载后无需 `xattr`，需要：
+
+1. 加入 [Apple Developer Program](https://developer.apple.com/programs/)（约 $99/年）  
+2. 创建 **Developer ID Application** 证书并装入钥匙串  
+3. 用 Tauri **签名 + notarize + staple** 后再上传 Release  
+   （文档：[Tauri macOS code signing](https://v2.tauri.app/distribute/sign/macos/)）
+
+| 目标 | 免费 / 未公证 Release | Developer ID + 已公证 |
+|------|----------------------|------------------------|
+| 本机自己编译运行 | 通常没问题 | 没问题 |
+| GitHub 下载后双击即开 | 需要 `xattr` / 右键打开 | 可以 |
+| 对所有用户静默通过 Gatekeeper | **没有可靠免费路径** | 可以 |
 
 ### 卸载
 
-菜单栏退出 → 删除 App →（可选）删除 Application Support 数据 → 按需恢复 `~/.codex` 备份。
+1. 从菜单栏 **退出** Codex Spur（不要只关窗口）  
+2. 删除 `/Applications/Codex Spur.app`  
+3. （可选）删除 Application Support 下的本地数据  
+4. 按需用 App 内备份恢复，或检查 `~/.codex/config.toml` 与 `~/.codex/codex-select/`
 
 ---
 
