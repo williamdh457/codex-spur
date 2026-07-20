@@ -46,6 +46,8 @@ pub struct StoredCredential {
     pub id: String,
     pub provider_id: String,
     pub account_id: Option<String>,
+    /// Unix seconds; used for OAuth access-token refresh lead time.
+    pub expires_at: Option<i64>,
     pub secret_envelope: EncryptedSecret,
 }
 
@@ -718,7 +720,7 @@ impl Storage {
 
     pub async fn get_credential(&self, id: &str) -> Result<Option<StoredCredential>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, provider_id, account_id, secret_envelope_json FROM credentials WHERE id = ?",
+            "SELECT id, provider_id, account_id, expires_at, secret_envelope_json FROM credentials WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -731,10 +733,37 @@ impl Storage {
                 id: row.get("id"),
                 provider_id: row.get("provider_id"),
                 account_id: row.get("account_id"),
+                expires_at: row.try_get("expires_at").unwrap_or(None),
                 secret_envelope,
             })
         })
         .transpose()
+    }
+
+    /// Prefer a healthy oauth row; otherwise the newest refreshable oauth row
+    /// (including `auth_invalid`) so callers can attempt token refresh recovery.
+    pub async fn first_refreshable_oauth_credential(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<StoredCredential>, sqlx::Error> {
+        if let Some(healthy) = self.first_healthy_credential(provider_id).await? {
+            return Ok(Some(healthy));
+        }
+        let row = sqlx::query(
+            "SELECT id FROM credentials
+             WHERE provider_id = ?
+               AND refreshable = 1
+               AND kind IN ('oauth', 'o_auth')
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 1",
+        )
+        .bind(provider_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => self.get_credential(row.get::<String, _>("id").as_str()).await,
+            None => Ok(None),
+        }
     }
 
     /// Replace encrypted secret payload and optional expiry after OAuth refresh.

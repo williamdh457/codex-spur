@@ -302,6 +302,70 @@ impl XaiOAuthManager {
     }
 }
 
+/// Refresh a Grok / xAI OAuth access token via the public CLI client.
+///
+/// Uses the same `client_id` and `scope` as device login. When the server omits
+/// a rotated `refresh_token`, the previous refresh token is preserved.
+pub async fn refresh_xai_tokens(refresh_token: &str) -> Result<DeviceLoginTokens, String> {
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err("缺少 refresh_token".into());
+    }
+    let body = format!(
+        "grant_type=refresh_token&refresh_token={}&client_id={}&scope={}",
+        urlencoding_encode(refresh_token),
+        urlencoding_encode(CLIENT_ID),
+        urlencoding_encode(SCOPE),
+    );
+    let client = http_client()?;
+    let response = client
+        .post(TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .header("User-Agent", USER_AGENT)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("刷新 Grok token 失败：{e}"))?;
+
+    let status = response.status();
+    let payload: OAuthTokenResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("解析 Grok 刷新响应失败：{e}"))?;
+
+    if !status.is_success() || payload.error.is_some() || payload.access_token.is_empty() {
+        let detail = payload
+            .error_description
+            .filter(|s| !s.is_empty())
+            .or(payload.error)
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        let snippet = detail.chars().take(200).collect::<String>();
+        return Err(format!("刷新 Grok token 失败（{status}）：{snippet}"));
+    }
+
+    let (account_id, email) = extract_identity(&payload);
+    let account_id = account_id.unwrap_or_else(|| {
+        format!("xai-{}", short_fingerprint(&payload.access_token))
+    });
+    let expires_at = payload
+        .expires_in
+        .map(|secs| chrono_now_secs().saturating_add(secs as i64))
+        .or_else(|| jwt_exp_secs(&payload.access_token));
+    let mut new_refresh = payload.refresh_token.filter(|s| !s.trim().is_empty());
+    if new_refresh.is_none() {
+        new_refresh = Some(refresh_token.to_string());
+    }
+    Ok(DeviceLoginTokens {
+        access_token: payload.access_token,
+        refresh_token: new_refresh,
+        id_token: payload.id_token,
+        account_id,
+        email,
+        expires_at,
+    })
+}
+
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -493,5 +557,17 @@ mod tests {
         let poll = mgr.poll_device_login("missing").await.unwrap();
         assert_eq!(poll.status, "error");
         assert!(poll.tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_xai_tokens_rejects_empty_refresh() {
+        let err = refresh_xai_tokens("   ").await.unwrap_err();
+        assert!(err.contains("refresh_token"), "{err}");
+    }
+
+    #[test]
+    fn urlencoding_encodes_refresh_token_specials() {
+        let encoded = urlencoding_encode("a+b/c=");
+        assert_eq!(encoded, "a%2Bb%2Fc%3D");
     }
 }

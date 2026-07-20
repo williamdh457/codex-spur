@@ -302,12 +302,18 @@ async fn forward_responses_compatible(
     let mut attempt = 0usize;
     while attempt < max_switches {
         let mut request = state.client.post(&endpoint).json(&request_body);
-        let auth = match upstream_auth(state, &target.provider_id, affinity, &exclude).await {
+        let auth = match upstream_auth(state, target, affinity, &exclude).await {
             Ok(Some(auth)) => {
                 request = apply_upstream_headers(request, &auth, target);
                 Some(auth)
             }
-            Ok(None) => None,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "no_upstream_credential",
+                    "No healthy upstream credential for this route; re-login the account in Codex Spur",
+                );
+            }
             Err(response) => return response,
         };
         let response = match request.send().await {
@@ -532,12 +538,18 @@ async fn forward_chat_compatible(
     let started = std::time::Instant::now();
     for attempt in 0..max_switches {
         let mut request = state.client.post(&endpoint).json(&chat_body);
-        let auth = match upstream_auth(state, &target.provider_id, affinity, &exclude).await {
+        let auth = match upstream_auth(state, target, affinity, &exclude).await {
             Ok(Some(auth)) => {
                 request = apply_upstream_headers(request, &auth, target);
                 Some(auth)
             }
-            Ok(None) => None,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "no_upstream_credential",
+                    "No healthy upstream credential for this route; re-login the account in Codex Spur",
+                );
+            }
             Err(response) => return response,
         };
         let upstream = match request.send().await {
@@ -1297,10 +1309,11 @@ async fn handle_upstream_failure(
 
 async fn upstream_auth(
     state: &ProxyState,
-    provider_id: &str,
+    target: &RouteTarget,
     affinity: &AffinityInputs,
     exclude: &[String],
 ) -> Result<Option<UpstreamAuth>, Response> {
+    let provider_id = target.provider_id.as_str();
     let lease = state
         .storage
         .select_for_request(
@@ -1319,10 +1332,10 @@ async fn upstream_auth(
         })?;
 
     let Some(lease) = lease else {
-        // Last resort for providers without pool members yet.
+        // No eligible pool member: try healthy, then any refreshable OAuth (recovery).
         let credential = state
             .storage
-            .first_healthy_credential(provider_id)
+            .first_refreshable_oauth_credential(provider_id)
             .await
             .map_err(|error| {
                 error_response(
@@ -1332,10 +1345,37 @@ async fn upstream_auth(
                 )
             })?;
         let Some(credential) = credential else {
-            return Ok(None);
+            // API-key providers without oauth: fall back to first healthy.
+            let credential = state
+                .storage
+                .first_healthy_credential(provider_id)
+                .await
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "credential_store_error",
+                        &error.to_string(),
+                    )
+                })?;
+            let Some(credential) = credential else {
+                return Ok(None);
+            };
+            return decrypt_auth(
+                state,
+                target,
+                &Lease {
+                    id: format!("ephemeral-{}", Uuid::new_v4()),
+                    credential_id: credential.id.clone(),
+                    layer: crate::scheduler::SelectionLayer::LoadBalance,
+                    sticky_escaped: false,
+                },
+                credential,
+            )
+            .await;
         };
         return decrypt_auth(
             state,
+            target,
             &Lease {
                 id: format!("ephemeral-{}", Uuid::new_v4()),
                 credential_id: credential.id.clone(),
@@ -1362,12 +1402,13 @@ async fn upstream_auth(
         let _ = state.storage.release_lease(&lease.id).await;
         return Ok(None);
     };
-    decrypt_auth(state, &lease, credential).await
+    decrypt_auth(state, target, &lease, credential).await
 }
 
 #[allow(clippy::result_large_err)]
 async fn decrypt_auth(
     state: &ProxyState,
+    target: &RouteTarget,
     lease: &Lease,
     mut credential: crate::storage::StoredCredential,
 ) -> Result<Option<UpstreamAuth>, Response> {
@@ -1390,52 +1431,99 @@ async fn decrypt_auth(
     })?;
     let mut expires_at_for_store: Option<i64> = None;
     let mut secret_dirty = false;
+    let mut refreshed_ok = false;
+    // Prefer explicit route kind; fall back to known xAI hosts only (never treat empty base as xAI).
+    let base_lower = target.base_url.to_ascii_lowercase();
+    let is_xai = target.kind == "xai"
+        || base_lower.contains("cli-chat-proxy.grok.com")
+        || base_lower.contains("api.x.ai");
 
-    // Refresh ChatGPT OAuth access tokens before they expire (official subscription).
+    // Refresh OAuth access tokens before they expire. Branch by upstream kind:
+    // xAI/Grok uses auth.x.ai; ChatGPT uses the OpenAI OAuth token endpoint.
     if secret.api_key.is_none() {
-        if let (Some(access), Some(refresh)) = (
-            secret.access_token.as_deref(),
-            secret.refresh_token.as_deref(),
-        ) {
-            if crate::openai_oauth::access_token_needs_refresh(access, None) {
-                match crate::openai_oauth::refresh_chatgpt_tokens(
-                    refresh,
-                    secret.id_token.as_deref(),
-                )
-                .await
+        if let Some(refresh) = secret.refresh_token.clone() {
+            let needs = match secret.access_token.as_deref() {
+                Some(access) => crate::openai_oauth::access_token_needs_refresh(
+                    access,
+                    credential.expires_at,
+                ),
+                // Missing access token — must refresh when we still have refresh_token.
+                None => true,
+            };
+            if needs {
+                let refresh_result = if is_xai {
+                    crate::xai_oauth::refresh_xai_tokens(&refresh)
+                        .await
+                        .map(|t| {
+                            (
+                                t.access_token,
+                                t.refresh_token,
+                                t.id_token,
+                                t.account_id,
+                                t.expires_at,
+                            )
+                        })
+                } else if target.kind == "openai"
+                    || target.base_url.contains("chatgpt.com")
+                    || target.base_url.contains("openai.com")
                 {
-                    Ok(refreshed) => {
-                        secret.access_token = Some(refreshed.access_token.clone());
-                        if let Some(id_token) = refreshed.id_token {
+                    crate::openai_oauth::refresh_chatgpt_tokens(&refresh, secret.id_token.as_deref())
+                        .await
+                        .map(|t| {
+                            (
+                                t.access_token,
+                                t.refresh_token,
+                                t.id_token,
+                                t.account_id,
+                                t.expires_at,
+                            )
+                        })
+                } else {
+                    // Unknown oauth upstream — do not call ChatGPT refresh by default.
+                    Err("unsupported oauth refresh for this provider kind".into())
+                };
+
+                match refresh_result {
+                    Ok((access_token, new_refresh, id_token, account_id, expires_at)) => {
+                        secret.access_token = Some(access_token);
+                        if let Some(id_token) = id_token {
                             secret.id_token = Some(id_token);
                         }
-                        if let Some(new_refresh) = refreshed.refresh_token {
+                        if let Some(new_refresh) = new_refresh {
                             secret.refresh_token = Some(new_refresh);
                         }
-                        if !refreshed.account_id.trim().is_empty() {
-                            credential.account_id = Some(refreshed.account_id);
+                        if !account_id.trim().is_empty() {
+                            credential.account_id = Some(account_id);
                         }
-                        expires_at_for_store = refreshed.expires_at;
+                        expires_at_for_store = expires_at;
                         secret_dirty = true;
+                        refreshed_ok = true;
                     }
                     Err(error) => {
                         let lower = error.to_lowercase();
-                        if lower.contains("invalid_grant")
+                        let hard_fail = lower.contains("invalid_grant")
                             || lower.contains("invalid_token")
                             || lower.contains("expired")
-                        {
+                            || lower.contains("revoked");
+                        if hard_fail {
+                            let msg = if is_xai {
+                                "Grok OAuth refresh 失败，请在 Spur 中重新登录该 Grok 账号"
+                            } else {
+                                "OAuth refresh 失败，请重新登录官方订阅"
+                            };
                             let _ = state
                                 .storage
                                 .mark_schedule_state(
                                     &credential.id,
                                     ScheduleState::AuthInvalid,
                                     false,
-                                    Some("OAuth refresh 失败，请重新登录官方订阅"),
+                                    Some(msg),
                                     None,
                                 )
                                 .await;
                         }
                         // Fall through with existing access token; upstream may still 401.
+                        let _ = error;
                     }
                 }
             }
@@ -1443,12 +1531,13 @@ async fn decrypt_auth(
     }
 
     // Recover missing ChatGPT account_id (partial JSON imports) for upstream headers.
-    if credential
-        .account_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
+    if !is_xai
+        && credential
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
     {
         if let Some(access) = secret.access_token.as_deref() {
             if let Ok(id) = crate::openai_oauth::ensure_chatgpt_account_id(
@@ -1490,6 +1579,21 @@ async fn decrypt_auth(
                 }
             }
         }
+    }
+
+    // Successful refresh heals auth_invalid / unhealthy so the scheduler can
+    // select this account again on subsequent turns.
+    if refreshed_ok {
+        let _ = state
+            .storage
+            .mark_schedule_state(
+                &credential.id,
+                ScheduleState::Ready,
+                true,
+                None,
+                None,
+            )
+            .await;
     }
 
     let token = secret
