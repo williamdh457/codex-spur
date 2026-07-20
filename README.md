@@ -59,7 +59,7 @@ Closing the main window keeps the menu-bar proxy alive. Quitting the app stops t
 |---|---|
 | Platform | macOS (Apple Silicon first) |
 | Stack | Tauri 2 · React · TypeScript · Rust |
-| Version | **0.1.0** |
+| Version | **0.1.1** |
 | License | MIT |
 
 ---
@@ -131,12 +131,19 @@ Typical data directory:
 ### From Release
 
 1. Open the [latest Release](https://github.com/williamdh457/codex-spur/releases/latest) and download  
-   `Codex.Spur_0.1.0_aarch64.dmg` (GitHub may normalize spaces in the asset name)
+   `Codex.Spur_0.1.1_aarch64.dmg` (GitHub may normalize spaces in the asset name)
 2. Open the DMG and drag **Codex Spur** into Applications
-3. If Gatekeeper blocks first launch: **System Settings → Privacy & Security → Open Anyway** (or right-click → Open)
+3. **First launch (unsigned builds):** macOS may say the app is **damaged** or cannot be opened. That is almost always **Gatekeeper quarantine**, not a corrupt download:
+   - Prefer: right-click the app → **Open** → confirm, **or**  
+     **System Settings → Privacy & Security → Open Anyway**
+   - If it still says damaged, clear quarantine once:
+     ```bash
+     xattr -cr "/Applications/Codex Spur.app"
+     ```
+     then open the app again (or right-click → Open).
 4. Leave the menu-bar process running while you use Spur-backed models
 
-> Builds are commonly unsigned / un-notarized for personal distribution. Sign and notarize yourself for enterprise deployment.
+> Public GitHub DMGs are usually **ad-hoc signed and not notarized**. That is enough for local development; downloaded copies get a quarantine flag and Gatekeeper blocks them until you open once or clear `xattr`. A permanent fix for other users requires an **Apple Developer Program** membership ($99/year), a **Developer ID Application** certificate, and **notarization + staple** before upload.
 
 ### Uninstall
 
@@ -265,10 +272,16 @@ Codex Spur is a local integration helper. Upstream APIs and Desktop behavior can
 
 ```bash
 npm run bundle:dmg
-git tag -a v0.1.0 -m "v0.1.0"
+git tag -a v0.1.1 -m "v0.1.1"
 git push origin main --tags
-gh release create v0.1.0 \
-  "src-tauri/target/release/bundle/dmg/Codex Spur_0.1.0_aarch64.dmg" \
-  --title "Codex Spur 0.1.0" \
+gh release create v0.1.1 \
+  "src-tauri/target/release/bundle/dmg/Codex Spur_0.1.1_aarch64.dmg" \
+  --title "Codex Spur 0.1.1" \
   --notes-file CHANGELOG.md
 ```
+
+### Optional: Developer ID sign + notarize (removes “app is damaged”)
+
+1. Enroll in [Apple Developer Program](https://developer.apple.com/programs/) and create a **Developer ID Application** certificate in Keychain.
+2. Export an App Store Connect API key (or use Apple ID + app-specific password) for notarization.
+3. Configure Tauri signing / notarization env vars (see [Tauri macOS code signing](https://v2.tauri.app/distribute/sign/macos/)), then rebuild the DMG and staple the ticket before `gh release create`.

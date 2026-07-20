@@ -80,6 +80,13 @@ Product implications (must fix in proxy/product, not by catalog-only edits):
 3. Surface proxy/stream errors clearly; “已处理” must not look like success when `task_complete.error` is set.
 4. Sticky-model bugs (UI shows model A, HTTP still sends model B) are a related class; see prior notes under CC Switch sticky sessions.
 
+**Proxy invariants (Codex Spur):**
+
+- OpenAI Responses path: **drop all reasoning items** in replayed `input[]` (Grok/xAI encrypted blobs are not OpenAI-decryptable; Chat-bridge summary-only reasoning 404s under `store=false`). Keep messages + tool calls; rewrite message ids to `msg…`.
+- Non-OpenAI Responses path (xAI/Grok, MiniMax, custom, …): **also drop all reasoning items** (and `item_reference` when `store` is not true). Official OpenAI `encrypted_content` (`gAAAAA…`) replayed into Grok yields `Could not decrypt the provided encrypted_content`. After any drop, strip `previous_response_id`. Keep messages + tool calls.
+- Both directions are required: Grok/DeepSeek → GPT **and** GPT → Grok. Do not leave sanitization asymmetric.
+- Chat Completions path (DeepSeek/Kimi): **preserve** `function_call` / `function_call_output` history as assistant `tool_calls` + `role=tool`; **parse and emit** streaming `tool_calls` as Responses `function_call` items. Reasoning is already skipped in the chat bridge. Never complete a reasoning-only stream as a healthy agent turn with zero tools and zero message when tools were the intended next step — at minimum emit a message item so Desktop does not silently shut down.
+
 ## 4. Security and privacy rules
 
 - Secrets are local-only. No telemetry or remote service may receive imported credentials.

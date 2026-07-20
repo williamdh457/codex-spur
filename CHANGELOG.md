@@ -2,6 +2,21 @@
 
 All notable changes to Codex Spur are documented in this file.
 
+## [0.1.1] - 2026-07-21
+
+### Fixed
+
+- **Cross-provider mid-thread switches** in Codex App / Desktop:
+  - OpenAI Responses path drops **all** replayed `reasoning` items (foreign `encrypted_content` and Chat-bridge summary-only reasoning are not portable).
+  - Non-OpenAI Responses path (xAI/Grok, MiniMax, custom, …) also drops **all** reasoning and strips `previous_response_id` after sanitization — fixes GPT → Grok `Could not decrypt the provided encrypted_content`.
+  - Chat Completions bridge (DeepSeek/Kimi): preserve `function_call` / `function_call_output` history and emit streaming `tool_calls` as Responses function-call items — fixes silent empty turns after Grok/DeepSeek agent work.
+- Document bidirectional proxy sanitization invariants in `AGENTS.md`.
+- Clarify Gatekeeper “app is damaged” install workaround for unsigned GitHub DMG downloads.
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.1** (still ad-hoc / un-notarized unless you sign with your own Developer ID).
+
 ## [0.1.0] - 2026-07-20
 
 ### Highlights

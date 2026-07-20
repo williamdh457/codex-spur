@@ -715,21 +715,27 @@ async fn forward_chat_compatible(
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let reasoning = payload
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                payload
+                    .pointer("/choices/0/message/reasoning")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default();
+        let tool_calls = tool_calls_from_chat_message(payload.pointer("/choices/0/message"));
         // Align with CC Switch `response_id_from_chat_id` + type-prefixed item ids.
         let response_id = response_id_from_chat_id(payload.get("id").and_then(Value::as_str));
         let usage = chat_usage_to_responses_usage(payload.get("usage"));
+        let output =
+            chat_parts_to_responses_output(&response_id, text, reasoning, &tool_calls);
         return Json(json!({
             "id": response_id,
             "object": "response",
             "status": "completed",
             "model": target.upstream_model,
-            "output": [{
-                "id": message_item_id_from_response_id(&response_id),
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}]
-            }],
+            "output": output,
             "usage": usage
         }))
         .into_response();
@@ -805,13 +811,15 @@ async fn adapt_chat_stream(
     // Chat Completions SSE → Responses SSE with the full lifecycle Desktop needs.
     // Skipping created/in_progress/item/content_part events makes ChatGPT Desktop
     // drop the turn as "stopped after 0s" even when upstream returned text.
+    // Must also surface tool_calls — agent turns are almost always think→tool.
     let parsed = parse_chat_completions_sse(&body);
-    let stream = chat_text_to_responses_sse(
+    let stream = chat_parsed_to_responses_sse(
         &parsed.response_id,
         model_id,
         parsed.created_at,
         &parsed.text,
         &parsed.reasoning,
+        &parsed.tool_calls,
         parsed.usage.as_ref(),
     );
     let usage = chat_usage_to_responses_usage(parsed.usage.as_ref());
@@ -845,21 +853,32 @@ async fn adapt_chat_stream(
         })
 }
 
+#[derive(Debug, Default, Clone)]
+struct AssembledToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
 #[derive(Debug, Default)]
 struct ParsedChatSse {
     response_id: String,
     created_at: u64,
     text: String,
     reasoning: String,
+    tool_calls: Vec<AssembledToolCall>,
     usage: Option<Value>,
 }
 
-/// Collect text / reasoning / usage from a buffered Chat Completions SSE body.
+/// Collect text / reasoning / tool_calls / usage from a buffered Chat Completions SSE body.
 fn parse_chat_completions_sse(body: &str) -> ParsedChatSse {
     let mut parsed = ParsedChatSse {
         response_id: format!("resp_{}", Uuid::new_v4()),
         ..ParsedChatSse::default()
     };
+    // index → partial tool call (DeepSeek streams name/args across chunks).
+    let mut tool_by_index: std::collections::BTreeMap<usize, AssembledToolCall> =
+        std::collections::BTreeMap::new();
     for line in body.lines() {
         let Some(data) = line.strip_prefix("data:") else {
             continue;
@@ -896,12 +915,43 @@ fn parse_chat_completions_sse(body: &str) -> ParsedChatSse {
                         parsed.reasoning.push_str(chunk);
                     }
                 }
+                merge_chat_tool_call_deltas(
+                    &mut tool_by_index,
+                    delta_obj.get("tool_calls").and_then(Value::as_array),
+                );
+            }
+            // Some gateways put tool_calls on the final message, not only delta.
+            if let Some(message) = delta.get("message") {
+                if parsed.text.is_empty() {
+                    if let Some(content) = message.get("content").and_then(Value::as_str) {
+                        parsed.text.push_str(content);
+                    }
+                }
+                for key in ["reasoning_content", "reasoning", "reasoning_text"] {
+                    if parsed.reasoning.is_empty() {
+                        if let Some(chunk) = message.get(key).and_then(Value::as_str) {
+                            parsed.reasoning.push_str(chunk);
+                        }
+                    }
+                }
+                if tool_by_index.is_empty() {
+                    for (i, tc) in tool_calls_from_chat_message(Some(message))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        tool_by_index.insert(i, tc);
+                    }
+                }
             }
         }
         if let Some(next_usage) = payload.get("usage").filter(|value| !value.is_null()) {
             parsed.usage = Some(next_usage.clone());
         }
     }
+    parsed.tool_calls = tool_by_index
+        .into_values()
+        .filter(|tc| !tc.name.is_empty())
+        .collect();
     if parsed.created_at == 0 {
         parsed.created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -909,6 +959,128 @@ fn parse_chat_completions_sse(body: &str) -> ParsedChatSse {
             .unwrap_or(0);
     }
     parsed
+}
+
+fn merge_chat_tool_call_deltas(
+    tool_by_index: &mut std::collections::BTreeMap<usize, AssembledToolCall>,
+    deltas: Option<&Vec<Value>>,
+) {
+    let Some(deltas) = deltas else {
+        return;
+    };
+    for tc in deltas {
+        let index = tc
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let entry = tool_by_index.entry(index).or_default();
+        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                entry.id = id.to_string();
+            }
+        }
+        let function = tc.get("function").unwrap_or(tc);
+        if let Some(name) = function.get("name").and_then(Value::as_str) {
+            // First non-empty name wins; later chunks often re-send "".
+            if !name.is_empty() && entry.name.is_empty() {
+                entry.name = name.to_string();
+            }
+        }
+        if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+            entry.arguments.push_str(args);
+        }
+    }
+}
+
+fn tool_calls_from_chat_message(message: Option<&Value>) -> Vec<AssembledToolCall> {
+    let Some(message) = message else {
+        return Vec::new();
+    };
+    let Some(items) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tc in items {
+        let function = tc.get("function").unwrap_or(tc);
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(AssembledToolCall {
+            id: tc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            name,
+            arguments: function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string(),
+        });
+    }
+    out
+}
+
+fn function_call_item_id(response_id: &str, index: usize) -> String {
+    let stem = response_id.strip_prefix("resp_").unwrap_or(response_id);
+    format!("fc_{stem}_{index}")
+}
+
+fn function_call_call_id(assembled: &AssembledToolCall, response_id: &str, index: usize) -> String {
+    if !assembled.id.is_empty() {
+        return assembled.id.clone();
+    }
+    let stem = response_id.strip_prefix("resp_").unwrap_or(response_id);
+    format!("call_{stem}_{index}")
+}
+
+/// Build Responses `output[]` from Chat Completions parts (non-stream path).
+fn chat_parts_to_responses_output(
+    response_id: &str,
+    text: &str,
+    reasoning: &str,
+    tool_calls: &[AssembledToolCall],
+) -> Vec<Value> {
+    let mut output = Vec::new();
+    let reasoning = reasoning.trim();
+    if !reasoning.is_empty() {
+        output.push(json!({
+            "id": reasoning_item_id_from_response_id(response_id),
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": reasoning }]
+        }));
+    }
+    for (index, tc) in tool_calls.iter().enumerate() {
+        if tc.name.is_empty() {
+            continue;
+        }
+        output.push(json!({
+            "id": function_call_item_id(response_id, index),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": function_call_call_id(tc, response_id, index),
+            "name": tc.name,
+            "arguments": if tc.arguments.is_empty() { "{}" } else { tc.arguments.as_str() }
+        }));
+    }
+    // Always emit a message when there is text, or when there were no tools
+    // (empty reply still needs a completed message for Desktop lifecycle).
+    if !text.is_empty() || tool_calls.is_empty() {
+        output.push(json!({
+            "id": message_item_id_from_response_id(response_id),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+        }));
+    }
+    output
 }
 
 fn sse_event(event: &str, data: &Value) -> String {
@@ -974,15 +1146,17 @@ fn reasoning_item_id_from_response_id(response_id: &str) -> String {
 
 /// Build the Responses SSE lifecycle Desktop expects (CC Switch / Nice Switch shape).
 ///
-/// Minimal complete sequence for a text answer (optional reasoning first):
+/// Sequence for text and/or tool calls (optional reasoning first):
 /// `response.created` → `response.in_progress` →
 /// [reasoning item lifecycle] →
-/// `output_item.added` → `content_part.added` → `output_text.delta` →
-/// `output_text.done` → `content_part.done` → `output_item.done` →
+/// [function_call item lifecycle per tool] →
+/// [message item lifecycle when text present, or when no tools] →
 /// `response.completed`
 ///
 /// Emitting only `output_text.delta` + `completed` makes ChatGPT Desktop show
-/// "stopped after 0s" with no assistant bubble.
+/// "stopped after 0s" with no assistant bubble. Emitting reasoning without
+/// tools/text used to complete as a silent empty agent turn.
+#[cfg(test)]
 fn chat_text_to_responses_sse(
     response_id: &str,
     model: &str,
@@ -991,8 +1165,20 @@ fn chat_text_to_responses_sse(
     reasoning: &str,
     raw_usage: Option<&Value>,
 ) -> String {
+    chat_parsed_to_responses_sse(response_id, model, created_at, text, reasoning, &[], raw_usage)
+}
+
+fn chat_parsed_to_responses_sse(
+    response_id: &str,
+    model: &str,
+    created_at: u64,
+    text: &str,
+    reasoning: &str,
+    tool_calls: &[AssembledToolCall],
+    raw_usage: Option<&Value>,
+) -> String {
     let usage = chat_usage_to_responses_usage(raw_usage);
-    let mut out = String::with_capacity(text.len().saturating_mul(2) + 2048);
+    let mut out = String::with_capacity(text.len().saturating_mul(2) + 4096);
     let mut output_items: Vec<Value> = Vec::new();
     let mut next_output_index: u32 = 0;
 
@@ -1021,9 +1207,8 @@ fn chat_text_to_responses_sse(
 
     // Optional reasoning item (DeepSeek reasoner / thinking models).
     // Desktop shows summary text here, but there is no OpenAI-signed
-    // `encrypted_content`. Replaying this item into OpenAI with store=false
-    // 404s — inbound `sanitize_openai_responses_input` drops those on the way
-    // back to OpenAI.
+    // `encrypted_content`. Replaying this item into OpenAI is stripped by
+    // `sanitize_openai_responses_input` (all reasoning dropped on OpenAI path).
     let reasoning = reasoning.trim();
     if !reasoning.is_empty() {
         let item_id = reasoning_item_id_from_response_id(response_id);
@@ -1098,11 +1283,78 @@ fn chat_text_to_responses_sse(
         output_items.push(reasoning_item);
     }
 
-    // Assistant message item — always emit when we have text, or when there was no
-    // reasoning either (empty reply still needs a completed message for Desktop).
+    // Function calls — required for Codex agent turns over Chat Completions.
+    for (index, tc) in tool_calls.iter().enumerate() {
+        if tc.name.is_empty() {
+            continue;
+        }
+        let item_id = function_call_item_id(response_id, index);
+        let call_id = function_call_call_id(tc, response_id, index);
+        let arguments = if tc.arguments.is_empty() {
+            "{}"
+        } else {
+            tc.arguments.as_str()
+        };
+        let output_index = next_output_index;
+        next_output_index += 1;
+        let item = json!({
+            "id": item_id,
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": call_id,
+            "name": tc.name,
+            "arguments": ""
+        });
+        out.push_str(&sse_event(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.function_call_arguments.delta",
+            &json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": arguments
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.function_call_arguments.done",
+            &json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "arguments": arguments
+            }),
+        ));
+        let done_item = json!({
+            "id": item_id,
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": tc.name,
+            "arguments": arguments
+        });
+        out.push_str(&sse_event(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": done_item
+            }),
+        ));
+        output_items.push(done_item);
+    }
+
+    // Assistant message — emit when we have text, or when there were no tools
+    // (including reasoning-only empty replies so Desktop still gets a message item).
     let has_text = !text.is_empty();
-    if has_text || output_items.is_empty() {
-        // OpenAI-shaped prefix (`msg_…`), not the legacy `{resp}_msg` suffix.
+    let has_tools = tool_calls.iter().any(|tc| !tc.name.is_empty());
+    if has_text || !has_tools {
         let item_id = message_item_id_from_response_id(response_id);
         let output_index = next_output_index;
         out.push_str(&sse_event(
@@ -1832,9 +2084,10 @@ fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
 ///
 /// OpenAI kind (官方订阅 / JSON 多账号 / API Key) keeps Codex-native shapes,
 /// but still sanitizes Desktop history that was poisoned by Chat-bridge turns
-/// (bad message ids, reasoning without `encrypted_content`, dead item refs).
-/// All other kinds share this expandable pipeline so future subscriptions do not
-/// re-introduce namespace/tool_choice/input 422s.
+/// (bad message ids, foreign reasoning/`encrypted_content`, dead item refs).
+/// Non-OpenAI kinds share this pipeline: strip Codex-only tools/tool_choice,
+/// drop **all** reasoning (OpenAI ciphertext is not xAI-decryptable), and
+/// clamp fields so future subscriptions do not re-introduce 422s.
 fn sanitize_responses_request_for_upstream(kind: &str, request: &mut Value) {
     if keeps_codex_native_tools(kind) {
         sanitize_openai_responses_input(request);
@@ -1845,18 +2098,6 @@ fn sanitize_responses_request_for_upstream(kind: &str, request: &mut Value) {
     sanitize_responses_input_for_upstream(request);
     strip_unsupported_responses_fields(request);
     clamp_responses_fields_for_kind(kind, request);
-}
-
-/// Whether a reasoning item can be safely replayed under OpenAI Responses.
-///
-/// With `store=false`, OpenAI looks up reasoning by id unless a real
-/// `encrypted_content` blob is present. Chat-bridge turns (Kimi/DeepSeek) only
-/// emit summary text → Desktop replays them → 404
-/// `Item with id 'rs_…' not found. Items are not persisted when store is false.`
-fn reasoning_has_portable_encrypted_content(item: &Value) -> bool {
-    item.get("encrypted_content")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty())
 }
 
 /// Rewrite one message-like item's id to OpenAI's `msg…` prefix, if needed.
@@ -1887,7 +2128,8 @@ fn rewrite_openai_message_item_id(item: &mut Value) {
 ///
 /// Layers:
 /// 1. Message ids must begin with `msg` (legacy Spur/CC Switch used `resp_…_msg`).
-/// 2. Drop reasoning items without non-empty `encrypted_content` (not portable).
+/// 2. Drop **all** reasoning items (foreign encrypted_content decrypts fail;
+///    bridge-only reasoning 404s under `store=false`).
 /// 3. When `store` is not `true`, drop `item_reference` (unresolvable offline).
 /// 4. If any input item was dropped, strip `previous_response_id` so OpenAI does
 ///    not chase a Spur-synthetic or already-invalid server id.
@@ -1902,12 +2144,8 @@ fn sanitize_openai_responses_input(request: &mut Value) {
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
             match item_type {
                 "reasoning" => {
-                    if reasoning_has_portable_encrypted_content(&item) {
-                        next.push(item);
-                    } else {
-                        // OpenAI: "remove this item from your input".
-                        dropped_any = true;
-                    }
+                    // Never portable across Grok/DeepSeek/Kimi ↔ OpenAI.
+                    dropped_any = true;
                 }
                 "item_reference" if drop_item_references => {
                     dropped_any = true;
@@ -2000,7 +2238,7 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
     match choice {
         Value::String(s) => {
             // auto/none/required are fine when tools remain.
-            matches!(s.as_str(), "auto" | "none" | "required") == false
+            !matches!(s.as_str(), "auto" | "none" | "required")
                 && !tools.iter().any(|t| {
                     t.get("name").and_then(Value::as_str) == Some(s.as_str())
                         || t.pointer("/function/name").and_then(Value::as_str) == Some(s.as_str())
@@ -2042,31 +2280,49 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
     }
 }
 
-/// Drop Codex-only input carriers that third-party Responses hosts reject.
+/// Drop Codex-only / non-portable input carriers that third-party Responses hosts reject.
 ///
 /// - `additional_tools`: Responses Lite private carrier (xAI ModelInput fails)
-/// - `reasoning` items with `"content": null` (xAI untagged enum → 422)
+/// - **all** `reasoning` items: OpenAI/xAI `encrypted_content` is not portable across
+///   providers (official GPT → Grok fails with "Could not decrypt encrypted_content");
+///   summary-only bridge reasoning is also dropped for symmetry with the OpenAI path
+/// - `item_reference` when `store` is not true (unresolvable on foreign hosts)
+/// - If anything was dropped, strip `previous_response_id` so affinity does not chase
+///   an OpenAI (or other foreign) response id on xAI/MiniMax/etc.
 fn sanitize_responses_input_for_upstream(request: &mut Value) {
+    let store_is_true = request.get("store").and_then(Value::as_bool) == Some(true);
+    let drop_item_references = !store_is_true;
+
+    let mut dropped_any = false;
     let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
     let mut next = Vec::with_capacity(items.len());
-    for mut item in items.drain(..) {
+    for item in items.drain(..) {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        if item_type == "additional_tools" {
-            continue;
-        }
-        if item_type == "reasoning" {
-            if item.get("content").is_some_and(Value::is_null) {
-                if let Some(object) = item.as_object_mut() {
-                    object.remove("content");
-                }
+        match item_type {
+            "additional_tools" => {
+                dropped_any = true;
+            }
+            // Symmetric with sanitize_openai_responses_input: foreign encrypted
+            // reasoning cannot be decrypted by the current upstream (e.g. OpenAI
+            // gAAAAA… blobs on xAI → invalid-argument decrypt error).
+            "reasoning" => {
+                dropped_any = true;
+            }
+            "item_reference" if drop_item_references => {
+                dropped_any = true;
+            }
+            _ => {
+                next.push(item);
             }
         }
-        next.push(item);
     }
     if let Some(object) = request.as_object_mut() {
         object.insert("input".into(), Value::Array(next));
+        if dropped_any {
+            object.remove("previous_response_id");
+        }
     }
 }
 
@@ -2436,35 +2692,99 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
         Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
         Some(Value::Array(items)) => {
             let mut messages = Vec::new();
+            // Batch consecutive function_call items into one assistant tool_calls msg.
+            let mut pending_tool_calls: Vec<Value> = Vec::new();
+
+            let flush_pending_tools = |messages: &mut Vec<Value>, pending: &mut Vec<Value>| {
+                if pending.is_empty() {
+                    return;
+                }
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": std::mem::take(pending)
+                }));
+            };
+
             for item in items {
                 let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-                // Skip tool/function call items for the first vertical slice; text only.
-                if matches!(
-                    item_type,
-                    "function_call"
-                        | "function_call_output"
-                        | "custom_tool_call"
-                        | "custom_tool_call_output"
-                        | "reasoning"
-                        | "web_search_call"
-                ) {
-                    continue;
-                }
-                let raw_role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                let role = responses_role_to_chat_role(raw_role);
-                if let Some(content) = item.get("content") {
-                    let text = content_text(content);
-                    if !text.is_empty() || role == "assistant" {
-                        messages.push(json!({"role": role, "content": text}));
+                match item_type {
+                    // Encrypted / foreign reasoning is not meaningful on Chat Completions.
+                    "reasoning" | "web_search_call" | "item_reference" => continue,
+                    "custom_tool_call" | "custom_tool_call_output" => {
+                        // Not mapped in v1; drop rather than poison history.
+                        continue;
                     }
-                    continue;
-                }
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        messages.push(json!({"role": role, "content": text}));
+                    "function_call" => {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if call_id.is_empty() || name.is_empty() {
+                            continue;
+                        }
+                        let arguments = match item.get("arguments") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) => v.to_string(),
+                            None => "{}".into(),
+                        };
+                        pending_tool_calls.push(json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments
+                            }
+                        }));
+                    }
+                    "function_call_output" => {
+                        flush_pending_tools(&mut messages, &mut pending_tool_calls);
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if call_id.is_empty() {
+                            continue;
+                        }
+                        let output = match item.get("output") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) => v.to_string(),
+                            None => String::new(),
+                        };
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": output
+                        }));
+                    }
+                    _ => {
+                        flush_pending_tools(&mut messages, &mut pending_tool_calls);
+                        let raw_role =
+                            item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let role = responses_role_to_chat_role(raw_role);
+                        if let Some(content) = item.get("content") {
+                            let text = content_text(content);
+                            if !text.is_empty() || role == "assistant" {
+                                messages.push(json!({"role": role, "content": text}));
+                            }
+                            continue;
+                        }
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                messages.push(json!({"role": role, "content": text}));
+                            }
+                        }
                     }
                 }
             }
+            flush_pending_tools(&mut messages, &mut pending_tool_calls);
             if messages.is_empty() {
                 vec![json!({"role": "user", "content": ""})]
             } else {
@@ -3036,8 +3356,9 @@ mod tests {
     }
 
     #[test]
-    fn openai_input_drops_bridge_reasoning_and_item_refs_when_store_false() {
-        // Repro of user log: rs_resp_… from Chat-bridge + store=false → OpenAI 404.
+    fn openai_input_drops_all_reasoning_and_item_refs_when_store_false() {
+        // Bridge summary-only reasoning 404s; Grok encrypted_content decrypts fail.
+        // OpenAI path drops every reasoning item so Grok/DeepSeek → GPT is safe.
         let mut request = json!({
             "store": false,
             "previous_response_id": "resp_DrEsjCIVmIVVpgzXc7U8pVV4",
@@ -3059,8 +3380,8 @@ mod tests {
                 },
                 {
                     "type": "reasoning",
-                    "id": "rs_real",
-                    "encrypted_content": "opaque-ciphertext",
+                    "id": "rs_grok_foreign",
+                    "encrypted_content": "opaque-ciphertext-from-xai",
                     "summary": []
                 },
                 {
@@ -3075,15 +3396,41 @@ mod tests {
         let input = request["input"].as_array().unwrap();
         assert_eq!(
             input.len(),
-            3,
-            "bridge reasoning + item_ref dropped: {input:?}"
+            2,
+            "all reasoning + item_ref dropped: {input:?}"
         );
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["id"], "msg_DrEsjCIVmIVVpgzXc7U8pVV4");
-        assert_eq!(input[1]["type"], "reasoning");
-        assert_eq!(input[1]["id"], "rs_real");
-        assert_eq!(input[2]["id"], "msg_user1");
+        assert_eq!(input[1]["id"], "msg_user1");
+        assert!(input.iter().all(|item| item["type"] != "reasoning"));
         // Dropped items → strip sticky previous_response_id.
+        assert!(request.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn openai_input_drops_encrypted_grok_reasoning_even_when_non_empty() {
+        let mut request = json!({
+            "store": false,
+            "previous_response_id": "resp_sticky",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_user1",
+                    "content": [{"type": "input_text", "text": "hi"}]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_grok",
+                    "encrypted_content": "cipher",
+                    "summary": []
+                }
+            ]
+        });
+        sanitize_openai_responses_input(&mut request);
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["id"], "msg_user1");
         assert!(request.get("previous_response_id").is_none());
     }
 
@@ -3100,10 +3447,11 @@ mod tests {
                     "content": [{"type": "input_text", "text": "hi"}]
                 },
                 {
-                    "type": "reasoning",
-                    "id": "rs_ok",
-                    "encrypted_content": "cipher",
-                    "summary": []
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}"
                 }
             ]
         });
@@ -3187,7 +3535,132 @@ data: [DONE]
         assert_eq!(parsed.created_at, 99);
         assert_eq!(parsed.text, "hi");
         assert_eq!(parsed.reasoning, "think ");
+        assert!(parsed.tool_calls.is_empty());
         assert_eq!(parsed.usage.as_ref().unwrap()["prompt_tokens"], 3);
+    }
+
+    #[test]
+    fn parse_chat_sse_assembles_streaming_tool_calls() {
+        // Repro: DeepSeek thinks then calls exec_command — must not drop tool_calls.
+        let body = r#"
+data: {"id":"chatcmpl_tools","created":1,"choices":[{"delta":{"reasoning_content":"Need to read the file."}}]}
+
+data: {"id":"chatcmpl_tools","created":1,"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command"}}]}}]}
+
+data: {"id":"chatcmpl_tools","created":1,"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"cat card-game.html\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}
+
+data: [DONE]
+"#;
+        let parsed = parse_chat_completions_sse(body);
+        assert_eq!(parsed.reasoning, "Need to read the file.");
+        assert!(parsed.text.is_empty());
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        assert_eq!(parsed.tool_calls[0].name, "exec_command");
+        assert_eq!(
+            parsed.tool_calls[0].arguments,
+            "{\"cmd\":\"cat card-game.html\"}"
+        );
+
+        let stream = chat_parsed_to_responses_sse(
+            &parsed.response_id,
+            "deepseek-v4-flash",
+            parsed.created_at,
+            &parsed.text,
+            &parsed.reasoning,
+            &parsed.tool_calls,
+            parsed.usage.as_ref(),
+        );
+        assert!(stream.contains("\"type\":\"function_call\""));
+        assert!(stream.contains("event: response.function_call_arguments.delta"));
+        assert!(stream.contains("event: response.function_call_arguments.done"));
+        assert!(stream.contains("exec_command"));
+        assert!(stream.contains("cat card-game.html"));
+        // Tool-only turn: no empty assistant message required.
+        // Reasoning should still appear before the tool call.
+        let reasoning_pos = stream.find("\"type\":\"reasoning\"").expect("reasoning");
+        let fc_pos = stream.find("\"type\":\"function_call\"").expect("function_call");
+        assert!(reasoning_pos < fc_pos);
+    }
+
+    #[test]
+    fn chat_history_preserves_function_call_and_output() {
+        // Grok wrote the file via function_call; DeepSeek must see tool trail.
+        let messages = response_input_to_messages(Some(&json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "写卡牌"}]
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_skip",
+                "encrypted_content": "foreign",
+                "summary": [{"type": "summary_text", "text": "plan"}]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "先写文件"}]
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call-write-1",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"cat > game.html << 'EOF'\\n<html/>\\nEOF\"}"
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco_1",
+                "call_id": "call-write-1",
+                "output": "done"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "增加二种卡牌"}]
+            }
+        ])));
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "先写文件");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2]["content"].is_null());
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-write-1");
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["name"],
+            "exec_command"
+        );
+        assert!(messages[2]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("game.html"));
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-write-1");
+        assert_eq!(messages[3]["content"], "done");
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(messages[4]["content"], "增加二种卡牌");
+        // Foreign reasoning must not become a chat message.
+        assert!(messages.iter().all(|m| m["role"] != "reasoning"));
+    }
+
+    #[test]
+    fn reasoning_only_without_tools_still_emits_message_item() {
+        let stream = chat_parsed_to_responses_sse(
+            "resp_empty",
+            "deepseek-v4-flash",
+            1,
+            "",
+            "I should check the file first.",
+            &[],
+            None,
+        );
+        // Avoid the silent "thinking then shut down" shape: always emit a message
+        // when there are no tools, even if text is empty.
+        assert!(stream.contains("\"type\":\"reasoning\""));
+        assert!(stream.contains("\"type\":\"message\""));
+        assert!(stream.contains("response.completed"));
     }
 
     #[test]
@@ -3416,17 +3889,105 @@ data: [DONE]
                 .all(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools")),
             "additional_tools input rows must be dropped"
         );
-        let reasoning = input
-            .iter()
-            .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
-            .expect("reasoning kept");
         assert!(
-            reasoning.get("content").is_none(),
-            "reasoning content:null must be removed"
+            input
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) != Some("reasoning")),
+            "all reasoning (incl. content:null) must be dropped on non-OpenAI path"
         );
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
         let tools = body["tools"].as_array().expect("function tool kept");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "lookup");
+    }
+
+    /// Accident replay: official GPT-5.4-Mini → Grok mid-thread (thread 019f8111…).
+    /// OpenAI `encrypted_content` (gAAAAA…) must never reach xAI Responses.
+    #[test]
+    fn xai_drops_openai_encrypted_reasoning_and_sticky_response_id() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "store": false,
+            "previous_response_id": "resp_openai_from_gpt_5_4_mini",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_user1",
+                    "content": [{"type": "input_text", "text": "帮我增加两种卡牌"}]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_047fc67e6232ba7c016a5e7b8dc31081919ccb5a219f3b634c",
+                    "summary": [],
+                    "encrypted_content": "gAAAAABqXnuOf4uNJwdYNDcUaog-J2H50PXEqDM9foreign-openai-cipher"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"echo ok\"}",
+                    "call_id": "call_EQYnOdluvZTEKyRshRkIfNts"
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fc_out_1",
+                    "call_id": "call_EQYnOdluvZTEKyRshRkIfNts",
+                    "output": "ok"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_047fc67e6232ba7c016a5e7bc38bbc8191ad230980d9814db7",
+                    "summary": [],
+                    "encrypted_content": "gAAAAABqXnvDQ6aXvKUNq30e3Hf-5MSbVzhcFz4Qanother-openai-blob"
+                },
+                {
+                    "type": "item_reference",
+                    "id": "rs_047fc67e6232ba7c016a5e7b8dc31081919ccb5a219f3b634c"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_continue",
+                    "content": [{"type": "input_text", "text": "继续"}]
+                }
+            ]
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+        let input = body["input"].as_array().expect("input");
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) != Some("reasoning")),
+            "OpenAI encrypted reasoning must not reach Grok: {input:?}"
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) != Some("item_reference")),
+            "item_reference must be dropped under store=false"
+        );
+        // Tool history + messages kept so Grok can continue the card-game work.
+        assert!(input.iter().any(|i| i.get("type") == Some(&json!("function_call"))));
+        assert!(input
+            .iter()
+            .any(|i| i.get("type") == Some(&json!("function_call_output"))));
+        assert!(input.iter().any(|i| {
+            i.get("type") == Some(&json!("message"))
+                && i.get("id") == Some(&json!("msg_continue"))
+        }));
+        assert!(
+            body.get("previous_response_id").is_none(),
+            "foreign previous_response_id must be stripped after drops"
+        );
+        // No encrypted_content anywhere in the outbound body.
+        let serialized = body.to_string();
+        assert!(
+            !serialized.contains("encrypted_content"),
+            "ciphertext must not appear in xAI request"
+        );
+        assert!(!serialized.contains("gAAAAA"));
     }
 
     #[test]
