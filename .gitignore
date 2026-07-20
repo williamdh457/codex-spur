@@ -1,0 +1,31 @@
+# Dependencies & frontend build
+node_modules/
+dist/
+
+# Logs & caches
+*.log
+npm-debug.log*
+.vite/
+.turbo/
+.cache/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Env / local secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Misc
+*.swp
+*~
