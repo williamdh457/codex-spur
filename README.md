@@ -8,8 +8,15 @@
   <b>English</b> · <a href="./README.zh-CN.md">中文</a>
 </p>
 
+<h2 align="center">
+  All your models. One Codex picker.<br>
+  One click to switch.
+</h2>
+
 <p align="center">
-  <strong>Local-first</strong> model &amp; account router for OpenAI Codex / ChatGPT Desktop on macOS.
+  <em style="font-size: 1.15em; line-height: 1.55;">
+    Connect Kimi, DeepSeek, xAI, OpenAI multi-account, or any compatible gateway once — then flip between them in the <strong>Codex / ChatGPT Desktop model menu</strong>, the same place you pick official models. No extra tabs. No API gymnastics mid-flow.
+  </em>
 </p>
 
 <p align="center">
@@ -24,13 +31,17 @@
 
 ## About
 
-Codex Spur is a **local-first** control surface for the models you actually use—not a cloud account locker and not a patcher for `ChatGPT.app`.
+### One Codex picker for every model you configured
 
-**Privacy by design.** API keys, session tokens, refresh tokens, and proxy bearer secrets stay on this Mac. They are encrypted at rest, never shown to the React UI, and never uploaded to a Codex Spur service. There is no telemetry channel for credentials.
+That is the whole point.
 
-**Codex-native switching.** After you enable models and **Review & Apply**, they appear in the Codex / ChatGPT Desktop model picker. From that picker you can **one-click switch** among every model you configured—OpenAI, Kimi, DeepSeek, xAI, custom gateways, multi-account pools—using the same UI you already use for official models.
+You wire providers in Spur, enable the routes you care about, hit **Review & Apply** — and they show up in the **native Codex model picker**. Coding on Kimi for speed, DeepSeek for cost, OpenAI for the hard pass, a custom gateway for a private endpoint: **switch with one click**, without leaving the app or rewriting configs.
 
-**No app injection.** Spur integrates only through supported seams:
+Spur is a **local-first** control surface for the models you actually ship with — not a cloud locker, not a ChatGPT.app patcher.
+
+**Keys stay on your Mac.** API keys, session tokens, refresh tokens, and proxy bearers never leave this machine: encrypted at rest, never exposed to the UI layer, never uploaded to a Codex Spur cloud. No credential telemetry.
+
+**No app injection.** Integration uses only supported seams:
 
 1. a localhost OpenAI Responses–compatible proxy  
 2. a generated `model_catalog_json`  

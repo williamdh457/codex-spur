@@ -2548,28 +2548,30 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
       <section className="panel about-panel" aria-label="About Codex Spur">
         <div className="panel__header">
           <div className="about-panel__brand">
-            <img className="about-panel__icon" src={brandIcon} alt="" width={48} height={48} />
+            <img className="about-panel__icon" src={brandIcon} alt="" width={56} height={56} />
             <div>
               <h2>About</h2>
-              <p>Codex Spur v0.1.0 · local-first model router</p>
+              <p>Codex Spur v0.1.0 · local-first</p>
             </div>
           </div>
         </div>
         <div className="about-panel__body">
-          <p>
-            <strong>Local-first &amp; private by design.</strong> API keys, session tokens, refresh tokens, and
-            proxy bearer secrets stay on this Mac. Credentials are encrypted at rest, never exposed to the UI
-            layer, and never uploaded to a Codex Spur cloud service.
+          <p className="about-panel__lead">
+            All your models. One Codex picker. One click to switch.
           </p>
           <p>
-            <strong>One-click model switching in Codex.</strong> After you enable models and Review &amp; Apply,
-            every selected route appears in the Codex / ChatGPT Desktop model picker. Switch among OpenAI, Kimi,
-            DeepSeek, xAI, custom gateways, and multi-account pools the same way you switch official models—one
-            click, no client injection.
+            Wire up Kimi, DeepSeek, xAI, OpenAI multi-account, or any compatible gateway once. Enable what you
+            want, Review &amp; Apply — and every selected model lands in the <strong>native Codex / ChatGPT
+            Desktop model menu</strong>. Flip mid-flow the same way you switch official models: no extra tabs,
+            no config rewrites, no client injection.
+          </p>
+          <p>
+            <strong>Local-first privacy.</strong> API keys, session tokens, refresh tokens, and proxy bearers stay
+            on this Mac — encrypted at rest, never exposed to the UI, never uploaded to a Codex Spur cloud.
           </p>
           <p>
             Closing the main window only hides the UI; the menu-bar proxy keeps running. Quit the app to stop the
-            proxy and release leases. Spur does not modify or inject into ChatGPT.app.
+            proxy and release leases.
           </p>
         </div>
       </section>

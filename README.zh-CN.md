@@ -8,8 +8,15 @@
   <a href="./README.md">English</a> · <b>中文</b>
 </p>
 
+<h2 align="center">
+  你配好的模型，全部进 Codex 选择器。<br>
+  一键切换。
+</h2>
+
 <p align="center">
-  面向 OpenAI Codex / ChatGPT Desktop 的 <strong>本地优先</strong> 模型与账号路由（macOS）。
+  <em style="font-size: 1.15em; line-height: 1.55;">
+    在 Spur 里接好 Kimi、DeepSeek、xAI、OpenAI 多账号或任意兼容网关，启用后点一次 <strong>Review &amp; Apply</strong>——它们就会出现在 <strong>Codex / ChatGPT Desktop 原生模型菜单</strong>里。写代码时想换模型，就在官方选择器里点一下，不用开新窗口、不用改配置、不用记一堆 API 入口。
+  </em>
 </p>
 
 <p align="center">
@@ -24,11 +31,15 @@
 
 ## 关于（About）
 
-Codex Spur 是 **local-first** 的桌面控制面：管理你真正在用的模型，而不是把凭据交给云端，也不是去改写 `ChatGPT.app`。
+### 已配置的模型，都在 Codex 选择器里一键切换
 
-**隐私优先。** API Key、session / refresh token、代理 bearer 等密钥只留在本机。落盘加密，不进入 React 前端，也不会上传到任何 Codex Spur 云服务；没有面向凭据的遥测通道。
+这就是产品本身。
 
-**在 Codex 里一键切换。** 启用模型并 **Review & Apply** 之后，它们会出现在 Codex / ChatGPT Desktop 的模型选择器中。你可以像切换官方模型一样，在已配置的全部模型之间 **一键切换**——OpenAI、Kimi、DeepSeek、xAI、自定义网关、多账号池，全部走同一选择器。
+在 Spur 接好供应商、勾选要发布的路由、**Review & Apply**——模型进入 **Codex 原生选择器**。赶速度用 Kimi、控成本用 DeepSeek、硬仗用 OpenAI、私有端点走自定义网关：全部 **一键切换**，不用离开 Codex，也不用反复改配置。
+
+Spur 是 **local-first** 的桌面控制面：管你真正在用的模型，不是把密钥交给云端，也不是去改写 `ChatGPT.app`。
+
+**密钥只留在本机。** API Key、session / refresh token、代理 bearer 加密落盘，不进入 UI，不上传任何 Codex Spur 云服务，也没有凭据遥测。
 
 **不注入客户端。** 仅通过受支持的 seam 接入：
 
