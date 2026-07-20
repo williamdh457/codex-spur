@@ -2544,12 +2544,35 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
       </section>
 
       {message && <div className={message.startsWith("已") ? "inline-success" : "inline-warning"}>{message}</div>}
-      <div className="callout">
-        <strong>桌面端原则</strong>
-        <p>
-          关闭主窗口只隐藏应用；菜单栏代理继续运行。只有“退出应用”会停止代理。不会注入或修改 ChatGPT.app。
-        </p>
-      </div>
+
+      <section className="panel about-panel" aria-label="About Codex Spur">
+        <div className="panel__header">
+          <div className="about-panel__brand">
+            <img className="about-panel__icon" src={brandIcon} alt="" width={48} height={48} />
+            <div>
+              <h2>About</h2>
+              <p>Codex Spur v0.1.0 · local-first model router</p>
+            </div>
+          </div>
+        </div>
+        <div className="about-panel__body">
+          <p>
+            <strong>Local-first &amp; private by design.</strong> API keys, session tokens, refresh tokens, and
+            proxy bearer secrets stay on this Mac. Credentials are encrypted at rest, never exposed to the UI
+            layer, and never uploaded to a Codex Spur cloud service.
+          </p>
+          <p>
+            <strong>One-click model switching in Codex.</strong> After you enable models and Review &amp; Apply,
+            every selected route appears in the Codex / ChatGPT Desktop model picker. Switch among OpenAI, Kimi,
+            DeepSeek, xAI, custom gateways, and multi-account pools the same way you switch official models—one
+            click, no client injection.
+          </p>
+          <p>
+            Closing the main window only hides the UI; the menu-bar proxy keeps running. Quit the app to stop the
+            proxy and release leases. Spur does not modify or inject into ChatGPT.app.
+          </p>
+        </div>
+      </section>
     </div>
   );
 }

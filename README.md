@@ -1,8 +1,42 @@
-# Codex Spur
+<p align="center">
+  <img src="src/assets/codex-spur-icon.png" alt="Codex Spur" width="128" height="128">
+</p>
 
-**Local-first model & account router for OpenAI Codex / ChatGPT Desktop (macOS).**
+<h1 align="center">Codex Spur</h1>
 
-Codex Spur 把你自选的模型（Kimi、DeepSeek、OpenAI 多账号、xAI/Grok、自定义网关等）发布进 Codex 右下角模型列表，**不修改、不注入** `ChatGPT.app`。
+<p align="center">
+  <b>English</b> · <a href="./README.zh-CN.md">中文</a>
+</p>
+
+<p align="center">
+  <strong>Local-first</strong> model &amp; account router for OpenAI Codex / ChatGPT Desktop on macOS.
+</p>
+
+<p align="center">
+  <a href="https://github.com/williamdh457/codex-spur/releases/latest">Download DMG</a>
+  ·
+  <a href="./CHANGELOG.md">Changelog</a>
+  ·
+  <a href="./LICENSE">MIT License</a>
+</p>
+
+---
+
+## About
+
+Codex Spur is a **local-first** control surface for the models you actually use—not a cloud account locker and not a patcher for `ChatGPT.app`.
+
+**Privacy by design.** API keys, session tokens, refresh tokens, and proxy bearer secrets stay on this Mac. They are encrypted at rest, never shown to the React UI, and never uploaded to a Codex Spur service. There is no telemetry channel for credentials.
+
+**Codex-native switching.** After you enable models and **Review & Apply**, they appear in the Codex / ChatGPT Desktop model picker. From that picker you can **one-click switch** among every model you configured—OpenAI, Kimi, DeepSeek, xAI, custom gateways, multi-account pools—using the same UI you already use for official models.
+
+**No app injection.** Spur integrates only through supported seams:
+
+1. a localhost OpenAI Responses–compatible proxy  
+2. a generated `model_catalog_json`  
+3. a dedicated provider id: `codex_select`  
+
+Closing the main window keeps the menu-bar proxy alive. Quitting the app stops the proxy and releases account leases. Version 1 does **not** install a LaunchAgent or privileged helper.
 
 | | |
 |---|---|
@@ -13,82 +47,55 @@ Codex Spur 把你自选的模型（Kimi、DeepSeek、OpenAI 多账号、xAI/Grok
 
 ---
 
-## 它做什么
+## Features
 
-Codex Spur 通过三条官方/兼容 seam 接入 Codex，而不是改客户端二进制：
+### Provider instances
 
-1. **本机 OpenAI Responses 兼容代理**（仅绑定 `127.0.0.1`）
-2. **生成的 `model_catalog_json`**
-3. **专用 provider：`codex_select`**（不会覆盖你现有的 `custom` / Nice Switch / CC Switch 等配置）
+- Add unlimited instances of the same kind (several OpenAI, several Kimi, …)
+- **Add → save & fetch models → a new row on Overview**
+- OpenAI entry methods: official browser OAuth (PKCE), API key, multi-account credentials JSON, provider config JSON
+- Kimi Code defaults to `https://api.kimi.com/coding/v1`
+- Fetched models stay **candidates** until you enable them on the Models page
 
-关闭主窗口时，菜单栏进程会继续跑代理；**退出应用**才会停代理并释放账号租约。v1 **不**安装 LaunchAgent、特权 helper 或无关后台守护进程。
+### Routing & scheduling
 
-```text
-ChatGPT Desktop / Codex
-        │  Responses API
-        ▼
-  127.0.0.1 proxy  (bearer required)
-        │
-        ├─ OpenAI / ChatGPT backend
-        ├─ Kimi / DeepSeek / MiniMax / xAI
-        └─ Custom OpenAI-compatible gateways
-```
+Multi-account OpenAI instances support:
 
----
+- `Pool` — load-aware pool selection  
+- `Fixed` — pin one account  
 
-## 功能一览
+Pool order (independent implementation of an observable contract):
 
-### 供应商实例（主对象）
+1. `previous_response_id` affinity  
+2. session-hash affinity  
+3. filtered, load-aware Top-K weighted pick  
 
-- 同一类型可添加多个实例（多个 OpenAI、多个 Kimi…）
-- **添加 → 保存并拉取模型 → 概览列表出现新行**
-- OpenAI 入口：
-  - 官方订阅（浏览器 localhost PKCE OAuth）
-  - API Key
-  - 多账号凭据 JSON
-  - 供应商配置 JSON（`base_url` / 别名 / env）
-- Kimi Code 默认 `https://api.kimi.com/coding/v1`
-- 拉取结果进入**候选**；模型页**逐个启用**后才进入 catalog / Codex 选择器
+Accounts must pass capability, token, cooldown, quota, and concurrency checks. Sticky bindings escape when unhealthy.
 
-### 路由与调度
+### Reasoning ladder
 
-多账号 OpenAI 实例支持两种模式：
-
-- `Pool` — 池内调度  
-- `Fixed` — 固定账号  
-
-Pool 调度顺序（行为契约，独立实现）：
-
-1. `previous_response_id` 亲和  
-2. session-hash 亲和  
-3. 过滤后负载感知 Top-K 加权选择  
-
-账号须通过能力、token、冷却、额度、并发等检查；不健康时 sticky 会 escape 并重绑。
-
-### Reasoning 八档
-
-Codex 侧固定阶梯：
+Every route maps all eight Codex levels:
 
 ```text
 none · minimal · low · medium · high · xhigh · max · ultra
 ```
 
-每个模型路由为八档写清上游 patch、实际行为与说明；上游不能关闭/变化的，会如实标注，不会假装档位有效。
+If an upstream model cannot vary reasoning, Spur says so honestly instead of faking distinct behavior.
 
-### 额度与重置卡
+### Quota & reset credits
 
-- 按 `limit_window_seconds` 展示最近的 **5 小时 / 7 天** 窗口  
-- 刷新失败**不会**自动禁用健康账号  
-- 消耗重置卡：显式确认 + 幂等键 + 审计；超时不确定时**禁止**换新键重试  
+- Nearest **5-hour / 7-day** windows by `limit_window_seconds`
+- Quota refresh failures do not auto-disable a healthy account
+- Reset-credit spend requires confirmation, an idempotency key, and an audit trail
 
-### 安全与隐私
+### Security
 
-- 凭据**仅本地**；无遥测上传 secret  
-- 前端**永不**收到 access/refresh token、API key、代理 bearer 明文  
-- SQLite 存 AES-256-GCM 密文；主密钥在应用数据目录 `master_key.hex`（权限 `0600`）  
-- 日志与 UI 错误会脱敏 token / email / Authorization  
+- Secrets are local-only  
+- Frontend never receives raw access tokens, refresh tokens, API keys, or proxy bearers  
+- SQLite stores AES-256-GCM ciphertext; master key is `master_key.hex` (`0600`) under the app data dir  
+- Logs and UI errors redact tokens, emails, and Authorization material  
 
-数据目录（macOS 典型路径）：
+Typical data directory:
 
 ```text
 ~/Library/Application Support/com.codexspur.desktop/
@@ -96,92 +103,79 @@ none · minimal · low · medium · high · xhigh · max · ultra
 
 ---
 
-## 安装（用户）
+## Install
 
-### 系统要求
+### Requirements
 
-- macOS **Apple Silicon**（本 release 提供 `aarch64` DMG）
-- 已安装并可登录的 **ChatGPT Desktop / Codex**（第三方模型要在 GUI 里出现，通常需要有效的 Desktop 官方登录，见下文「Desktop 可见性」）
-- 网络可访问你所配置的上游 API
+- macOS **Apple Silicon** (`aarch64` DMG for this release)
+- ChatGPT Desktop / Codex installed (third-party rows in the GUI usually need a valid Desktop login—see Desktop visibility)
+- Network access to the upstream APIs you configure
 
-### 从 Release 安装
+### From Release
 
-1. 打开 [Releases](../../releases) 页面，下载最新  
-   `Codex Spur_0.1.0_aarch64.dmg`
-2. 打开 DMG，将 **Codex Spur** 拖到「应用程序」
-3. 首次打开若遇 Gatekeeper 拦截：  
-   **系统设置 → 隐私与安全性 → 仍要打开**  
-   （或：右键 App → 打开）
-4. 启动后菜单栏会驻留；主窗口可关，代理仍在
+1. Open the [latest Release](https://github.com/williamdh457/codex-spur/releases/latest) and download  
+   `Codex.Spur_0.1.0_aarch64.dmg` (GitHub may normalize spaces in the asset name)
+2. Open the DMG and drag **Codex Spur** into Applications
+3. If Gatekeeper blocks first launch: **System Settings → Privacy & Security → Open Anyway** (or right-click → Open)
+4. Leave the menu-bar process running while you use Spur-backed models
 
-> 当前构建为**开发/未公证**常见分发形态。若你需要企业分发，请自行签名与公证。
+> Builds are commonly unsigned / un-notarized for personal distribution. Sign and notarize yourself for enterprise deployment.
 
-### 卸载
+### Uninstall
 
-1. 退出 Codex Spur（菜单栏 → 退出，不只是关窗口）  
-2. 删除 `/Applications/Codex Spur.app`  
-3. （可选）删除本地数据：  
-   `~/Library/Application Support/com.codexspur.desktop/`  
-4. 如曾 Apply 过配置，可在 App 内恢复备份，或手动检查  
-   `~/.codex/config.toml` 与 `~/.codex/codex-select/`
+1. Quit Codex Spur from the menu bar (not only close the window)  
+2. Delete `/Applications/Codex Spur.app`  
+3. Optionally delete local data under Application Support  
+4. Restore a Codex config backup from the app, or inspect `~/.codex/config.toml` and `~/.codex/codex-select/`
 
 ---
 
-## 快速开始（配置 Codex）
+## Quick start
 
-1. **添加供应商**  
-   概览 → 添加 → 选类型与入口 → 保存并拉取模型  
-2. **启用模型**  
-   模型页勾选要发布到 Codex 的路由  
-3. **预览并 Apply**  
-   应用配置前会生成 diff/预览；确认后写入：  
-   - `~/.codex/config.toml` 中的 `[model_providers.codex_select]`  
-   - catalog：`~/.codex/codex-select/model-catalog.json`  
-4. **Desktop 可见性**  
-   概览页检查清单为就绪后，重启或刷新 ChatGPT Desktop，在模型列表中选择 Spur 发布的模型  
-5. **保持 Spur 在运行**  
-   代理必须在线，请求才会转发到上游  
+1. **Add a provider** — Overview → Add → choose kind & entry method → save & fetch  
+2. **Enable models** — Models page → enable routes you want in Codex  
+3. **Review & Apply** — preview the diff, then write:  
+   - `[model_providers.codex_select]` in `~/.codex/config.toml`  
+   - catalog at `~/.codex/codex-select/model-catalog.json`  
+4. **Open the Codex model picker** — select any Spur-published model with one click  
+5. **Keep Spur running** — the localhost proxy must be up for traffic to reach upstreams  
 
-### Desktop 可见性（重要）
+### Desktop visibility
 
-| 登录 | 位置 | 用途 |
+| Login | Where | Role |
 |------|------|------|
-| ChatGPT Desktop 官方登录 | `~/.codex/auth.json` | GUI 身份门控，影响是否显示第三方模型 |
-| Spur 供应商凭据 | Spur 本地 vault | **仅**代理上游鉴权，**不能**替代 Desktop 门控 |
+| ChatGPT Desktop official login | `~/.codex/auth.json` | GUI identity gate for showing third-party models |
+| Spur provider credentials | Spur local vault | Upstream auth for the proxy only — **not** a Desktop login substitute |
 
-Apply 会为 `codex_select` 写入兼容字段（如 `requires_openai_auth = true`、`supports_websockets = false` 等）。catalog 含非官方 slug 且缺少有效 `auth.json` 时，Apply 会**硬拦截**（不会写假 token）。
+Apply may hard-stop if the catalog has non-official slugs and Desktop auth is missing (no fake tokens are written).
 
-### CLI 一键发布（可选）
-
-已在 UI 勾选模型后，可用：
+### Optional CLI publish
 
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml --bin codex-spur-publish
 ```
 
-从 Spur SQLite 重建 catalog 并写入 `~/.codex`（调试/脚本场景）。
+Rebuilds catalog from Spur SQLite and publishes into `~/.codex` (for scripts / debugging).
 
 ---
 
-## 从源码构建
+## Build from source
 
-### 依赖
+### Dependencies
 
-- Node.js 20+（推荐 22）
-- Rust stable（`rustc` ≥ 1.86，见 `Cargo.toml`）
-- Xcode Command Line Tools / 常规 macOS 原生构建工具链
-- [Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/)
+- Node.js 20+ (22 recommended)
+- Rust stable (`rustc` ≥ 1.86 per `Cargo.toml`)
+- Xcode CLT / standard macOS native toolchain
+- [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)
 
-### 开发
+### Develop
 
 ```bash
 npm install
-npm run dev:app          # Tauri + Vite 热重载
-# 或
-npm run dev              # 仅前端
+npm run dev:app
 ```
 
-### 检查
+### Checks
 
 ```bash
 npm run typecheck
@@ -192,75 +186,68 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-### 打包 DMG
+### Bundle DMG
 
 ```bash
 npm run bundle:dmg
-# 产物：
-# src-tauri/target/release/bundle/dmg/Codex Spur_<version>_aarch64.dmg
+# → src-tauri/target/release/bundle/dmg/Codex Spur_<version>_aarch64.dmg
 ```
 
-真实上游 smoke / 重置卡测试会消耗配额，**必须显式 opt-in**，默认 CI 不要跑。
+Real-provider smoke tests and reset-credit tests consume quota—**opt-in only**.
 
 ---
 
-## 架构边界（给贡献者）
+## Architecture (contributors)
 
-| 层 | 职责 |
-|----|------|
-| React UI | 展示、交互、可访问性；只调类型化 Tauri 命令 |
-| Rust core | 凭据、调度、代理、catalog、Codex 配置写入、备份恢复 |
-| Proxy | Responses 兼容；可取消上游；断连释放 lease |
-| Codex 集成 | 仅 `codex_select`；`toml_edit` 保留无关段落与注释 |
+| Layer | Responsibility |
+|------|----------------|
+| React UI | Presentation & typed Tauri commands only |
+| Rust core | Credentials, scheduler, proxy, catalog, Codex config, backups |
+| Proxy | Responses-compatible; cancellable; releases leases on disconnect |
+| Codex integration | Provider id `codex_select` only; `toml_edit` preserves unrelated config |
 
-更细的产品契约见仓库内：
+Also see:
 
-- [`AGENTS.md`](./AGENTS.md) — 工程与安全硬约束  
-- [`DESIGN.md`](./DESIGN.md) — 桌面 UI 设计系统  
-- [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) — 当前实现说明  
-- [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) — 第三方行为参考声明  
-- [`CHANGELOG.md`](./CHANGELOG.md) — 版本记录  
-
----
-
-## 配置与文件
-
-| 路径 | 说明 |
-|------|------|
-| `~/Library/Application Support/com.codexspur.desktop/` | Spur 本地 DB、主密钥、代理 bearer 等 |
-| `~/.codex/config.toml` | Codex 配置（Apply 时备份后原子更新） |
-| `~/.codex/codex-select/model-catalog.json` | 发布的模型目录 |
-| `~/.codex/auth.json` | **原生** Codex/Desktop 登录（Spur 正常运行不改它） |
-
-Apply 流水线：预览 → 哈希/锁 → 备份 → 临时文件 → fsync → 原子 rename → 回读校验；失败可回滚。
+- [`AGENTS.md`](./AGENTS.md) — engineering & security contract  
+- [`DESIGN.md`](./DESIGN.md) — desktop design system  
+- [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) — implementation notes  
+- [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) — reference projects  
+- [`CHANGELOG.md`](./CHANGELOG.md)  
 
 ---
 
-## 许可证与合规
+## Paths
 
-- 本项目以 **MIT** 发布，见 [`LICENSE`](./LICENSE)。  
-- **Sub2API（LGPL-3.0）** 仅作行为参考，**未**拷贝其源码。  
-- **Codex++（AGPL-3.0）** 仅作架构参考，**未**拷贝源码。  
-- 细节见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。  
-
-请遵守各上游服务的服务条款与当地法律。本工具**不会**协助绕过 CAPTCHA、手机验证、套餐限制或滥用防护。
-
----
-
-## 免责声明
-
-Codex Spur 以「本地工具」方式集成 Codex 配置与代理协议。API 与 Desktop 行为可能随上游变更；请在使用前自行验证对你账户与工作流的影响。作者不对配额消耗、账号封禁或数据丢失承担责任——请做好备份，并谨慎使用重置卡等不可逆操作。
+| Path | Purpose |
+|------|---------|
+| `~/Library/Application Support/com.codexspur.desktop/` | Local DB, master key, proxy bearer |
+| `~/.codex/config.toml` | Codex config (backed up before Apply) |
+| `~/.codex/codex-select/model-catalog.json` | Published model catalog |
+| `~/.codex/auth.json` | Native Desktop login (Spur does not rewrite it in normal operation) |
 
 ---
 
-## 发布清单（维护者）
+## License & compliance
+
+- MIT — see [`LICENSE`](./LICENSE)  
+- Sub2API (LGPL-3.0) is a **behavioral** reference only; source is not copied  
+- Codex++ (AGPL-3.0) is architecture reference only  
+- Details: [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)  
+
+Comply with upstream terms and local law. This tool does **not** help bypass CAPTCHAs, phone verification, plan entitlements, or abuse controls.
+
+---
+
+## Disclaimer
+
+Codex Spur is a local integration helper. Upstream APIs and Desktop behavior can change. You are responsible for quota use, account policy, and backups—especially irreversible reset-credit actions.
+
+---
+
+## Maintainers: release checklist
 
 ```bash
-# 1. 版本号对齐 package.json / tauri.conf.json / Cargo.toml / CHANGELOG
-# 2. 测试与 typecheck / clippy
-# 3. 打包
 npm run bundle:dmg
-# 4. 打 tag 并创建 GitHub Release，附上 DMG 与发行说明
 git tag -a v0.1.0 -m "v0.1.0"
 git push origin main --tags
 gh release create v0.1.0 \
@@ -268,14 +255,3 @@ gh release create v0.1.0 \
   --title "Codex Spur 0.1.0" \
   --notes-file CHANGELOG.md
 ```
-
----
-
-## 反馈
-
-请通过 GitHub Issues 报告 bug 或需求。提交问题时尽量附上：
-
-- macOS 版本与芯片  
-- Spur / Codex Desktop 版本  
-- 诊断页中的**已脱敏**事件摘要（勿粘贴 token）  
-- 复现步骤  
