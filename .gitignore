@@ -29,3 +29,6 @@ coverage/
 # Misc
 *.swp
 *~
+# Website deployment output and local release binaries
+website/dist/
+website/public/downloads/*.dmg

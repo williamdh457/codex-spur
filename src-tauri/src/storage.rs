@@ -12,7 +12,8 @@ use crate::{
     credentials::CanonicalCredential,
     domain::{
         AccountPoolSummary, CredentialSummary, ModelRouteSummary, OpenAiQuotaSnapshot,
-        PoolMemberDetail, ProviderRouting, ProviderSummary, ProxyRequestEvent,
+        PoolMemberDetail, ProviderRouting, ProviderSummary, ProxyRequestEvent, UsageBreakdown,
+        UsageDashboardSnapshot, UsageRange, UsageTrendPoint,
     },
     providers::RouteCatalogPayload,
     scheduler::{
@@ -235,12 +236,8 @@ impl Storage {
                 "pool" | "config" => "json".to_string(),
                 other => other.to_string(),
             });
-        let api_key_count = row
-            .try_get::<i64, _>("api_key_count")
-            .unwrap_or(0) as u32;
-        let oauth_count = row
-            .try_get::<i64, _>("oauth_count")
-            .unwrap_or(0) as u32;
+        let api_key_count = row.try_get::<i64, _>("api_key_count").unwrap_or(0) as u32;
+        let oauth_count = row.try_get::<i64, _>("oauth_count").unwrap_or(0) as u32;
         // Browser official login only ever writes one account. Multi-account rows
         // stamped "official" are almost always a prior JSON import mis-classified
         // when discover rewrote the channel after an empty base_url fetch.
@@ -254,7 +251,13 @@ impl Storage {
             _ => stored_category,
         };
         let entry_category = stored_category.or_else(|| {
-            infer_entry_category(&kind, base_url.as_deref(), credential_count, api_key_count, oauth_count)
+            infer_entry_category(
+                &kind,
+                base_url.as_deref(),
+                credential_count,
+                api_key_count,
+                oauth_count,
+            )
         });
         ProviderSummary {
             id: row.get("id"),
@@ -299,7 +302,10 @@ impl Storage {
         Ok(rows.iter().map(Self::map_provider_row).collect())
     }
 
-    pub async fn get_provider(&self, provider_id: &str) -> Result<Option<ProviderSummary>, sqlx::Error> {
+    pub async fn get_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<ProviderSummary>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id, entry_category,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id) AS credential_count,
@@ -333,9 +339,10 @@ impl Storage {
         kind: &str,
         name: Option<&str>,
     ) -> Result<String, sqlx::Error> {
-        let (default_name, region, protocol, _) = crate::providers::kind_meta(kind).ok_or_else(|| {
-            sqlx::Error::Configuration(format!("unknown provider kind: {kind}").into())
-        })?;
+        let (default_name, region, protocol, _) =
+            crate::providers::kind_meta(kind).ok_or_else(|| {
+                sqlx::Error::Configuration(format!("unknown provider kind: {kind}").into())
+            })?;
         let id = uuid::Uuid::new_v4().to_string();
         let display = if let Some(custom) = name.map(str::trim).filter(|value| !value.is_empty()) {
             custom.to_owned()
@@ -808,28 +815,25 @@ impl Storage {
                     "fixed routing requires fixed_credential_id".into(),
                 ));
             };
-            let ok = sqlx::query(
-                "SELECT 1 AS ok FROM credentials WHERE id = ? AND provider_id = ?",
-            )
-            .bind(cred)
-            .bind(provider_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some();
+            let ok =
+                sqlx::query("SELECT 1 AS ok FROM credentials WHERE id = ? AND provider_id = ?")
+                    .bind(cred)
+                    .bind(provider_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .is_some();
             if !ok {
                 return Err(sqlx::Error::Protocol(
                     "fixed credential does not belong to provider".into(),
                 ));
             }
         }
-        sqlx::query(
-            "UPDATE providers SET routing_mode = ?, fixed_credential_id = ? WHERE id = ?",
-        )
-        .bind(mode.as_str())
-        .bind(fixed.as_deref())
-        .bind(provider_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE providers SET routing_mode = ?, fixed_credential_id = ? WHERE id = ?")
+            .bind(mode.as_str())
+            .bind(fixed.as_deref())
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -837,10 +841,12 @@ impl Storage {
         &self,
         pool_id: &str,
     ) -> Result<PoolSchedulerConfig, sqlx::Error> {
-        let row = sqlx::query("SELECT scheduler_config_json, sticky_ttl_secs FROM account_pools WHERE id = ?")
-            .bind(pool_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT scheduler_config_json, sticky_ttl_secs FROM account_pools WHERE id = ?",
+        )
+        .bind(pool_id)
+        .fetch_optional(&self.pool)
+        .await?;
         let Some(row) = row else {
             return Ok(PoolSchedulerConfig::default());
         };
@@ -1053,8 +1059,7 @@ impl Storage {
                 enabled: row.get::<i64, _>("enabled") != 0,
                 healthy: row.get::<i64, _>("healthy") != 0,
                 schedule_state: ScheduleState::parse(
-                    &row
-                        .try_get::<String, _>("schedule_state")
+                    &row.try_get::<String, _>("schedule_state")
                         .unwrap_or_else(|_| "ready".into()),
                 ),
                 cooldown_until: row.try_get("cooldown_until").unwrap_or(None),
@@ -1080,7 +1085,8 @@ impl Storage {
             if let Some(snapshot) = self.cached_quota_snapshot(&candidate.credential_id).await? {
                 candidate.quota_fetched_at = Some(snapshot.fetched_at);
                 if let Some(five) = snapshot.five_hour.as_ref() {
-                    candidate.quota_remaining = Some((five.remaining_percent / 100.0).clamp(0.0, 1.0));
+                    candidate.quota_remaining =
+                        Some((five.remaining_percent / 100.0).clamp(0.0, 1.0));
                     candidate.session_reset_at = five.reset_at.or(candidate.session_reset_at);
                 } else if let Some(seven) = snapshot.seven_day.as_ref() {
                     candidate.quota_remaining =
@@ -1129,9 +1135,7 @@ impl Storage {
                 .map(|r| r.routing_mode.as_str())
                 .unwrap_or("pool"),
         );
-        let fixed_id = routing
-            .as_ref()
-            .and_then(|r| r.fixed_credential_id.clone());
+        let fixed_id = routing.as_ref().and_then(|r| r.fixed_credential_id.clone());
 
         let pool_id = match self.active_pool_id(provider_id).await? {
             Some(id) => id,
@@ -1139,7 +1143,9 @@ impl Storage {
                 // No pool: fixed credential or first healthy.
                 if routing_mode == RoutingMode::Fixed {
                     if let Some(id) = fixed_id {
-                        return self.acquire_direct_lease(provider_id, &id, SelectionLayer::Fixed).await;
+                        return self
+                            .acquire_direct_lease(provider_id, &id, SelectionLayer::Fixed)
+                            .await;
                     }
                 }
                 return Ok(None);
@@ -1270,8 +1276,7 @@ impl Storage {
                         let reseed = uuid::Uuid::new_v4();
                         let reseed_u64 =
                             u64::from_le_bytes(reseed.as_bytes()[..8].try_into().unwrap_or([0; 8]));
-                        let Some(next) =
-                            select_account(&candidates, &config, &request, reseed_u64)
+                        let Some(next) = select_account(&candidates, &config, &request, reseed_u64)
                         else {
                             return Ok(None);
                         };
@@ -1327,8 +1332,8 @@ impl Storage {
         credential_id: &str,
         timeout_secs: i64,
     ) -> Result<bool, sqlx::Error> {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(timeout_secs.max(0) as u64);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(0) as u64);
         loop {
             // Expire stale leases so crashes don't block sticky wait forever.
             sqlx::query(
@@ -1712,9 +1717,10 @@ impl Storage {
     }
 
     pub async fn diagnostics_max_events(&self) -> Result<i64, sqlx::Error> {
-        let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'diagnostics.max_events'")
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query("SELECT value_json FROM app_settings WHERE key = 'diagnostics.max_events'")
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row
             .and_then(|row| {
                 let json: String = row.get("value_json");
@@ -1832,7 +1838,8 @@ impl Storage {
         } else {
             ScheduleState::AuthInvalid
         };
-        self.mark_schedule_state(id, state, healthy, error, None).await
+        self.mark_schedule_state(id, state, healthy, error, None)
+            .await
     }
 
     pub async fn record_usage(
@@ -1877,6 +1884,195 @@ impl Storage {
             cache_hit_rate,
             failed_requests: row.get::<i64, _>("failed_requests") as u64,
             sampled_at: chrono_like_now(),
+        })
+    }
+
+    pub async fn usage_dashboard(
+        &self,
+        range: UsageRange,
+    ) -> Result<UsageDashboardSnapshot, sqlx::Error> {
+        // Static SQL only: sqlx 0.9 rejects dynamic format! strings without AssertSqlSafe.
+        // Range windows are fixed enum values, so each branch uses a literal query.
+        let summary = match range {
+            UsageRange::SevenDays => sqlx::query(
+                "SELECT COALESCE(SUM(request_count),0) request_count, COALESCE(SUM(input_tokens),0) input_tokens, COALESCE(SUM(output_tokens),0) output_tokens, COALESCE(SUM(failed_requests),0) failed_requests, COALESCE(SUM(cache_observations),0) cache_observations, COALESCE(SUM(cache_hits),0) cache_hits FROM usage_events WHERE day >= date('now','localtime', '-6 day')",
+            )
+            .fetch_one(&self.pool)
+            .await?,
+            UsageRange::ThirtyDays => sqlx::query(
+                "SELECT COALESCE(SUM(request_count),0) request_count, COALESCE(SUM(input_tokens),0) input_tokens, COALESCE(SUM(output_tokens),0) output_tokens, COALESCE(SUM(failed_requests),0) failed_requests, COALESCE(SUM(cache_observations),0) cache_observations, COALESCE(SUM(cache_hits),0) cache_hits FROM usage_events WHERE day >= date('now','localtime', '-29 day')",
+            )
+            .fetch_one(&self.pool)
+            .await?,
+            UsageRange::All => sqlx::query(
+                "SELECT COALESCE(SUM(request_count),0) request_count, COALESCE(SUM(input_tokens),0) input_tokens, COALESCE(SUM(output_tokens),0) output_tokens, COALESCE(SUM(failed_requests),0) failed_requests, COALESCE(SUM(cache_observations),0) cache_observations, COALESCE(SUM(cache_hits),0) cache_hits FROM usage_events",
+            )
+            .fetch_one(&self.pool)
+            .await?,
+        };
+        let request_count = summary.get::<i64, _>("request_count") as u64;
+        let input_tokens = summary.get::<i64, _>("input_tokens") as u64;
+        let output_tokens = summary.get::<i64, _>("output_tokens") as u64;
+        let failed_requests = summary.get::<i64, _>("failed_requests") as u64;
+        let cache_observations = summary.get::<i64, _>("cache_observations");
+        let total_tokens = input_tokens + output_tokens;
+        let cache_hit_rate = (cache_observations > 0)
+            .then(|| summary.get::<i64, _>("cache_hits") as f64 / cache_observations as f64);
+
+        let trend_rows = match range {
+            UsageRange::SevenDays => sqlx::query(
+                "SELECT day, SUM(request_count) request_count, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(failed_requests) failed_requests, SUM(cache_observations) cache_observations, SUM(cache_hits) cache_hits FROM usage_events WHERE day >= date('now','localtime', '-6 day') GROUP BY day ORDER BY day",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+            UsageRange::ThirtyDays => sqlx::query(
+                "SELECT day, SUM(request_count) request_count, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(failed_requests) failed_requests, SUM(cache_observations) cache_observations, SUM(cache_hits) cache_hits FROM usage_events WHERE day >= date('now','localtime', '-29 day') GROUP BY day ORDER BY day",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+            UsageRange::All => sqlx::query(
+                "SELECT day, SUM(request_count) request_count, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(failed_requests) failed_requests, SUM(cache_observations) cache_observations, SUM(cache_hits) cache_hits FROM usage_events GROUP BY day ORDER BY day",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+        };
+        let trend_data: std::collections::HashMap<String, UsageTrendPoint> = trend_rows
+            .into_iter()
+            .map(|row| {
+                let input = row.get::<i64, _>("input_tokens") as u64;
+                let output = row.get::<i64, _>("output_tokens") as u64;
+                let observations = row.get::<i64, _>("cache_observations");
+                let point = UsageTrendPoint {
+                    day: row.get("day"),
+                    request_count: row.get::<i64, _>("request_count") as u64,
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: input + output,
+                    failed_requests: row.get::<i64, _>("failed_requests") as u64,
+                    cache_hit_rate: (observations > 0)
+                        .then(|| row.get::<i64, _>("cache_hits") as f64 / observations as f64),
+                };
+                (point.day.clone(), point)
+            })
+            .collect();
+        let trend = if trend_data.is_empty() {
+            Vec::new()
+        } else {
+            let days = match range {
+                UsageRange::SevenDays => {
+                    sqlx::query_scalar::<_, String>(
+                        "WITH RECURSIVE dates(day) AS (SELECT date('now','localtime', '-6 day') UNION ALL SELECT date(day, '+1 day') FROM dates WHERE day < date('now','localtime')) SELECT day FROM dates ORDER BY day",
+                    )
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                UsageRange::ThirtyDays => {
+                    sqlx::query_scalar::<_, String>(
+                        "WITH RECURSIVE dates(day) AS (SELECT date('now','localtime', '-29 day') UNION ALL SELECT date(day, '+1 day') FROM dates WHERE day < date('now','localtime')) SELECT day FROM dates ORDER BY day",
+                    )
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                UsageRange::All => {
+                    sqlx::query_scalar::<_, String>(
+                        "WITH RECURSIVE dates(day) AS (SELECT (SELECT MIN(day) FROM usage_events) UNION ALL SELECT date(day, '+1 day') FROM dates WHERE day < date('now','localtime')) SELECT day FROM dates ORDER BY day",
+                    )
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+            };
+            days.into_iter()
+                .map(|day| {
+                    trend_data.get(&day).cloned().unwrap_or(UsageTrendPoint {
+                        day,
+                        request_count: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                        failed_requests: 0,
+                        cache_hit_rate: None,
+                    })
+                })
+                .collect()
+        };
+
+        let model_rows = match range {
+            UsageRange::SevenDays => sqlx::query(
+                "SELECT model_id name, SUM(request_count) request_count, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(failed_requests) failed_requests FROM usage_events WHERE day >= date('now','localtime', '-6 day') GROUP BY model_id ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC, model_id",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+            UsageRange::ThirtyDays => sqlx::query(
+                "SELECT model_id name, SUM(request_count) request_count, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(failed_requests) failed_requests FROM usage_events WHERE day >= date('now','localtime', '-29 day') GROUP BY model_id ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC, model_id",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+            UsageRange::All => sqlx::query(
+                "SELECT model_id name, SUM(request_count) request_count, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(failed_requests) failed_requests FROM usage_events GROUP BY model_id ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC, model_id",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+        };
+        let provider_rows = match range {
+            UsageRange::SevenDays => sqlx::query(
+                "SELECT COALESCE(NULLIF(p.name, ''), '已删除供应商 · ' || ue.provider_id) name, SUM(ue.request_count) request_count, SUM(ue.input_tokens) input_tokens, SUM(ue.output_tokens) output_tokens, SUM(ue.failed_requests) failed_requests FROM usage_events ue LEFT JOIN providers p ON p.id = ue.provider_id WHERE ue.day >= date('now','localtime', '-6 day') GROUP BY ue.provider_id, p.name ORDER BY (SUM(ue.input_tokens) + SUM(ue.output_tokens)) DESC, name",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+            UsageRange::ThirtyDays => sqlx::query(
+                "SELECT COALESCE(NULLIF(p.name, ''), '已删除供应商 · ' || ue.provider_id) name, SUM(ue.request_count) request_count, SUM(ue.input_tokens) input_tokens, SUM(ue.output_tokens) output_tokens, SUM(ue.failed_requests) failed_requests FROM usage_events ue LEFT JOIN providers p ON p.id = ue.provider_id WHERE ue.day >= date('now','localtime', '-29 day') GROUP BY ue.provider_id, p.name ORDER BY (SUM(ue.input_tokens) + SUM(ue.output_tokens)) DESC, name",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+            UsageRange::All => sqlx::query(
+                "SELECT COALESCE(NULLIF(p.name, ''), '已删除供应商 · ' || ue.provider_id) name, SUM(ue.request_count) request_count, SUM(ue.input_tokens) input_tokens, SUM(ue.output_tokens) output_tokens, SUM(ue.failed_requests) failed_requests FROM usage_events ue LEFT JOIN providers p ON p.id = ue.provider_id GROUP BY ue.provider_id, p.name ORDER BY (SUM(ue.input_tokens) + SUM(ue.output_tokens)) DESC, name",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+        };
+        let make_breakdowns = |rows: Vec<sqlx::sqlite::SqliteRow>, denominator: u64| {
+            rows.into_iter()
+                .map(|row| {
+                    let input = row.get::<i64, _>("input_tokens") as u64;
+                    let output = row.get::<i64, _>("output_tokens") as u64;
+                    let total = input + output;
+                    UsageBreakdown {
+                        name: row.get("name"),
+                        request_count: row.get::<i64, _>("request_count") as u64,
+                        input_tokens: input,
+                        output_tokens: output,
+                        total_tokens: total,
+                        failed_requests: row.get::<i64, _>("failed_requests") as u64,
+                        token_share: if denominator == 0 {
+                            0.0
+                        } else {
+                            total as f64 / denominator as f64
+                        },
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let today_tokens = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(input_tokens + output_tokens),0) FROM usage_events WHERE day = date('now','localtime')",
+        )
+        .fetch_one(&self.pool)
+        .await? as u64;
+        Ok(UsageDashboardSnapshot {
+            range,
+            request_count,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            today_tokens,
+            selected_range_tokens: total_tokens,
+            failed_requests,
+            failure_rate: (request_count > 0)
+                .then(|| failed_requests as f64 / request_count as f64),
+            cache_hit_rate,
+            sampled_at: chrono_like_now(),
+            models: make_breakdowns(model_rows, total_tokens),
+            providers: make_breakdowns(provider_rows, total_tokens),
+            trend,
         })
     }
 
@@ -2136,14 +2332,8 @@ mod entry_category_tests {
             Some("official")
         );
         assert_eq!(
-            infer_entry_category(
-                "xai",
-                Some("https://cli-chat-proxy.grok.com/v1"),
-                1,
-                0,
-                1
-            )
-            .as_deref(),
+            infer_entry_category("xai", Some("https://cli-chat-proxy.grok.com/v1"), 1, 0, 1)
+                .as_deref(),
             Some("official")
         );
     }
@@ -2151,5 +2341,272 @@ mod entry_category_tests {
     #[test]
     fn empty_unconfigured_is_none() {
         assert_eq!(infer_entry_category("openai", None, 0, 0, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod usage_dashboard_tests {
+    use super::{Storage, UsageDelta};
+    use crate::domain::UsageRange;
+    use sqlx::Row;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    async fn open_temp_storage() -> Storage {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-usage-{}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        Storage::open(&dir).await.expect("open storage")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_usage_day(
+        storage: &Storage,
+        day_offset: i64,
+        provider_id: &str,
+        model_id: &str,
+        request_count: i64,
+        input_tokens: i64,
+        output_tokens: i64,
+        failed_requests: i64,
+        cache_observations: i64,
+        cache_hits: i64,
+    ) {
+        let day_modifier = format!("{day_offset} day");
+        sqlx::query(
+            "INSERT INTO usage_events (
+                day, provider_id, model_id, request_count, input_tokens, output_tokens,
+                cache_observations, cache_hits, failed_requests
+             ) VALUES (
+                date('now','localtime', ?), ?, ?, ?, ?, ?, ?, ?, ?
+             )
+             ON CONFLICT(day, provider_id, model_id) DO UPDATE SET
+                request_count = excluded.request_count,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cache_observations = excluded.cache_observations,
+                cache_hits = excluded.cache_hits,
+                failed_requests = excluded.failed_requests",
+        )
+        .bind(day_modifier)
+        .bind(provider_id)
+        .bind(model_id)
+        .bind(request_count)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_observations)
+        .bind(cache_hits)
+        .bind(failed_requests)
+        .execute(&storage.pool)
+        .await
+        .expect("insert usage day");
+    }
+
+    async fn insert_provider(storage: &Storage, id: &str, name: &str) {
+        sqlx::query(
+            "INSERT INTO providers (id, name, region, protocol, base_url, configured, selected_models, discovered_models, kind)
+             VALUES (?, ?, 'global', 'openai-compatible', 'https://example.test', 1, 0, 0, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(id)
+        .execute(&storage.pool)
+        .await
+        .expect("insert provider");
+    }
+
+    #[tokio::test]
+    async fn empty_database_returns_renderable_empty_dashboard() {
+        let storage = open_temp_storage().await;
+        let dash = storage
+            .usage_dashboard(UsageRange::SevenDays)
+            .await
+            .expect("dashboard");
+        assert_eq!(dash.request_count, 0);
+        assert_eq!(dash.total_tokens, 0);
+        assert!(dash.failure_rate.is_none());
+        assert!(dash.cache_hit_rate.is_none());
+        assert!(dash.trend.is_empty());
+        assert!(dash.models.is_empty());
+        assert!(dash.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seven_and_thirty_day_ranges_filter_and_pad_days() {
+        let storage = open_temp_storage().await;
+        // Outside 30d window
+        insert_usage_day(&storage, -40, "p1", "m1", 1, 100, 50, 0, 0, 0).await;
+        // Inside 30d, outside 7d
+        insert_usage_day(&storage, -10, "p1", "m1", 2, 200, 100, 1, 0, 0).await;
+        // Inside 7d
+        insert_usage_day(&storage, -2, "p1", "m1", 3, 300, 150, 0, 0, 0).await;
+        insert_usage_day(&storage, 0, "p1", "m1", 4, 400, 200, 0, 0, 0).await;
+
+        let seven = storage
+            .usage_dashboard(UsageRange::SevenDays)
+            .await
+            .expect("7d");
+        assert_eq!(seven.trend.len(), 7);
+        assert_eq!(seven.request_count, 7); // 3 + 4
+        assert_eq!(seven.input_tokens, 700);
+        assert_eq!(seven.output_tokens, 350);
+        assert_eq!(seven.total_tokens, 1050);
+        assert_eq!(seven.selected_range_tokens, 1050);
+        // Missing days padded with zeros
+        assert!(seven.trend.iter().any(|p| p.request_count == 0));
+        assert!(seven.trend.iter().all(|p| !p.day.is_empty()));
+
+        let thirty = storage
+            .usage_dashboard(UsageRange::ThirtyDays)
+            .await
+            .expect("30d");
+        assert_eq!(thirty.trend.len(), 30);
+        assert_eq!(thirty.request_count, 9); // 2+3+4
+        assert_eq!(thirty.total_tokens, 1350);
+
+        let all = storage.usage_dashboard(UsageRange::All).await.expect("all");
+        assert_eq!(all.request_count, 10);
+        assert_eq!(all.total_tokens, 1500);
+        assert!(!all.trend.is_empty());
+        // Continuous day series from earliest to today
+        assert!(all.trend.len() >= 41);
+    }
+
+    #[tokio::test]
+    async fn models_and_providers_sorted_by_total_tokens() {
+        let storage = open_temp_storage().await;
+        insert_provider(&storage, "alpha", "Alpha Provider").await;
+        insert_provider(&storage, "beta", "Beta Provider").await;
+        insert_usage_day(&storage, 0, "alpha", "gpt-small", 2, 100, 50, 0, 0, 0).await;
+        insert_usage_day(&storage, 0, "alpha", "gpt-large", 1, 500, 500, 1, 0, 0).await;
+        insert_usage_day(&storage, 0, "beta", "gpt-mid", 3, 200, 100, 0, 0, 0).await;
+
+        let dash = storage
+            .usage_dashboard(UsageRange::SevenDays)
+            .await
+            .expect("dash");
+        assert_eq!(
+            dash.models
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-large", "gpt-mid", "gpt-small"]
+        );
+        assert!(dash.models[0].total_tokens >= dash.models[1].total_tokens);
+        assert!((dash.models.iter().map(|m| m.token_share).sum::<f64>() - 1.0).abs() < 1e-9);
+
+        assert_eq!(dash.providers[0].name, "Alpha Provider");
+        assert_eq!(dash.providers[1].name, "Beta Provider");
+        assert_eq!(dash.providers[0].total_tokens, 1150);
+        assert_eq!(dash.providers[1].total_tokens, 300);
+    }
+
+    #[tokio::test]
+    async fn failure_and_cache_rates_handle_zero_and_samples() {
+        let storage = open_temp_storage().await;
+        // No requests path already covered; insert successful requests without cache samples
+        insert_usage_day(&storage, 0, "p1", "m1", 4, 40, 20, 1, 0, 0).await;
+        let dash = storage
+            .usage_dashboard(UsageRange::SevenDays)
+            .await
+            .expect("dash");
+        assert!((dash.failure_rate.unwrap() - 0.25).abs() < 1e-9);
+        assert!(dash.cache_hit_rate.is_none());
+        assert_eq!(dash.failed_requests, 1);
+
+        insert_usage_day(&storage, 0, "p1", "m1", 4, 40, 20, 1, 10, 4).await;
+        let with_cache = storage
+            .usage_dashboard(UsageRange::SevenDays)
+            .await
+            .expect("cache");
+        assert!((with_cache.cache_hit_rate.unwrap() - 0.4).abs() < 1e-9);
+        assert!(with_cache.trend.iter().any(|p| p.cache_hit_rate.is_some()));
+    }
+
+    #[tokio::test]
+    async fn deleted_provider_uses_stable_fallback_name() {
+        let storage = open_temp_storage().await;
+        // No row in providers table
+        insert_usage_day(&storage, 0, "gone-id", "m1", 1, 10, 5, 0, 0, 0).await;
+        let dash = storage
+            .usage_dashboard(UsageRange::All)
+            .await
+            .expect("dash");
+        assert_eq!(dash.providers.len(), 1);
+        assert_eq!(dash.providers[0].name, "已删除供应商 · gone-id");
+    }
+
+    #[tokio::test]
+    async fn record_usage_aggregates_into_snapshot_and_dashboard() {
+        let storage = open_temp_storage().await;
+        storage
+            .record_usage(
+                "p1",
+                "m1",
+                &UsageDelta {
+                    request_count: 2,
+                    input_tokens: 30,
+                    output_tokens: 10,
+                    cache_observations: 2,
+                    cache_hits: 1,
+                    failed_requests: 0,
+                },
+            )
+            .await
+            .expect("record");
+        storage
+            .record_usage(
+                "p1",
+                "m1",
+                &UsageDelta {
+                    request_count: 1,
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    cache_observations: 0,
+                    cache_hits: 0,
+                    failed_requests: 1,
+                },
+            )
+            .await
+            .expect("record2");
+
+        let snap = storage.usage_snapshot().await.expect("snapshot");
+        assert_eq!(snap.request_count, 3);
+        assert_eq!(snap.input_tokens, 35);
+        assert_eq!(snap.output_tokens, 15);
+        assert_eq!(snap.total_tokens, 50);
+        assert_eq!(snap.failed_requests, 1);
+        assert!((snap.cache_hit_rate.unwrap() - 0.5).abs() < 1e-9);
+
+        let dash = storage
+            .usage_dashboard(UsageRange::SevenDays)
+            .await
+            .expect("dash");
+        assert_eq!(dash.total_tokens, 50);
+        assert_eq!(dash.today_tokens, 50);
+        assert_eq!(dash.trend.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn local_date_helper_matches_sqlite() {
+        // Sanity: SQLite local date expression used by range filters is queryable
+        let storage = open_temp_storage().await;
+        let day: String = sqlx::query_scalar("SELECT date('now','localtime')")
+            .fetch_one(&storage.pool)
+            .await
+            .expect("day");
+        assert_eq!(day.len(), 10);
+        let row = sqlx::query("SELECT date('now','localtime', '-6 day') as start")
+            .fetch_one(&storage.pool)
+            .await
+            .expect("start");
+        let start: String = row.get("start");
+        assert_eq!(start.len(), 10);
     }
 }

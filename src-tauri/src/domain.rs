@@ -225,6 +225,59 @@ pub struct UsageSnapshot {
     pub sampled_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageRange {
+    #[serde(rename = "7d")]
+    SevenDays,
+    #[serde(rename = "30d")]
+    ThirtyDays,
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTrendPoint {
+    pub day: String,
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub failed_requests: u64,
+    pub cache_hit_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageBreakdown {
+    pub name: String,
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub failed_requests: u64,
+    pub token_share: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardSnapshot {
+    pub range: UsageRange,
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub today_tokens: u64,
+    pub selected_range_tokens: u64,
+    pub failed_requests: u64,
+    pub failure_rate: Option<f64>,
+    pub cache_hit_rate: Option<f64>,
+    pub sampled_at: i64,
+    pub trend: Vec<UsageTrendPoint>,
+    pub models: Vec<UsageBreakdown>,
+    pub providers: Vec<UsageBreakdown>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSnapshot {
@@ -324,7 +377,11 @@ pub struct CatalogModel {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, alias = "defaultReasoningLevel", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "defaultReasoningLevel",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_reasoning_level: Option<ReasoningEffort>,
     #[serde(alias = "supportedReasoningLevels")]
     pub supported_reasoning_levels: Vec<ReasoningEffortPreset>,
@@ -338,15 +395,27 @@ pub struct CatalogModel {
     pub additional_speed_tiers: Vec<String>,
     #[serde(default, alias = "serviceTiers")]
     pub service_tiers: Vec<serde_json::Value>,
-    #[serde(default, alias = "defaultServiceTier", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "defaultServiceTier",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_service_tier: Option<String>,
     #[serde(default, alias = "availabilityNux")]
     pub availability_nux: Option<serde_json::Value>,
     #[serde(default)]
     pub upgrade: Option<serde_json::Value>,
-    #[serde(default, alias = "baseInstructions", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        alias = "baseInstructions",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub base_instructions: String,
-    #[serde(default, alias = "modelMessages", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "modelMessages",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model_messages: Option<serde_json::Value>,
     // Bools must always serialize: Codex ModelInfo rejects missing required fields
     // (e.g. `support_verbosity`) even when the value is false.
@@ -357,13 +426,24 @@ pub struct CatalogModel {
     pub supports_reasoning_summaries: bool,
     #[serde(default, alias = "supportsReasoningSummaryParameter")]
     pub supports_reasoning_summary_parameter: bool,
-    #[serde(default = "default_reasoning_summary_value", alias = "defaultReasoningSummary")]
+    #[serde(
+        default = "default_reasoning_summary_value",
+        alias = "defaultReasoningSummary"
+    )]
     pub default_reasoning_summary: serde_json::Value,
     #[serde(default, alias = "supportVerbosity")]
     pub support_verbosity: bool,
-    #[serde(default, alias = "defaultVerbosity", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "defaultVerbosity",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_verbosity: Option<serde_json::Value>,
-    #[serde(default, alias = "applyPatchToolType", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "applyPatchToolType",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub apply_patch_tool_type: Option<String>,
     #[serde(
         default,
@@ -377,15 +457,30 @@ pub struct CatalogModel {
     pub supports_parallel_tool_calls: bool,
     #[serde(default, alias = "supportsImageDetailOriginal")]
     pub supports_image_detail_original: bool,
-    #[serde(default, alias = "contextWindow", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "contextWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub context_window: Option<i64>,
-    #[serde(default, alias = "maxContextWindow", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "maxContextWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_context_window: Option<i64>,
-    #[serde(default, alias = "autoCompactTokenLimit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "autoCompactTokenLimit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_compact_token_limit: Option<i64>,
     #[serde(default, alias = "compHash", skip_serializing_if = "Option::is_none")]
     pub comp_hash: Option<String>,
-    #[serde(default = "default_effective_context_window_percent", alias = "effectiveContextWindowPercent")]
+    #[serde(
+        default = "default_effective_context_window_percent",
+        alias = "effectiveContextWindowPercent"
+    )]
     pub effective_context_window_percent: i64,
     // Codex requires this field present (even as []) — do not skip when empty.
     #[serde(default, alias = "experimentalSupportedTools")]
@@ -396,11 +491,19 @@ pub struct CatalogModel {
     pub supports_search_tool: bool,
     #[serde(default, alias = "useResponsesLite")]
     pub use_responses_lite: bool,
-    #[serde(default, alias = "autoReviewModelOverride", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "autoReviewModelOverride",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_review_model_override: Option<String>,
     #[serde(default, alias = "toolMode", skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<String>,
-    #[serde(default, alias = "multiAgentVersion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "multiAgentVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub multi_agent_version: Option<String>,
 }
 

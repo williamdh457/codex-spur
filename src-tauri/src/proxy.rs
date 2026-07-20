@@ -27,8 +27,7 @@ use crate::{
     content_encoding::{decode_request_body, get_content_encoding},
     credentials::SecretMaterial,
     domain::ProxyRequestEvent,
-    media_sanitizer,
-    providers,
+    media_sanitizer, providers,
     scheduler::{ScheduleState, SelectionLayer},
     storage::{Lease, Storage, UsageDelta},
     upstream_errors::{
@@ -377,8 +376,8 @@ async fn forward_responses_compatible(
                 Some(body_bytes.as_ref()),
             )
             .await;
-            let summary = summarize_upstream_error_body(&body_bytes)
-                .unwrap_or_else(|| category.to_string());
+            let summary =
+                summarize_upstream_error_body(&body_bytes).unwrap_or_else(|| category.to_string());
             record_diag(
                 state,
                 target,
@@ -405,15 +404,13 @@ async fn forward_responses_compatible(
             {
                 builder = builder.header(header::CONTENT_TYPE, ct);
             }
-            return builder
-                .body(Body::from(body_bytes))
-                .unwrap_or_else(|_| {
-                    error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "proxy_response_error",
-                        "Failed to build proxy response",
-                    )
-                });
+            return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "proxy_response_error",
+                    "Failed to build proxy response",
+                )
+            });
         }
         if let Some(auth) = &auth {
             let category = if status.is_success() {
@@ -706,18 +703,16 @@ async fn forward_chat_compatible(
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let id = payload
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("resp_codex_select");
+        // Align with CC Switch `response_id_from_chat_id` + type-prefixed item ids.
+        let response_id = response_id_from_chat_id(payload.get("id").and_then(Value::as_str));
         let usage = chat_usage_to_responses_usage(payload.get("usage"));
         return Json(json!({
-            "id": id,
+            "id": response_id,
             "object": "response",
             "status": "completed",
             "model": target.upstream_model,
             "output": [{
-                "id": format!("msg_{id}"),
+                "id": message_item_id_from_response_id(&response_id),
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
@@ -866,21 +861,18 @@ fn parse_chat_completions_sse(body: &str) -> ParsedChatSse {
         };
         if let Some(id) = payload.get("id").and_then(Value::as_str) {
             if !id.is_empty() {
-                // Normalize chatcmpl_* → resp_* so Desktop sees a Responses id.
-                parsed.response_id = if id.starts_with("resp_") {
-                    id.to_string()
-                } else if let Some(rest) = id.strip_prefix("chatcmpl-").or_else(|| id.strip_prefix("chatcmpl_"))
-                {
-                    format!("resp_{rest}")
-                } else {
-                    format!("resp_{id}")
-                };
+                // Normalize chatcmpl_* → resp_* so Desktop sees a Responses id
+                // (same helper as CC Switch `response_id_from_chat_id`).
+                parsed.response_id = response_id_from_chat_id(Some(id));
             }
         }
         if let Some(created) = payload.get("created").and_then(Value::as_u64) {
             parsed.created_at = created;
         }
-        if let Some(delta) = payload.get("choices").and_then(Value::as_array).and_then(|c| c.first())
+        if let Some(delta) = payload
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
         {
             if let Some(delta_obj) = delta.get("delta") {
                 if let Some(content) = delta_obj.get("content").and_then(Value::as_str) {
@@ -912,6 +904,60 @@ fn sse_event(event: &str, data: &Value) -> String {
         "event: {event}\ndata: {}\n\n",
         serde_json::to_string(data).unwrap_or_else(|_| "{}".into())
     )
+}
+
+/// Normalize Chat Completions ids into Responses response ids (`resp_…`).
+///
+/// Behavioral reference: CC Switch `response_id_from_chat_id` (MIT). Independent
+/// reimplementation — also strips the common `chatcmpl-` / `chatcmpl_` prefixes.
+fn response_id_from_chat_id(id: Option<&str>) -> String {
+    let id = id.unwrap_or("codex_select");
+    if id.is_empty() {
+        return format!("resp_{}", Uuid::new_v4());
+    }
+    if id.starts_with("resp_") {
+        return id.to_string();
+    }
+    if let Some(rest) = id
+        .strip_prefix("chatcmpl-")
+        .or_else(|| id.strip_prefix("chatcmpl_"))
+    {
+        return format!("resp_{rest}");
+    }
+    format!("resp_{id}")
+}
+
+/// Message output-item id. OpenAI requires ids that **begin with `msg`**.
+///
+/// CC Switch / Nice Switch use type-prefixed item ids for tools (`fc_`, `ctc_`)
+/// and reasoning (`rs_`), but their message bridge historically used the
+/// suffix form `{response_id}_msg` (e.g. `resp_abc_msg`). Desktop stores that
+/// id and later replays it into OpenAI `input[]`, which then 400s:
+///
+/// ```text
+/// Invalid 'input[n].id': 'resp_…_msg'. Expected an ID that begins with 'msg'.
+/// ```
+///
+/// Apply the same type-prefix style to messages: `msg_{stem}`.
+fn message_item_id_from_response_id(response_id: &str) -> String {
+    if response_id.starts_with("msg") {
+        return response_id.to_string();
+    }
+    let stem = response_id.strip_prefix("resp_").unwrap_or(response_id);
+    // Legacy Spur/CC Switch suffix form → canonical prefix form.
+    if let Some(stem) = stem.strip_suffix("_msg") {
+        return format!("msg_{stem}");
+    }
+    format!("msg_{stem}")
+}
+
+/// Reasoning output-item id (`rs_…`). Matches CC Switch streaming bridge shape.
+fn reasoning_item_id_from_response_id(response_id: &str) -> String {
+    if response_id.starts_with("rs_") {
+        return response_id.to_string();
+    }
+    let stem = response_id.strip_prefix("resp_").unwrap_or(response_id);
+    format!("rs_{stem}")
 }
 
 /// Build the Responses SSE lifecycle Desktop expects (CC Switch / Nice Switch shape).
@@ -962,9 +1008,13 @@ fn chat_text_to_responses_sse(
     ));
 
     // Optional reasoning item (DeepSeek reasoner / thinking models).
+    // Desktop shows summary text here, but there is no OpenAI-signed
+    // `encrypted_content`. Replaying this item into OpenAI with store=false
+    // 404s — inbound `sanitize_openai_responses_input` drops those on the way
+    // back to OpenAI.
     let reasoning = reasoning.trim();
     if !reasoning.is_empty() {
-        let item_id = format!("rs_{response_id}");
+        let item_id = reasoning_item_id_from_response_id(response_id);
         let output_index = next_output_index;
         next_output_index += 1;
         out.push_str(&sse_event(
@@ -1040,7 +1090,8 @@ fn chat_text_to_responses_sse(
     // reasoning either (empty reply still needs a completed message for Desktop).
     let has_text = !text.is_empty();
     if has_text || output_items.is_empty() {
-        let item_id = format!("{response_id}_msg");
+        // OpenAI-shaped prefix (`msg_…`), not the legacy `{resp}_msg` suffix.
+        let item_id = message_item_id_from_response_id(response_id);
         let output_index = next_output_index;
         out.push_str(&sse_event(
             "response.output_item.added",
@@ -1162,10 +1213,7 @@ fn apply_upstream_headers(
             .header("version", providers::CODEX_CLIENT_VERSION);
     }
     if target.kind == "kimi" {
-        request = request.header(
-            reqwest::header::USER_AGENT,
-            "claude-cli/1.0.0 (Codex Spur)",
-        );
+        request = request.header(reqwest::header::USER_AGENT, "claude-cli/1.0.0 (Codex Spur)");
     }
     // Grok OAuth subscription CLI proxy rejects otherwise-valid tokens without
     // a supported client identity (observable Grok CLI / Sub2API contract).
@@ -1228,16 +1276,15 @@ async fn handle_upstream_failure(
             .await;
         return false;
     }
-    let is_rate =
-        status == reqwest::StatusCode::TOO_MANY_REQUESTS || body.is_some_and(body_is_usage_or_rate_limit);
+    let is_rate = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || body.is_some_and(body_is_usage_or_rate_limit);
     if is_rate {
         let default_secs = state
             .storage
             .default_429_cooldown_secs(provider_id)
             .await
             .unwrap_or(30);
-        let decision =
-            resolve_rate_limit_cooldown(headers, body, default_secs, now_unix());
+        let decision = resolve_rate_limit_cooldown(headers, body, default_secs, now_unix());
         let reason = format!("上游限流 ({})", decision.reason);
         let _ = state
             .storage
@@ -1476,11 +1523,7 @@ async fn record_diag(
         .await
         .ok()
         .flatten();
-    let max_events = state
-        .storage
-        .diagnostics_max_events()
-        .await
-        .unwrap_or(200);
+    let max_events = state.storage.diagnostics_max_events().await.unwrap_or(200);
     let event = ProxyRequestEvent {
         id: Uuid::new_v4().to_string(),
         created_at: String::new(),
@@ -1664,7 +1707,10 @@ fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
         // Freeform Responses function without explicit type, but never treat
         // named non-function kinds (namespace/custom/…) as functions.
         if tool_type.is_empty()
-            && tool.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())
+            && tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty())
             && allowed.contains(&"function")
         {
             let mut row = tool.clone();
@@ -1680,11 +1726,14 @@ fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
 
 /// Responses-path port for every non-OpenAI kind (xAI / MiniMax / custom / …).
 ///
-/// OpenAI kind (官方订阅 / JSON 多账号 / API Key) keeps Codex-native shapes.
+/// OpenAI kind (官方订阅 / JSON 多账号 / API Key) keeps Codex-native shapes,
+/// but still sanitizes Desktop history that was poisoned by Chat-bridge turns
+/// (bad message ids, reasoning without `encrypted_content`, dead item refs).
 /// All other kinds share this expandable pipeline so future subscriptions do not
 /// re-introduce namespace/tool_choice/input 422s.
 fn sanitize_responses_request_for_upstream(kind: &str, request: &mut Value) {
     if keeps_codex_native_tools(kind) {
+        sanitize_openai_responses_input(request);
         return;
     }
     sanitize_responses_tools_for_upstream(kind, request);
@@ -1692,6 +1741,101 @@ fn sanitize_responses_request_for_upstream(kind: &str, request: &mut Value) {
     sanitize_responses_input_for_upstream(request);
     strip_unsupported_responses_fields(request);
     clamp_responses_fields_for_kind(kind, request);
+}
+
+/// Whether a reasoning item can be safely replayed under OpenAI Responses.
+///
+/// With `store=false`, OpenAI looks up reasoning by id unless a real
+/// `encrypted_content` blob is present. Chat-bridge turns (Kimi/DeepSeek) only
+/// emit summary text → Desktop replays them → 404
+/// `Item with id 'rs_…' not found. Items are not persisted when store is false.`
+fn reasoning_has_portable_encrypted_content(item: &Value) -> bool {
+    item.get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Rewrite one message-like item's id to OpenAI's `msg…` prefix, if needed.
+fn rewrite_openai_message_item_id(item: &mut Value) {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let has_role = item.get("role").and_then(Value::as_str).is_some();
+    let is_message = item_type == "message" || (item_type.is_empty() && has_role);
+    if !is_message {
+        return;
+    }
+    let Some(id) = item.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+    // OpenAI wording: "begins with 'msg'".
+    if id.starts_with("msg") {
+        return;
+    }
+    let rewritten = message_item_id_from_response_id(&id);
+    if rewritten == id {
+        return;
+    }
+    if let Some(object) = item.as_object_mut() {
+        object.insert("id".into(), Value::String(rewritten));
+    }
+}
+
+/// Sanitize Desktop-replayed `input` for OpenAI Responses (mixed-model threads).
+///
+/// Layers:
+/// 1. Message ids must begin with `msg` (legacy Spur/CC Switch used `resp_…_msg`).
+/// 2. Drop reasoning items without non-empty `encrypted_content` (not portable).
+/// 3. When `store` is not `true`, drop `item_reference` (unresolvable offline).
+/// 4. If any input item was dropped, strip `previous_response_id` so OpenAI does
+///    not chase a Spur-synthetic or already-invalid server id.
+fn sanitize_openai_responses_input(request: &mut Value) {
+    let store_is_true = request.get("store").and_then(Value::as_bool) == Some(true);
+    let drop_item_references = !store_is_true;
+
+    let mut dropped_any = false;
+    if let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) {
+        let mut next = Vec::with_capacity(items.len());
+        for mut item in items.drain(..) {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            match item_type {
+                "reasoning" => {
+                    if reasoning_has_portable_encrypted_content(&item) {
+                        next.push(item);
+                    } else {
+                        // OpenAI: "remove this item from your input".
+                        dropped_any = true;
+                    }
+                }
+                "item_reference" if drop_item_references => {
+                    dropped_any = true;
+                }
+                _ => {
+                    rewrite_openai_message_item_id(&mut item);
+                    next.push(item);
+                }
+            }
+        }
+        if let Some(object) = request.as_object_mut() {
+            object.insert("input".into(), Value::Array(next));
+        }
+    }
+
+    if dropped_any {
+        if let Some(object) = request.as_object_mut() {
+            object.remove("previous_response_id");
+        }
+    }
+}
+
+/// Back-compat name used by older call sites / mental model: message-id rewrite
+/// only. Prefer [`sanitize_openai_responses_input`] for the full OpenAI path.
+#[cfg(test)]
+fn sanitize_openai_input_message_ids(request: &mut Value) {
+    let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items.iter_mut() {
+        rewrite_openai_message_item_id(item);
+    }
 }
 
 /// Drop or remap Codex-only tool rows so third-party Responses APIs do not 422.
@@ -1780,7 +1924,10 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
                     return false;
                 }
                 return !tools.iter().any(|tool| {
-                    tool.get("type").and_then(Value::as_str).unwrap_or("function") == "function"
+                    tool.get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("function")
+                        == "function"
                         && (tool.get("name").and_then(Value::as_str) == Some(name)
                             || tool.pointer("/function/name").and_then(Value::as_str) == Some(name))
                 });
@@ -1796,10 +1943,7 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
 /// - `additional_tools`: Responses Lite private carrier (xAI ModelInput fails)
 /// - `reasoning` items with `"content": null` (xAI untagged enum → 422)
 fn sanitize_responses_input_for_upstream(request: &mut Value) {
-    let Some(items) = request
-        .get_mut("input")
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
     let mut next = Vec::with_capacity(items.len());
@@ -1823,10 +1967,7 @@ fn sanitize_responses_input_for_upstream(request: &mut Value) {
 }
 
 /// Fields known to 422 on non-OpenAI Responses hosts (xAI and peers).
-const UNSUPPORTED_RESPONSES_TOP_LEVEL: &[&str] = &[
-    "prompt_cache_retention",
-    "safety_identifier",
-];
+const UNSUPPORTED_RESPONSES_TOP_LEVEL: &[&str] = &["prompt_cache_retention", "safety_identifier"];
 
 fn strip_unsupported_responses_fields(request: &mut Value) {
     if let Some(object) = request.as_object_mut() {
@@ -2042,10 +2183,7 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
 
 /// OpenAI-compat stream requests omit usage unless `stream_options.include_usage`.
 fn inject_stream_include_usage(chat: &mut Value) {
-    let is_stream = chat
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let is_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if !is_stream {
         return;
     }
@@ -2158,11 +2296,11 @@ fn instruction_text(value: &Value) -> String {
         Value::String(text) => text.trim().to_string(),
         Value::Array(parts) => parts
             .iter()
-            .filter_map(|part| part.as_str().map(str::to_string).or_else(|| {
-                part.get("text")
-                    .and_then(Value::as_str)
+            .filter_map(|part| {
+                part.as_str()
                     .map(str::to_string)
-            }))
+                    .or_else(|| part.get("text").and_then(Value::as_str).map(str::to_string))
+            })
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -2208,10 +2346,7 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                 ) {
                     continue;
                 }
-                let raw_role = item
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("user");
+                let raw_role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let role = responses_role_to_chat_role(raw_role);
                 if let Some(content) = item.get("content") {
                     let text = content_text(content);
@@ -2270,7 +2405,12 @@ fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Vec<Value> {
         // Already Chat Completions shaped.
         if tool.get("function").is_some() {
             let mut row = tool;
-            if row.get("type").and_then(Value::as_str).unwrap_or("").is_empty() {
+            if row
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
                 if let Some(object) = row.as_object_mut() {
                     object.insert("type".into(), Value::String("function".into()));
                 }
@@ -2364,15 +2504,13 @@ async fn passthrough(
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
         builder = builder.header(header::CACHE_CONTROL, "no-cache");
-        return builder
-            .body(Body::from_stream(mapped))
-            .unwrap_or_else(|_| {
-                error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "proxy_response_error",
-                    "Failed to build streaming proxy response",
-                )
-            });
+        return builder.body(Body::from_stream(mapped)).unwrap_or_else(|_| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_response_error",
+                "Failed to build streaming proxy response",
+            )
+        });
     }
 
     match response.bytes().await {
@@ -2696,14 +2834,210 @@ mod tests {
             ],
             "unexpected event order: {events:?}"
         );
-        assert!(!stream.contains("data: [DONE]"), "Responses SSE must not use Chat [DONE]");
+        assert!(
+            !stream.contains("data: [DONE]"),
+            "Responses SSE must not use Chat [DONE]"
+        );
         assert!(stream.contains("\"created_at\":1700000000"));
         assert!(stream.contains("\"input_tokens\":4"));
         assert!(stream.contains("\"delta\":\"Hello\""));
         assert!(stream.contains("\"text\":\"Hello\""));
-        assert!(stream.contains("resp_test1_msg"));
+        // OpenAI requires message item ids to begin with `msg` (not `resp_…_msg`).
+        assert!(stream.contains("\"id\":\"msg_test1\""));
+        assert!(
+            !stream.contains("resp_test1_msg"),
+            "legacy suffix form poisons Desktop history for later OpenAI turns"
+        );
         // created/in_progress carry empty output; completed carries the message item.
         assert!(stream.contains("\"status\":\"completed\""));
+    }
+
+    #[test]
+    fn item_ids_use_openai_type_prefixes() {
+        // CC Switch style type prefixes: msg_ / rs_ / resp_ (not suffix `_msg`).
+        assert_eq!(
+            message_item_id_from_response_id("resp_DrEsjCIVmIVVpgzXc7U8pVV4"),
+            "msg_DrEsjCIVmIVVpgzXc7U8pVV4"
+        );
+        assert_eq!(message_item_id_from_response_id("resp_abc_msg"), "msg_abc");
+        assert_eq!(
+            message_item_id_from_response_id("msg_already"),
+            "msg_already"
+        );
+        assert_eq!(reasoning_item_id_from_response_id("resp_abc"), "rs_abc");
+        assert_eq!(response_id_from_chat_id(Some("chatcmpl-xyz")), "resp_xyz");
+        assert_eq!(response_id_from_chat_id(Some("chatcmpl_abc")), "resp_abc");
+        assert_eq!(response_id_from_chat_id(Some("resp_keep")), "resp_keep");
+    }
+
+    #[test]
+    fn openai_input_rewrites_legacy_message_ids() {
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "resp_DrEsjCIVmIVVpgzXc7U8pVV4_msg",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_ok",
+                    "content": [{"type": "input_text", "text": "go"}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_call1",
+                    "call_id": "call1",
+                    "name": "shell"
+                },
+                {
+                    "role": "assistant",
+                    "id": "25fdab0e-8ec3-413c-8703-7ce5668ec990",
+                    "content": "bare uuid"
+                }
+            ]
+        });
+        sanitize_openai_input_message_ids(&mut request);
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(
+            input[0]["id"].as_str().unwrap(),
+            "msg_DrEsjCIVmIVVpgzXc7U8pVV4"
+        );
+        assert_eq!(input[1]["id"].as_str().unwrap(), "msg_ok");
+        // Non-message items untouched.
+        assert_eq!(input[2]["id"].as_str().unwrap(), "fc_call1");
+        assert_eq!(
+            input[3]["id"].as_str().unwrap(),
+            "msg_25fdab0e-8ec3-413c-8703-7ce5668ec990"
+        );
+    }
+
+    #[test]
+    fn openai_sanitize_rewrites_ids_but_keeps_native_tools() {
+        let mut request = json!({
+            "tools": [{"type": "namespace", "name": "x", "tools": []}],
+            "input": [{
+                "type": "message",
+                "role": "assistant",
+                "id": "resp_old_msg",
+                "content": []
+            }]
+        });
+        sanitize_responses_request_for_upstream("openai", &mut request);
+        // OpenAI kind keeps Codex-native tools (namespace not stripped).
+        assert_eq!(request["tools"][0]["type"], "namespace");
+        assert_eq!(request["input"][0]["id"], "msg_old");
+    }
+
+    #[test]
+    fn openai_input_drops_bridge_reasoning_and_item_refs_when_store_false() {
+        // Repro of user log: rs_resp_… from Chat-bridge + store=false → OpenAI 404.
+        let mut request = json!({
+            "store": false,
+            "previous_response_id": "resp_DrEsjCIVmIVVpgzXc7U8pVV4",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_resp_DrEsjCIVmIVVpgzXc7U8pVV4",
+                    "summary": [{"type": "summary_text", "text": "plan"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "resp_DrEsjCIVmIVVpgzXc7U8pVV4_msg",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                },
+                {
+                    "type": "item_reference",
+                    "id": "rs_resp_DrEsjCIVmIVVpgzXc7U8pVV4"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_real",
+                    "encrypted_content": "opaque-ciphertext",
+                    "summary": []
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_user1",
+                    "content": [{"type": "input_text", "text": "hi"}]
+                }
+            ]
+        });
+        sanitize_openai_responses_input(&mut request);
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(
+            input.len(),
+            3,
+            "bridge reasoning + item_ref dropped: {input:?}"
+        );
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["id"], "msg_DrEsjCIVmIVVpgzXc7U8pVV4");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_real");
+        assert_eq!(input[2]["id"], "msg_user1");
+        // Dropped items → strip sticky previous_response_id.
+        assert!(request.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn openai_input_keeps_previous_response_id_when_nothing_dropped() {
+        let mut request = json!({
+            "store": false,
+            "previous_response_id": "resp_openai_native",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_user1",
+                    "content": [{"type": "input_text", "text": "hi"}]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_ok",
+                    "encrypted_content": "cipher",
+                    "summary": []
+                }
+            ]
+        });
+        sanitize_openai_responses_input(&mut request);
+        assert_eq!(request["previous_response_id"], "resp_openai_native");
+        assert_eq!(request["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn openai_input_store_true_keeps_item_reference_but_drops_empty_reasoning() {
+        let mut request = json!({
+            "store": true,
+            "previous_response_id": "resp_keep",
+            "input": [
+                {
+                    "type": "item_reference",
+                    "id": "msg_server_side"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_resp_bridge",
+                    "summary": [{"type": "summary_text", "text": "x"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "resp_x_msg",
+                    "content": []
+                }
+            ]
+        });
+        sanitize_openai_responses_input(&mut request);
+        let input = request["input"].as_array().unwrap();
+        // store=true: item_reference kept; bridge reasoning still dropped.
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "item_reference");
+        assert_eq!(input[1]["id"], "msg_x");
+        assert!(request.get("previous_response_id").is_none());
     }
 
     #[test]
@@ -2721,7 +3055,9 @@ mod tests {
             .filter_map(|line| line.strip_prefix("event: "))
             .collect();
         assert!(events.contains(&"response.reasoning_summary_text.delta"));
-        let reasoning_pos = stream.find("\"type\":\"reasoning\"").expect("reasoning item");
+        let reasoning_pos = stream
+            .find("\"type\":\"reasoning\"")
+            .expect("reasoning item");
         let message_pos = stream.find("\"type\":\"message\"").expect("message item");
         assert!(
             reasoning_pos < message_pos,
@@ -2729,6 +3065,8 @@ mod tests {
         );
         assert!(stream.contains("Need context."));
         assert!(stream.contains("\"text\":\"pong\""));
+        assert!(stream.contains("\"id\":\"rs_r1\""));
+        assert!(stream.contains("\"id\":\"msg_r1\""));
     }
 
     #[test]
@@ -2794,10 +3132,7 @@ data: [DONE]
         assert!(roles.contains(&"system"));
         assert!(roles.contains(&"user"));
         assert!(!roles.contains(&"developer"));
-        assert_eq!(
-            responses_role_to_chat_role("developer"),
-            "system"
-        );
+        assert_eq!(responses_role_to_chat_role("developer"), "system");
         assert_eq!(responses_role_to_chat_role("assistant"), "assistant");
     }
 
@@ -2887,7 +3222,11 @@ data: [DONE]
         for kind in ["xai", "minimax", "custom", "kimi", "deepseek"] {
             let mut body = json!({"tools": sample_codex_tools()});
             sanitize_responses_request_for_upstream(kind, &mut body);
-            let tools = body.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
+            let tools = body
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             assert!(
                 tools.iter().all(|t| {
                     let ty = t["type"].as_str().unwrap_or("");
@@ -2896,11 +3235,15 @@ data: [DONE]
                 "{kind} must not forward Codex-only tool types"
             );
             assert!(
-                tools.iter().any(|t| t["name"] == "open_url" || t["function"]["name"] == "open_url"),
+                tools
+                    .iter()
+                    .any(|t| t["name"] == "open_url" || t["function"]["name"] == "open_url"),
                 "{kind} should flatten nested function tools from namespace"
             );
             assert!(
-                tools.iter().any(|t| t["name"] == "get_weather" || t["function"]["name"] == "get_weather"),
+                tools
+                    .iter()
+                    .any(|t| t["name"] == "get_weather" || t["function"]["name"] == "get_weather"),
                 "{kind} should keep freeform function tools"
             );
         }
@@ -2954,7 +3297,10 @@ data: [DONE]
             "external_web_access": true
         });
         sanitize_responses_request_for_upstream("xai", &mut body);
-        assert!(body.get("tool_choice").is_none(), "namespace tool_choice must be dropped");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "namespace tool_choice must be dropped"
+        );
         assert!(body.get("prompt_cache_retention").is_none());
         assert!(body.get("safety_identifier").is_none());
         assert!(body.get("presence_penalty").is_none());
@@ -3050,7 +3396,10 @@ data: [DONE]
         assert_eq!(chat["model"], "deepseek-v4-flash");
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][1]["content"], "Hi");
-        assert!(chat.get("tools").is_none(), "unsupported tools must be dropped");
+        assert!(
+            chat.get("tools").is_none(),
+            "unsupported tools must be dropped"
+        );
         assert_eq!(chat["reasoning_effort"], "high");
 
         let low = responses_to_chat_completions(

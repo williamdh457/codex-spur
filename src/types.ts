@@ -210,6 +210,42 @@ export type UsageSnapshot = {
   sampledAt: number;
 };
 
+export type UsageRange = "7d" | "30d" | "all";
+export type UsageTrendPoint = {
+  day: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  failedRequests: number;
+  cacheHitRate: number | null;
+};
+export type UsageBreakdown = {
+  name: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  failedRequests: number;
+  tokenShare: number;
+};
+export type UsageDashboardSnapshot = {
+  range: UsageRange;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  todayTokens: number;
+  selectedRangeTokens: number;
+  failedRequests: number;
+  failureRate: number | null;
+  cacheHitRate: number | null;
+  sampledAt: number;
+  trend: UsageTrendPoint[];
+  models: UsageBreakdown[];
+  providers: UsageBreakdown[];
+};
+
 export type DesktopVisibilityCheck = {
   id: string;
   label: string;

@@ -282,15 +282,17 @@ Top strip:
 
 - Proxy: Running / Stopped
 - Codex binding: Applied / Changed / Invalid
+- Desktop visibility status
 - Published models: count
 - Healthy accounts: count
-- Last apply time
 
-Below it:
+Section order below the strip:
 
-- “Needs attention” list for expired credentials, provider fetch failures, or apply drift.
-- Recent local routing metrics.
-- Primary action: `Review & Apply` only when a draft differs from the active revision.
+1. **Providers** — primary working surface (add / list / open edit sheet).
+2. **Desktop visibility** — collapsed by default. Failed checks (`ok === false`) always remain visible at the first level; explanatory copy, the short path callout, and passing checks expand on click.
+3. **Needs attention** — collapsed by default. Non-empty attention items always remain visible at the first level; the helper copy and empty “all clear” state expand on click.
+
+Do not auto-expand either disclosure when problems appear: surface the red/problem rows at level one and keep the secondary detail behind the disclosure control. Primary action for apply remains `Review & Apply` when a draft differs from the active revision.
 
 ### Providers
 

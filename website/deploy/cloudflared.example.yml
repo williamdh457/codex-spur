@@ -1,0 +1,10 @@
+# Replace placeholders on the Mac mini. Never commit the real tunnel UUID or credentials.
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /Users/your-user/.cloudflared/YOUR_TUNNEL_UUID.json
+
+ingress:
+  - hostname: codex-spur.example.com
+    service: http://127.0.0.1:8788
+  - hostname: www.codex-spur.example.com
+    service: http://127.0.0.1:8788
+  - service: http_status:404

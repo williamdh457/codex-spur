@@ -8,13 +8,13 @@ mod domain;
 mod media_sanitizer;
 mod openai_oauth;
 pub mod providers;
-mod xai_oauth;
 mod proxy;
 mod quota;
 mod scheduler;
 pub mod storage;
 mod upstream_errors;
 pub mod vault;
+mod xai_oauth;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -57,8 +57,13 @@ impl AppState {
         // apply/rebuild starts from Codex-safe snake_case rows.
         match storage.heal_all_route_catalogs().await {
             Ok(0) => {}
-            Ok(n) => tracing::info!(healed_routes = n, "已将 model_routes.catalog_json heal 为 snake_case"),
-            Err(error) => tracing::warn!(%error, "启动时 heal catalog_json 失败，将继续用运行时 heal"),
+            Ok(n) => tracing::info!(
+                healed_routes = n,
+                "已将 model_routes.catalog_json heal 为 snake_case"
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "启动时 heal catalog_json 失败，将继续用运行时 heal")
+            }
         }
         let stored_routes = storage.list_routes(true).await?;
         let (catalog_value, route_values) = catalog::build_from_routes(&stored_routes)?;
@@ -78,10 +83,8 @@ impl AppState {
         let providers = storage.list_providers().await?;
         let credentials = storage.list_credentials(None).await?;
         let published_models = catalog.read().await.models.len() as u32;
-        let desktop_visibility = codex_config::inspect_desktop_visibility(
-            Some(true),
-            Some(base_url.as_str()),
-        );
+        let desktop_visibility =
+            codex_config::inspect_desktop_visibility(Some(true), Some(base_url.as_str()));
         let live =
             codex_config::inspect_live_binding_with_proxy(Some(true), Some(base_url.as_str()));
         let mut attention_items = live.attention;
@@ -143,12 +146,12 @@ impl AppState {
         // Refresh binding + Desktop visibility from live ~/.codex (not isolated CODEX_HOME).
         let proxy_running = snapshot.proxy.running;
         let proxy_base = snapshot.proxy.base_url.clone();
-        let desktop_visibility = codex_config::inspect_desktop_visibility(
+        let desktop_visibility =
+            codex_config::inspect_desktop_visibility(Some(proxy_running), proxy_base.as_deref());
+        let live = codex_config::inspect_live_binding_with_proxy(
             Some(proxy_running),
             proxy_base.as_deref(),
         );
-        let live =
-            codex_config::inspect_live_binding_with_proxy(Some(proxy_running), proxy_base.as_deref());
         snapshot.binding.state = live.state;
         snapshot.binding.codex_home = live.codex_home.display().to_string();
         snapshot.binding.provider_id = live.provider_id;
@@ -380,6 +383,18 @@ async fn get_usage_snapshot(state: State<'_, AppState>) -> Result<domain::UsageS
 }
 
 #[tauri::command]
+async fn get_usage_dashboard(
+    range: domain::UsageRange,
+    state: State<'_, AppState>,
+) -> Result<domain::UsageDashboardSnapshot, String> {
+    state
+        .storage
+        .usage_dashboard(range)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_app_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, String> {
     let providers = state
         .storage
@@ -398,10 +413,8 @@ async fn get_app_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, Str
     // Drift re-check: auth expiry, gate edits, CC Switch steal-back.
     let proxy_running = snapshot.proxy.running;
     let proxy_base = snapshot.proxy.base_url.clone();
-    let desktop_visibility = codex_config::inspect_desktop_visibility(
-        Some(proxy_running),
-        proxy_base.as_deref(),
-    );
+    let desktop_visibility =
+        codex_config::inspect_desktop_visibility(Some(proxy_running), proxy_base.as_deref());
     let live =
         codex_config::inspect_live_binding_with_proxy(Some(proxy_running), proxy_base.as_deref());
     snapshot.binding.state = live.state;
@@ -472,12 +485,12 @@ async fn apply_codex_config(state: State<'_, AppState>) -> Result<CodexApplyOutc
         let mut snapshot = state.snapshot.write().await;
         let proxy_running = snapshot.proxy.running;
         let proxy_base = snapshot.proxy.base_url.clone();
-        let desktop_visibility = codex_config::inspect_desktop_visibility(
+        let desktop_visibility =
+            codex_config::inspect_desktop_visibility(Some(proxy_running), proxy_base.as_deref());
+        let live_proxy = codex_config::inspect_live_binding_with_proxy(
             Some(proxy_running),
             proxy_base.as_deref(),
         );
-        let live_proxy =
-            codex_config::inspect_live_binding_with_proxy(Some(proxy_running), proxy_base.as_deref());
         snapshot.binding.state = live_proxy.state;
         snapshot.binding.codex_home = live_proxy.codex_home.display().to_string();
         snapshot.binding.provider_id = live_proxy.provider_id.clone();
@@ -592,10 +605,7 @@ async fn store_api_key_credential(
             .add_pool_member(&pool_id, &id)
             .await
             .map_err(|error| error.to_string())?;
-        let _ = state
-            .storage
-            .set_active_pool(provider_id, &pool_id)
-            .await;
+        let _ = state.storage.set_active_pool(provider_id, &pool_id).await;
     }
     // API Key form / config import path — mark channel for Overview badge.
     let _ = state
@@ -668,9 +678,8 @@ async fn discover_provider_models(
     // via empty base_url (same path as official model discovery).
     if official_openai {
         let existing = provider.entry_category.as_deref();
-        let is_json_import = existing == Some("json")
-            || existing == Some("pool")
-            || existing == Some("config");
+        let is_json_import =
+            existing == Some("json") || existing == Some("pool") || existing == Some("config");
         if !is_json_import {
             let _ = state
                 .storage
@@ -679,23 +688,19 @@ async fn discover_provider_models(
         }
     } else if official_xai {
         let existing = provider.entry_category.as_deref();
-        let is_json_import = existing == Some("json")
-            || existing == Some("pool")
-            || existing == Some("config");
+        let is_json_import =
+            existing == Some("json") || existing == Some("pool") || existing == Some("config");
         if !is_json_import {
             let _ = state
                 .storage
                 .set_provider_entry_category(&provider_id, "official")
                 .await;
         }
-    } else if form_key.is_some()
-        && (provider.kind != "openai" || !base_url.trim().is_empty())
-    {
+    } else if form_key.is_some() && (provider.kind != "openai" || !base_url.trim().is_empty()) {
         // Form API key only — do not clobber a prior JSON import stamp.
         let existing = provider.entry_category.as_deref();
-        let is_json_import = existing == Some("json")
-            || existing == Some("pool")
-            || existing == Some("config");
+        let is_json_import =
+            existing == Some("json") || existing == Some("pool") || existing == Some("config");
         if !is_json_import {
             let _ = state
                 .storage
@@ -787,8 +792,7 @@ async fn discover_provider_models(
         let bearer = resolve_bearer_for_discover(&state, &provider_id, form_key.as_deref()).await?;
         if bearer.is_none() {
             return Err(
-                "缺少 API Key。请到「API 配置」填写，或先在「导入 JSON」导入账号后再拉取。"
-                    .into(),
+                "缺少 API Key。请到「API 配置」填写，或先在「导入 JSON」导入账号后再拉取。".into(),
             );
         }
         let models = if provider.kind == "xai" {
@@ -796,13 +800,9 @@ async fn discover_provider_models(
                 .await
                 .map_err(|error| error.to_string())?
         } else {
-            providers::discover_models(
-                &provider.kind,
-                &effective_base,
-                bearer.as_deref(),
-            )
-            .await
-            .map_err(|error| error.to_string())?
+            providers::discover_models(&provider.kind, &effective_base, bearer.as_deref())
+                .await
+                .map_err(|error| error.to_string())?
         };
         let normalized_base =
             providers::normalize_base_url(&effective_base).map_err(|error| error.to_string())?;
@@ -914,10 +914,7 @@ async fn start_openai_browser_login(
     state.openai_oauth.clear_browser_login().await;
 
     let (listener, port) = bind_oauth_callback_listener(openai_oauth::DEFAULT_OAUTH_REDIRECT_PORT)?;
-    let (prepared, pending) = state
-        .openai_oauth
-        .prepare_browser_login(port, name)
-        .await?;
+    let (prepared, pending) = state.openai_oauth.prepare_browser_login(port, name).await?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     {
@@ -930,7 +927,12 @@ async fn start_openai_browser_login(
     std::thread::Builder::new()
         .name("openai-oauth-callback".into())
         .spawn(move || {
-            run_openai_oauth_callback_listener(app_handle, listener, pending_for_thread, shutdown_rx);
+            run_openai_oauth_callback_listener(
+                app_handle,
+                listener,
+                pending_for_thread,
+                shutdown_rx,
+            );
         })
         .map_err(|e| format!("无法启动登录回调监听：{e}"))?;
 
@@ -1267,8 +1269,8 @@ async fn store_oauth_tokens_credential(
     if let Some(expires_at) = tokens.expires_at {
         import["expires_at"] = serde_json::Value::Number(expires_at.into());
     }
-    let credentials = credentials::parse_json_import(&import.to_string())
-        .map_err(|error| error.to_string())?;
+    let credentials =
+        credentials::parse_json_import(&import.to_string()).map_err(|error| error.to_string())?;
     for credential in credentials {
         let credential = credential.assign_provider(provider_id);
         let id = Uuid::new_v4().to_string();
@@ -1506,9 +1508,7 @@ async fn complete_xai_device_login(
                             .iter()
                             .filter(|route| route.provider_id == id)
                             .count() as u32,
-                        model_error: Some(format!(
-                            "已用内置 Grok 目录；在线模型列表失败：{error}"
-                        )),
+                        model_error: Some(format!("已用内置 Grok 目录；在线模型列表失败：{error}")),
                     })
                 }
                 Err(publish_err) => {
@@ -1897,11 +1897,7 @@ async fn set_provider_routing(
 ) -> Result<ProviderRouting, String> {
     state
         .storage
-        .set_provider_routing(
-            &provider_id,
-            &routing_mode,
-            fixed_credential_id.as_deref(),
-        )
+        .set_provider_routing(&provider_id, &routing_mode, fixed_credential_id.as_deref())
         .await
         .map_err(|error| error.to_string())?;
     state
@@ -2128,6 +2124,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
             get_usage_snapshot,
+            get_usage_dashboard,
             preview_codex_apply,
             apply_codex_config,
             restore_previous_codex_config,

@@ -13,6 +13,8 @@ import type {
   OpenAiQuotaSnapshot,
   ProviderSummary,
   UsageSnapshot,
+  UsageDashboardSnapshot,
+  UsageRange,
 } from "./types";
 
 const browserFallback: AppSnapshot = {
@@ -335,6 +337,13 @@ export async function getUsageSnapshot(): Promise<UsageSnapshot> {
     return { requestCount: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, todayTokens: 0, sevenDayTokens: 0, cacheHitRate: null, failedRequests: 0, sampledAt: Date.now() };
   }
   return invoke<UsageSnapshot>("get_usage_snapshot");
+}
+
+export async function getUsageDashboard(range: UsageRange): Promise<UsageDashboardSnapshot> {
+  if (!isTauriRuntime()) {
+    return { range, requestCount: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, todayTokens: 0, selectedRangeTokens: 0, failedRequests: 0, failureRate: null, cacheHitRate: null, sampledAt: Date.now(), trend: [], models: [], providers: [] };
+  }
+  return invoke<UsageDashboardSnapshot>("get_usage_dashboard", { range });
 }
 
 export async function refreshOpenAiQuota(credentialId: string): Promise<OpenAiQuotaSnapshot> {

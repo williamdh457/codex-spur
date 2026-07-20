@@ -12,7 +12,12 @@
     "test:watch": "vitest",
     "tauri": "tauri",
     "dev:app": "tauri dev",
-    "bundle:dmg": "tauri build --bundles dmg"
+    "bundle:dmg": "tauri build --bundles dmg",
+    "site:dev": "vite --config website/vite.config.ts --host 127.0.0.1",
+    "site:typecheck": "tsc -p website/tsconfig.json --noEmit --pretty false",
+    "site:build": "node website/scripts/validate-release.mjs && npm run site:typecheck && vite --config website/vite.config.ts build",
+    "site:preview": "vite preview --config website/vite.config.ts",
+    "site:deploy": "bash website/scripts/deploy.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

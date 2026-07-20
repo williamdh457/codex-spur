@@ -16,7 +16,6 @@ import {
   getCachedOpenAiQuota,
   getDiagnosticsMaxEvents,
   getPoolSchedulerConfig,
-  getUsageSnapshot,
   importCredentialsJson,
   importProviderConfigJson,
   listCredentials,
@@ -51,8 +50,8 @@ import type {
   ProxyRequestEvent,
   QuotaWindow,
   StatusTone,
-  UsageSnapshot,
 } from "./types";
+import { UsagePage } from "./usage";
 
 const NAVIGATION: Array<{ id: NavigationSection; label: string; icon: string }> = [
   { id: "overview", label: "概览", icon: "◫" },
@@ -102,6 +101,14 @@ function Overview({
   onEditProvider: (provider: ProviderSummary) => void;
 }) {
   const visibility = snapshot.desktopVisibility;
+  const [desktopOpen, setDesktopOpen] = useState(false);
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const desktopPanelId = useId();
+  const attentionPanelId = useId();
+  const failedChecks = visibility.checks.filter((check) => !check.ok);
+  const passedChecks = visibility.checks.filter((check) => check.ok);
+  const attentionCount = snapshot.attentionItems.length;
+
   return (
     <div className="page-stack">
       <section className="metrics-grid metrics-grid--5" aria-label="运行摘要">
@@ -116,55 +123,6 @@ function Overview({
         <Metric label="健康账号" value={String(snapshot.healthyAccounts)} note="可参与调度" />
       </section>
 
-      <section className="panel">
-        <div className="panel__header">
-          <div>
-            <h2>Desktop 可见性</h2>
-            <p>
-              ChatGPT 桌面端按官方身份门控自定义 catalog。请先在 <strong>ChatGPT.app</strong> 登录官方账号
-              （不是 Spur 的 API Key / 浏览器 OAuth），再 Apply，最后 Cmd+Q 冷启动，在「高级 → 模型」中选择 Kimi / DeepSeek。
-            </p>
-          </div>
-          <span className={`badge ${visibility.ready ? "badge--success" : "badge--warning"}`}>
-            {visibility.statusLabel}
-          </span>
-        </div>
-        <div className="readiness-list" role="list">
-          {visibility.checks.map((check) => (
-            <div
-              key={check.id}
-              className={`readiness-item ${check.ok ? "readiness-item--ok" : "readiness-item--bad"}`}
-              role="listitem"
-            >
-              <span aria-hidden="true">{check.ok ? "✓" : "!"}</span>
-              <div>
-                <strong>{check.label}</strong>
-                <p>{check.detail}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-        <div className="callout callout--inline">
-          <strong>最短路径</strong>
-          <p>ChatGPT 官方登录 → 启用模型 → Review &amp; Apply → Cmd+Q 重开 ChatGPT → 高级 → 模型 ›</p>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="panel__header">
-          <div><h2>需要处理</h2><p>只列出会阻止路由、Apply 或 Desktop 可见性的问题。</p></div>
-          <span className="badge badge--warning">{snapshot.attentionItems.length}</span>
-        </div>
-        <div className="attention-list">
-          {snapshot.attentionItems.length === 0 ? (
-            <div className="attention-item attention-item--ok"><span aria-hidden="true">✓</span><p>当前没有需要处理的问题。</p></div>
-          ) : (
-            snapshot.attentionItems.map((item) => (
-              <div className="attention-item" key={item}><span aria-hidden="true">!</span><p>{item}</p></div>
-            ))
-          )}
-        </div>
-      </section>
       <section className="panel">
         <div className="panel__header">
           <div>
@@ -188,9 +146,109 @@ function Overview({
           </div>
         )}
       </section>
+
+      <section className="panel panel--disclosure">
+        <div className="panel__header panel__header--disclosure">
+          <button
+            type="button"
+            className="panel-disclosure"
+            aria-expanded={desktopOpen}
+            aria-controls={desktopPanelId}
+            onClick={() => setDesktopOpen((open) => !open)}
+          >
+            <span className="panel-disclosure__chevron" aria-hidden="true">{desktopOpen ? "▾" : "▸"}</span>
+            <span className="panel-disclosure__title">
+              <strong>Desktop 可见性</strong>
+              <span>{desktopOpen ? "收起说明与通过项" : "展开说明与通过项"}</span>
+            </span>
+          </button>
+          <span className={`badge ${visibility.ready ? "badge--success" : "badge--warning"}`}>
+            {visibility.statusLabel}
+          </span>
+        </div>
+        {failedChecks.length > 0 ? (
+          <div className="readiness-list" role="list" aria-label="Desktop 可见性待处理项">
+            {failedChecks.map((check) => (
+              <div key={check.id} className="readiness-item readiness-item--bad" role="listitem">
+                <span aria-hidden="true">!</span>
+                <div>
+                  <strong>{check.label}</strong>
+                  <p>{check.detail}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <div id={desktopPanelId} className="panel-disclosure__body" hidden={!desktopOpen}>
+          <p className="panel-disclosure__copy">
+            ChatGPT 桌面端按官方身份门控自定义 catalog。请先在 <strong>ChatGPT.app</strong> 登录官方账号
+            （不是 Spur 的 API Key / 浏览器 OAuth），再 Apply，最后 Cmd+Q 冷启动，在「高级 → 模型」中选择 Kimi / DeepSeek。
+          </p>
+          {passedChecks.length > 0 ? (
+            <div className="readiness-list" role="list" aria-label="Desktop 可见性通过项">
+              {passedChecks.map((check) => (
+                <div key={check.id} className="readiness-item readiness-item--ok" role="listitem">
+                  <span aria-hidden="true">✓</span>
+                  <div>
+                    <strong>{check.label}</strong>
+                    <p>{check.detail}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <div className="callout callout--inline">
+            <strong>最短路径</strong>
+            <p>ChatGPT 官方登录 → 启用模型 → Review &amp; Apply → Cmd+Q 重开 ChatGPT → 高级 → 模型 ›</p>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel panel--disclosure">
+        <div className="panel__header panel__header--disclosure">
+          <button
+            type="button"
+            className="panel-disclosure"
+            aria-expanded={attentionOpen}
+            aria-controls={attentionPanelId}
+            onClick={() => setAttentionOpen((open) => !open)}
+          >
+            <span className="panel-disclosure__chevron" aria-hidden="true">{attentionOpen ? "▾" : "▸"}</span>
+            <span className="panel-disclosure__title">
+              <strong>需要处理</strong>
+              <span>{attentionOpen ? "收起说明" : "展开说明"}</span>
+            </span>
+          </button>
+          <span className={`badge ${attentionCount > 0 ? "badge--warning" : "badge--success"}`}>
+            {attentionCount}
+          </span>
+        </div>
+        {attentionCount > 0 ? (
+          <div className="attention-list" aria-label="需要处理的问题">
+            {snapshot.attentionItems.map((item) => (
+              <div className="attention-item" key={item}>
+                <span aria-hidden="true">!</span>
+                <p>{item}</p>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <div id={attentionPanelId} className="panel-disclosure__body" hidden={!attentionOpen}>
+          <p className="panel-disclosure__copy">只列出会阻止路由、Apply 或 Desktop 可见性的问题。</p>
+          {attentionCount === 0 ? (
+            <div className="attention-list">
+              <div className="attention-item attention-item--ok">
+                <span aria-hidden="true">✓</span>
+                <p>当前没有需要处理的问题。</p>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </section>
     </div>
   );
 }
+
 
 type AddMethodId =
   | "openai-official"
@@ -1680,43 +1738,6 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
       </section>
     </div>
   );
-}
-
-function UsageMetric({ label, value, note }: { label: string; value: string; note: string }) {
-  return <div className="usage-metric"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>;
-}
-
-function UsagePage() {
-  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const reload = useCallback(async () => {
-    try { setUsage(await getUsageSnapshot()); setError(null); }
-    catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-    void getUsageSnapshot().then((value) => { if (active) setUsage(value); }).catch((nextError: unknown) => { if (active) setError(nextError instanceof Error ? nextError.message : String(nextError)); });
-    return () => { active = false; };
-  }, []);
-
-  if (!usage) return <div className="page-stack"><section className="panel"><div className="empty-state"><strong>正在读取本地用量</strong><p>数据只来自本机代理，不会上传。</p></div></section></div>;
-  const format = (value: number) => new Intl.NumberFormat("zh-CN").format(value);
-  return <div className="page-stack">
-    <section className="panel usage-panel">
-      <div className="panel__header"><div><h2>本地代理用量</h2><p>按 Codex Spur 本地代理统计；token 是请求体长度估算值，直到上游返回 usage 才会显示精确值。</p></div><button type="button" className="button button--secondary" onClick={() => void reload()}>刷新</button></div>
-      <div className="usage-grid">
-        <UsageMetric label="请求数" value={format(usage.requestCount)} note="当前代理进程" />
-        <UsageMetric label="今日 token" value={format(usage.todayTokens)} note="本地日统计" />
-        <UsageMetric label="总 token" value={format(usage.totalTokens)} note="本地累计" />
-        <UsageMetric label="7 日 token" value={format(usage.sevenDayTokens)} note="本地累计暂未分日" />
-        <UsageMetric label="缓存命中率" value={usage.cacheHitRate === null ? "暂无数据" : `${(usage.cacheHitRate * 100).toFixed(1)}%`} note="上游返回 usage 后统计" />
-      </div>
-      <div className="usage-chart" role="img" aria-label="最近请求用量趋势"><div className="usage-chart__bars"><span style={{ height: `${Math.max(12, Math.min(100, usage.requestCount * 8 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.inputTokens / 20 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.outputTokens / 20 + 12))}%` }} /><span style={{ height: `${Math.max(12, Math.min(100, usage.totalTokens / 20 + 12))}%` }} /></div><div className="usage-chart__labels"><span>请求</span><span>输入</span><span>输出</span><span>合计</span></div></div>
-    </section>
-    {error && <div className="inline-warning">{error}</div>}
-  </div>;
 }
 
 function layerLabel(layer: string): string {

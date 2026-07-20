@@ -1,0 +1,23 @@
+# Copy to the Mac mini after replacing the site root.
+127.0.0.1:8788 {
+  root * /Users/your-user/Sites/codex-spur/current
+  encode zstd gzip
+
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    Cache-Control "public, max-age=300, must-revalidate"
+  }
+
+  @immutable path /assets/*
+  header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+  file_server
+  handle_errors {
+    rewrite * /404.html
+    file_server
+  }
+}
