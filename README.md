@@ -32,6 +32,23 @@
 ---
 
 > [!IMPORTANT]
+> ### 首次打开提示 **「应用已损坏，无法打开」**？
+>
+> **几乎不是安装包坏了。** 公开 Release 的 DMG 是 **ad-hoc 签名、未做 Apple 公证**。浏览器下载会带隔离属性，Gatekeeper 常误报为「已损坏」。
+>
+> **最快处理**（先拖进「应用程序」）：
+>
+> ```bash
+> xattr -cr "/Applications/Codex Spur.app"
+> open "/Applications/Codex Spur.app"
+> ```
+>
+> 或：对 App **右键 → 打开 → 打开** · 或 **系统设置 → 隐私与安全性 → 仍要打开**。
+>
+> 完整说明：[§ If macOS says “app is damaged”](#if-macos-says-app-is-damaged) · 中文版：[README.zh-CN.md](./README.zh-CN.md#首次打开提示应用已损坏)
+>
+> ---
+>
 > ### If macOS says **“Codex Spur is damaged and can’t be opened”**
 >
 > **The download is almost never corrupt.** Public Release DMGs are **ad-hoc signed and not notarized**, so Gatekeeper treats the quarantine flag from a browser download as “damaged.”
@@ -45,7 +62,7 @@
 >
 > Or: **right-click the app → Open → Open** · or **System Settings → Privacy & Security → Open Anyway**.
 >
-> Full options (and what does *not* work without a $99 Developer ID): [§ If macOS says “app is damaged”](#if-macos-says-app-is-damaged)
+> Full options: [§ If macOS says “app is damaged”](#if-macos-says-app-is-damaged)
 
 ---
 
