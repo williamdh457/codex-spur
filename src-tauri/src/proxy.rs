@@ -1168,6 +1168,24 @@ fn instruction_text(value: &Value) -> String {
     }
 }
 
+/// Map Codex Responses roles onto Chat Completions roles accepted by
+/// DeepSeek/Kimi (and OpenAI-compatible gateways).
+///
+/// Codex Desktop injects `developer` blocks (permissions, collaboration mode,
+/// …). DeepSeek rejects them with:
+/// `messages[N].role: unknown variant developer, expected one of system, user, …`.
+fn responses_role_to_chat_role(role: &str) -> &'static str {
+    match role {
+        "system" | "developer" => "system",
+        "assistant" => "assistant",
+        "tool" => "tool",
+        // latest_reminder is a DeepSeek-accepted role; treat as user for other
+        // OpenAI-compatible upstreams that only allow the classic set.
+        "user" | "latest_reminder" => "user",
+        _ => "user",
+    }
+}
+
 fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
     match input {
         Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
@@ -1187,10 +1205,11 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                 ) {
                     continue;
                 }
-                let role = item
+                let raw_role = item
                     .get("role")
                     .and_then(Value::as_str)
-                    .unwrap_or(if item_type == "message" { "user" } else { "user" });
+                    .unwrap_or("user");
+                let role = responses_role_to_chat_role(raw_role);
                 if let Some(content) = item.get("content") {
                     let text = content_text(content);
                     if !text.is_empty() || role == "assistant" {
@@ -1499,6 +1518,59 @@ mod tests {
             {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
         ])));
         assert_eq!(messages[0]["content"], "Hi");
+    }
+
+    #[test]
+    fn maps_codex_developer_role_to_system_for_deepseek() {
+        // Desktop "carefully think" turns inject developer instruction blocks.
+        let messages = response_input_to_messages(Some(&json!([
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Permissions block"}]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "think carefully"}]
+            }
+        ])));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "Permissions block");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(
+            messages
+                .iter()
+                .all(|m| m["role"].as_str() != Some("developer")),
+            "developer must never reach Chat Completions"
+        );
+
+        let chat = responses_to_chat_completions(
+            &json!({
+                "instructions": "You are Codex.",
+                "input": [
+                    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Collab mode"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+                ],
+                "stream": false
+            }),
+            "deepseek-v4-flash",
+        );
+        let roles: Vec<&str> = chat["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert!(roles.contains(&"system"));
+        assert!(roles.contains(&"user"));
+        assert!(!roles.contains(&"developer"));
+        assert_eq!(
+            responses_role_to_chat_role("developer"),
+            "system"
+        );
+        assert_eq!(responses_role_to_chat_role("assistant"), "assistant");
     }
 
     #[test]
