@@ -8,7 +8,7 @@
 flowchart LR
   UI[React 桌面 UI] -->|Tauri IPC| Core[Rust AppState]
   Core --> DB[(SQLite)]
-  Core --> Vault[macOS Keychain + AES-256-GCM]
+  Core --> Vault[master_key.hex + AES-256-GCM]
   Core --> Catalog[model-catalog.json]
   Core --> Config[~/.codex/config.toml]
   Core --> Proxy[127.0.0.1 Responses Proxy]
@@ -37,7 +37,7 @@ flowchart LR
 - 多账号实例支持 **Pool | Fixed** 路由；Pool 为 Sub2API 风格独立实现（不拷贝 LGPL 源码）。
 - 「导入账号」只是创建多账号 OpenAI 实例的一种方式；UI 用语优先「账号 / 多账号」，不做一级账号池导航。
 - JSON 根对象、数组、`accounts` 数组、Codex `auth.json`、Sub2API 风格 tokens 均可解析（仅走账号导入路径）。
-- 原始 secret 不回传前端；SQLite 只保存 AES-256-GCM 密文，主密钥位于 macOS Keychain。
+- 原始 secret 不回传前端；SQLite 只保存 AES-256-GCM 密文，主密钥位于应用数据目录下的 `master_key.hex`（`0600`，不使用 macOS Keychain，避免未签名/开发版反复索要登录密码）。
 - **调度流水线**（`scheduler` 模块，Sub2API 可观察契约的独立实现）：
   1. Fixed 模式 → 固定账号；
   2. 否则 `previous_response_id` sticky（命中后把 session 也绑到同账号，利于 prompt cache）；
