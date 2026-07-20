@@ -35,6 +35,12 @@
 
 这就是产品本身。
 
+<p align="center">
+  <img src="docs/images/codex-model-picker.png" alt="Codex 模型选择器中显示由 Codex Spur 发布的 Grok、Kimi、DeepSeek、OpenAI 模型" width="720">
+</p>
+
+<p align="center"><sub>你在 Spur 里配置的模型，出现在 Codex / ChatGPT Desktop 原生选择器中——点一下即可切换。</sub></p>
+
 在 Spur 接好供应商、勾选要发布的路由、**Review & Apply**——模型进入 **Codex 原生选择器**。赶速度用 Kimi、控成本用 DeepSeek、硬仗用 OpenAI、私有端点走自定义网关：全部 **一键切换**，不用离开 Codex，也不用反复改配置。
 
 Spur 是 **local-first** 的桌面控制面：管你真正在用的模型，不是把密钥交给云端，也不是去改写 `ChatGPT.app`。

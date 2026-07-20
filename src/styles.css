@@ -787,3 +787,25 @@ h2 { font-size: 14px; line-height: 20px; }
   letter-spacing: -0.02em;
   line-height: 1.35;
 }
+
+.about-panel__shot {
+  margin: 2px 0 4px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface-muted);
+}
+.about-panel__shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  vertical-align: middle;
+}
+.about-panel__shot figcaption {
+  padding: 8px 10px 9px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--tertiary);
+  font-size: 11px;
+  line-height: 1.4;
+}

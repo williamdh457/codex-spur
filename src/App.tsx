@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import brandIcon from "./assets/codex-spur-icon.png";
+import modelPickerShot from "./assets/codex-model-picker.png";
 import {
   applyCodexConfig,
   cancelOpenAiBrowserLogin,
@@ -2559,6 +2560,15 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
           <p className="about-panel__lead">
             All your models. One Codex picker. One click to switch.
           </p>
+          <figure className="about-panel__shot">
+            <img
+              src={modelPickerShot}
+              alt="Codex model picker listing Grok, Kimi, DeepSeek, and OpenAI models"
+            />
+            <figcaption>
+              Your configured models in the native Codex picker — one click to switch.
+            </figcaption>
+          </figure>
           <p>
             Wire up Kimi, DeepSeek, xAI, OpenAI multi-account, or any compatible gateway once. Enable what you
             want, Review &amp; Apply — and every selected model lands in the <strong>native Codex / ChatGPT

@@ -35,6 +35,12 @@
 
 That is the whole point.
 
+<p align="center">
+  <img src="docs/images/codex-model-picker.png" alt="Codex model picker with Grok, Kimi, DeepSeek, and OpenAI models published by Codex Spur" width="720">
+</p>
+
+<p align="center"><sub>Your configured models in the native Codex / ChatGPT Desktop picker — one click to switch.</sub></p>
+
 You wire providers in Spur, enable the routes you care about, hit **Review & Apply** — and they show up in the **native Codex model picker**. Coding on Kimi for speed, DeepSeek for cost, OpenAI for the hard pass, a custom gateway for a private endpoint: **switch with one click**, without leaving the app or rewriting configs.
 
 Spur is a **local-first** control surface for the models you actually ship with — not a cloud locker, not a ChatGPT.app patcher.
