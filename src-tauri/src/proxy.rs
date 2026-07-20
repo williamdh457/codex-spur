@@ -188,14 +188,10 @@ async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: By
             "Invalid local proxy token",
         );
     }
-    let mut parsed = match serde_json::from_slice::<Value>(&body) {
-        Ok(Value::Object(value)) => Value::Object(value),
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_json",
-                "Request body must be a JSON object",
-            )
+    let mut parsed = match parse_json_object_body(&body) {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_json", &message);
         }
     };
     let affinity = affinity_inputs(&headers, &parsed);
@@ -235,13 +231,15 @@ async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: By
             },
         )
         .await;
-    map_reasoning(&target, &mut parsed);
     if let Some(object) = parsed.as_object_mut() {
         object.insert("model".into(), Value::String(target.upstream_model.clone()));
     }
     if target.protocol.to_ascii_lowercase().contains("chat") {
+        // Chat Completions conversion maps reasoning itself; do not pre-mutate
+        // reasoning.effort into provider-internal tokens like "disabled"/"enabled".
         forward_chat_compatible(&state, &target, parsed, &affinity).await
     } else {
+        map_reasoning(&target, &mut parsed);
         forward_responses_compatible(&state, &target, parsed, &affinity).await
     }
 }
@@ -373,12 +371,10 @@ async fn forward_chat_compatible(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let chat_body = json!({
-        "model": target.upstream_model,
-        "messages": response_input_to_messages(request_body.get("input")),
-        "stream": wants_stream,
-        "tools": request_body.get("tools").cloned().unwrap_or(Value::Array(Vec::new())),
-    });
+    // Codex Desktop talks Responses API; DeepSeek/Kimi expose Chat Completions only.
+    // Naive passthrough of Responses `tools` (type/name/parameters, local_shell, …)
+    // makes upstream reject with 400. Convert like Nice Switch's transform_codex_chat.
+    let chat_body = responses_to_chat_completions(&request_body, &target.upstream_model);
     let endpoint = endpoint(&target.base_url, &target.kind, "chat/completions");
     let max_switches = state
         .storage
@@ -974,18 +970,195 @@ fn map_reasoning(target: &RouteTarget, request: &mut Value) {
     }
 }
 
+/// Parse Codex → proxy request bodies. Desktop occasionally double-encodes JSON as a
+/// string, and structured-turn helpers may send empty bodies; reject with a useful
+/// message instead of a bare "must be a JSON object".
+fn parse_json_object_body(body: &Bytes) -> Result<Value, String> {
+    if body.is_empty() {
+        return Err("Request body is empty (expected a JSON object)".into());
+    }
+    let parsed = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(format!(
+                "Request body is not valid JSON ({} bytes): {error}",
+                body.len()
+            ));
+        }
+    };
+    match parsed {
+        Value::Object(_) => Ok(parsed),
+        // Double-encoded: "\"{...}\"" → string whose content is a JSON object.
+        Value::String(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(map)) => Ok(Value::Object(map)),
+            Ok(other) => Err(format!(
+                "Request body string decoded to JSON {}, expected object",
+                json_value_kind(&other)
+            )),
+            Err(error) => Err(format!(
+                "Request body is a JSON string but not a nested object: {error}"
+            )),
+        },
+        other => Err(format!(
+            "Request body must be a JSON object (got {})",
+            json_value_kind(&other)
+        )),
+    }
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Convert a Codex Responses request into OpenAI Chat Completions for Kimi/DeepSeek.
+fn responses_to_chat_completions(request_body: &Value, upstream_model: &str) -> Value {
+    let mut messages = Vec::new();
+    if let Some(instructions) = request_body.get("instructions") {
+        let text = instruction_text(instructions);
+        if !text.is_empty() {
+            messages.push(json!({"role": "system", "content": text}));
+        }
+    }
+    messages.extend(response_input_to_messages(request_body.get("input")));
+    if messages.is_empty() {
+        messages.push(json!({"role": "user", "content": ""}));
+    }
+
+    let wants_stream = request_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut chat = json!({
+        "model": upstream_model,
+        "messages": messages,
+        "stream": wants_stream,
+    });
+
+    let tools = responses_tools_to_chat_tools(request_body.get("tools"));
+    if !tools.is_empty() {
+        chat.as_object_mut()
+            .expect("chat object")
+            .insert("tools".into(), Value::Array(tools));
+        if let Some(tool_choice) = request_body.get("tool_choice") {
+            chat.as_object_mut()
+                .expect("chat object")
+                .insert("tool_choice".into(), tool_choice.clone());
+        }
+    }
+
+    // Optional Chat Completions knobs Codex may already set.
+    for key in [
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "stop",
+        "user",
+        "n",
+        "presence_penalty",
+        "frequency_penalty",
+        "response_format",
+        "seed",
+    ] {
+        if let Some(value) = request_body.get(key) {
+            if !value.is_null() {
+                chat.as_object_mut()
+                    .expect("chat object")
+                    .insert(key.into(), value.clone());
+            }
+        }
+    }
+
+    // Only inject OpenAI-style reasoning_effort when the Codex effort is a legal
+    // Chat Completions enum. Never forward profile tokens like disabled/enabled/off.
+    if let Some(effort) = request_body
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+    {
+        if let Some(mapped) = chat_reasoning_effort(effort) {
+            chat.as_object_mut()
+                .expect("chat object")
+                .insert("reasoning_effort".into(), Value::String(mapped.into()));
+        }
+    }
+
+    chat
+}
+
+/// Map Codex ladder → Chat Completions `reasoning_effort` (DeepSeek/Kimi/OpenAI-compat).
+/// Returns None to omit the field (e.g. none/minimal → no thinking param).
+fn chat_reasoning_effort(codex_effort: &str) -> Option<&'static str> {
+    match codex_effort {
+        "none" | "minimal" | "disabled" | "off" => None,
+        "low" => Some("low"),
+        "medium" | "enabled" | "default" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "max" | "ultra" => Some("high"),
+        _ => None,
+    }
+}
+
+fn instruction_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.as_str().map(str::to_string).or_else(|| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
 fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
     match input {
         Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
         Some(Value::Array(items)) => {
-            let messages = items
-                .iter()
-                .filter_map(|item| {
-                    let role = item.get("role").and_then(Value::as_str)?;
-                    let content = item.get("content").map(content_text).unwrap_or_default();
-                    Some(json!({"role": role, "content": content}))
-                })
-                .collect::<Vec<_>>();
+            let mut messages = Vec::new();
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                // Skip tool/function call items for the first vertical slice; text only.
+                if matches!(
+                    item_type,
+                    "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output"
+                        | "reasoning"
+                        | "web_search_call"
+                ) {
+                    continue;
+                }
+                let role = item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or(if item_type == "message" { "user" } else { "user" });
+                if let Some(content) = item.get("content") {
+                    let text = content_text(content);
+                    if !text.is_empty() || role == "assistant" {
+                        messages.push(json!({"role": role, "content": text}));
+                    }
+                    continue;
+                }
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        messages.push(json!({"role": role, "content": text}));
+                    }
+                }
+            }
             if messages.is_empty() {
                 vec![json!({"role": "user", "content": ""})]
             } else {
@@ -1005,11 +1178,58 @@ fn content_text(content: &Value) -> String {
                 part.get("text")
                     .and_then(Value::as_str)
                     .or_else(|| part.get("input_text").and_then(Value::as_str))
+                    .or_else(|| part.get("output_text").and_then(Value::as_str))
             })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// Map Codex Responses tools → Chat Completions `tools[].function` shape.
+/// Drops unsupported kinds (local_shell, web_search, …) instead of forwarding raw rows.
+fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Vec<Value> {
+    let Some(Value::Array(items)) = tools else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tool in items {
+        let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+        // Already Chat Completions shaped.
+        if tool.get("function").is_some() && (tool_type.is_empty() || tool_type == "function") {
+            out.push(tool.clone());
+            continue;
+        }
+        // Responses freeform function tool: {type:function, name, description, parameters}
+        if tool_type == "function" || tool.get("name").is_some() {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let description = tool
+                .get("description")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new()));
+            let parameters = tool
+                .get("parameters")
+                .or_else(|| tool.get("input_schema"))
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            out.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters
+                }
+            }));
+            continue;
+        }
+        // local_shell / web_search / custom / namespace — not portable to DeepSeek/Kimi.
+    }
+    out
 }
 
 fn endpoint(base_url: &str, kind: &str, path: &str) -> String {
@@ -1234,6 +1454,67 @@ mod tests {
             {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
         ])));
         assert_eq!(messages[0]["content"], "Hi");
+    }
+
+    #[test]
+    fn converts_responses_tools_to_chat_function_shape() {
+        let tools = responses_tools_to_chat_tools(Some(&json!([
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            },
+            {"type": "local_shell"},
+            {
+                "type": "function",
+                "function": {
+                    "name": "already_chat",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }
+        ])));
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+        assert_eq!(tools[1]["function"]["name"], "already_chat");
+    }
+
+    #[test]
+    fn chat_conversion_omits_empty_tools_and_maps_input() {
+        let chat = responses_to_chat_completions(
+            &json!({
+                "model": "ignored",
+                "instructions": "You are helpful.",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hi"}]}],
+                "stream": false,
+                "tools": [{"type": "local_shell"}],
+                "reasoning": {"effort": "high"}
+            }),
+            "deepseek-v4-flash",
+        );
+        assert_eq!(chat["model"], "deepseek-v4-flash");
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][1]["content"], "Hi");
+        assert!(chat.get("tools").is_none(), "unsupported tools must be dropped");
+        assert_eq!(chat["reasoning_effort"], "high");
+
+        let low = responses_to_chat_completions(
+            &json!({"input": "hi", "reasoning": {"effort": "none"}}),
+            "deepseek-v4-flash",
+        );
+        assert!(
+            low.get("reasoning_effort").is_none(),
+            "none/minimal must not emit invalid reasoning_effort"
+        );
+    }
+
+    #[test]
+    fn parse_json_object_body_accepts_double_encoded_objects() {
+        let nested = json!({"model": "x", "input": "hi"});
+        let encoded = serde_json::to_string(&nested).unwrap();
+        let as_string = serde_json::to_vec(&Value::String(encoded)).unwrap();
+        let parsed = parse_json_object_body(&Bytes::from(as_string)).expect("decode");
+        assert_eq!(parsed["model"], "x");
     }
 
     #[test]
