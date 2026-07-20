@@ -548,6 +548,7 @@ async fn forward_chat_compatible(
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or("resp_codex_select");
+        let usage = chat_usage_to_responses_usage(payload.get("usage"));
         return Json(json!({
             "id": id,
             "object": "response",
@@ -560,7 +561,7 @@ async fn forward_chat_compatible(
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": text, "annotations": []}]
             }],
-            "usage": payload.get("usage").cloned().unwrap_or(Value::Null)
+            "usage": usage
         }))
         .into_response();
     }
@@ -632,7 +633,7 @@ async fn adapt_chat_stream(
             .into_response();
     }
     let mut text = String::new();
-    let mut usage = Value::Null;
+    let mut raw_usage: Option<Value> = None;
     for line in body.lines() {
         let Some(data) = line.strip_prefix("data:") else {
             continue;
@@ -648,11 +649,14 @@ async fn adapt_chat_stream(
             {
                 text.push_str(delta);
             }
-            if let Some(next_usage) = payload.get("usage") {
-                usage = next_usage.clone();
+            if let Some(next_usage) = payload.get("usage").filter(|value| !value.is_null()) {
+                raw_usage = Some(next_usage.clone());
             }
         }
     }
+    // Codex Desktop deserializes ResponseCompleted.usage and requires input_tokens
+    // (Responses shape). Chat Completions only has prompt_tokens — map like CC Switch.
+    let usage = chat_usage_to_responses_usage(raw_usage.as_ref());
     let response_id = format!("resp_{}", Uuid::new_v4());
     let completed = json!({
         "type": "response.completed",
@@ -1062,6 +1066,108 @@ fn json_value_kind(value: &Value) -> &'static str {
     }
 }
 
+/// Map Chat Completions `usage` onto Responses usage for Codex Desktop.
+///
+/// Desktop requires `input_tokens` on `response.completed`; Chat only exposes
+/// `prompt_tokens` / `completion_tokens`. Always emit a full object (zeros when
+/// missing) — never `null` — matching CC Switch's `chat_usage_to_responses_usage`.
+fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage.filter(|value| value.is_object() && !value.is_null()) else {
+        return json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "output_tokens_details": { "reasoning_tokens": 0 }
+        });
+    };
+
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(input_tokens + output_tokens);
+
+    let mut result = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens
+    });
+
+    let cached = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_write = usage
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    if cached > 0 || cache_write > 0 {
+        result["input_tokens_details"] = json!({
+            "cached_tokens": cached,
+            "cache_write_tokens": cache_write
+        });
+    }
+
+    if let Some(details) = usage
+        .get("completion_tokens_details")
+        .filter(|value| value.is_object())
+    {
+        let mut details = details.clone();
+        if details.get("reasoning_tokens").is_none() {
+            details["reasoning_tokens"] = json!(0);
+        }
+        result["output_tokens_details"] = details;
+    } else {
+        result["output_tokens_details"] = json!({ "reasoning_tokens": 0 });
+    }
+
+    if let Some(cache_read) = usage.get("cache_read_input_tokens") {
+        result["cache_read_input_tokens"] = cache_read.clone();
+    }
+    if cache_write > 0 {
+        result["cache_creation_input_tokens"] = json!(cache_write);
+    }
+
+    result
+}
+
+/// OpenAI-compat stream requests omit usage unless `stream_options.include_usage`.
+fn inject_stream_include_usage(chat: &mut Value) {
+    let is_stream = chat
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !is_stream {
+        return;
+    }
+    match chat.get_mut("stream_options") {
+        Some(Value::Object(opts)) => {
+            opts.insert("include_usage".into(), json!(true));
+        }
+        _ => {
+            chat.as_object_mut()
+                .expect("chat object")
+                .insert("stream_options".into(), json!({ "include_usage": true }));
+        }
+    }
+}
+
 /// Convert a Codex Responses request into OpenAI Chat Completions for Kimi/DeepSeek.
 fn responses_to_chat_completions(request_body: &Value, upstream_model: &str) -> Value {
     let mut messages = Vec::new();
@@ -1085,6 +1191,7 @@ fn responses_to_chat_completions(request_body: &Value, upstream_model: &str) -> 
         "messages": messages,
         "stream": wants_stream,
     });
+    inject_stream_include_usage(&mut chat);
 
     let tools = responses_tools_to_chat_tools(request_body.get("tools"));
     if !tools.is_empty() {
@@ -1518,6 +1625,62 @@ mod tests {
             {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
         ])));
         assert_eq!(messages[0]["content"], "Hi");
+    }
+
+    #[test]
+    fn chat_usage_maps_prompt_tokens_to_input_tokens() {
+        let mapped = chat_usage_to_responses_usage(Some(&json!({
+            "prompt_tokens": 4,
+            "completion_tokens": 2,
+            "total_tokens": 6,
+            "completion_tokens_details": { "reasoning_tokens": 1 }
+        })));
+        assert_eq!(mapped["input_tokens"], 4);
+        assert_eq!(mapped["output_tokens"], 2);
+        assert_eq!(mapped["total_tokens"], 6);
+        assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 1);
+        assert!(mapped.get("prompt_tokens").is_none());
+
+        let zeros = chat_usage_to_responses_usage(None);
+        assert_eq!(zeros["input_tokens"], 0);
+        assert_eq!(zeros["output_tokens"], 0);
+        assert_eq!(zeros["total_tokens"], 0);
+        assert_eq!(zeros["output_tokens_details"]["reasoning_tokens"], 0);
+
+        // response.completed must always carry input_tokens for Desktop.
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": chat_usage_to_responses_usage(Some(&json!({
+                    "prompt_tokens": 10,
+                    "completion_tokens": 3
+                })))
+            }
+        });
+        let encoded = serde_json::to_string(&completed).unwrap();
+        assert!(
+            encoded.contains("\"input_tokens\":10"),
+            "completed event must expose input_tokens: {encoded}"
+        );
+    }
+
+    #[test]
+    fn stream_chat_request_injects_include_usage() {
+        let chat = responses_to_chat_completions(
+            &json!({
+                "input": "hi",
+                "stream": true
+            }),
+            "deepseek-v4-flash",
+        );
+        assert_eq!(chat["stream"], true);
+        assert_eq!(chat["stream_options"]["include_usage"], true);
+
+        let non_stream = responses_to_chat_completions(
+            &json!({ "input": "hi", "stream": false }),
+            "deepseek-v4-flash",
+        );
+        assert!(non_stream.get("stream_options").is_none());
     }
 
     #[test]
