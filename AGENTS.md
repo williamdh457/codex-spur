@@ -52,6 +52,34 @@ Do not delete, move, or reinterpret unknown user files without explicit approval
 - Generate stable opaque route slugs; do not expose account ids, emails, provider secrets, or credential fingerprints in model slugs.
 - Normal operation must not modify Codex's native `auth.json`. Native-account synchronization is a separate, explicit, backed-up action.
 
+### Primary runtime: Codex App (GUI), not CLI-only
+
+**The product is consumed primarily through the Codex APP / GUI** (`ChatGPT.app` embedded Codex UI, and/or Orca-hosted Codex). Agents and engineers must not assume a pure `codex` CLI workflow.
+
+Facts for this machine/product path:
+
+- Live provider: `model_provider = "codex_select"` with localhost proxy (typically `http://127.0.0.1:17861/v1`).
+- Catalog: `model_catalog_json` → Spur opaque `spur-route-*` slugs (or instance/model path slugs).
+- Session truth lives in Codex App rollouts: `~/.codex/sessions/**/rollout-*.jsonl` and `state_5.sqlite` threads — not only terminal logs.
+- When diagnosing user reports of “model switch broke”, read `turn_context.model`, `thread_settings_applied`, and `task_complete.error` from the rollout. UI labels like “ChatGPT 4.5.6” map to catalog models such as `gpt-5.6-sol`; “Kimi K3” maps to the Kimi K3 spur-route slug.
+
+### Cross-provider same-thread hazard (P0)
+
+**Do not treat mid-thread model switching across providers as safe.** Codex App reuses the full conversation `input[]` when the user switches models in the same thread. Different upstreams emit incompatible history:
+
+| Failure mode | Typical error | Cause |
+|---|---|---|
+| OpenAI after Kimi | `Invalid 'input[N].id': 'resp_…_msg'. Expected an ID that begins with 'msg'.` | Kimi/Spur assistant items use `resp_*_msg` IDs; OpenAI requires `msg*` |
+| Grok/other after prior model | `Could not decrypt the provided encrypted_content` | Reasoning/encrypted blocks are not portable across providers |
+| Mid-run “已处理” then silence | `stream disconnected before completion` / `401` to `:17861` | Local proxy or upstream stream end; App marks the turn processed even on failure |
+
+Product implications (must fix in proxy/product, not by catalog-only edits):
+
+1. On **cross-provider** resume, sanitize outbound history: rewrite/drop illegal message ids, strip foreign `encrypted_content`.
+2. Prefer UX that **starts a new thread** (or soft-resumes with a summary) when the provider family changes.
+3. Surface proxy/stream errors clearly; “已处理” must not look like success when `task_complete.error` is set.
+4. Sticky-model bugs (UI shows model A, HTTP still sends model B) are a related class; see prior notes under CC Switch sticky sessions.
+
 ## 4. Security and privacy rules
 
 - Secrets are local-only. No telemetry or remote service may receive imported credentials.
