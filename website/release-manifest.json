@@ -1,8 +1,8 @@
 {
-  "version": "v0.1.0",
+  "version": "v0.1.1",
   "platform": "macOS",
   "architecture": "Apple Silicon",
-  "releaseUrl": "https://github.com/williamdh457/codex-spur/releases/tag/v0.1.0",
-  "assetUrl": "https://github.com/williamdh457/codex-spur/releases/download/v0.1.0/Codex%20Spur_0.1.0_aarch64.dmg",
-  "sha256": "9a5cd2bca98baf067dd0e12cf55df38d58366e52d3e9ab5ce203f89458eedfac"
+  "releaseUrl": "https://github.com/williamdh457/codex-spur/releases/tag/v0.1.1",
+  "assetUrl": "https://github.com/williamdh457/codex-spur/releases/download/v0.1.1/Codex.Spur_0.1.1_aarch64.dmg",
+  "sha256": "c327123a0a903209006bca778da55a1391b2055416a8ed92fae533f33042acde"
 }
