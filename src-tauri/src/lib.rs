@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod codex_config;
+mod content_encoding;
 mod credentials;
 mod domain;
 mod openai_oauth;

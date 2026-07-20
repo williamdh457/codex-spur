@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     catalog::{RouteTarget, SharedCatalog, SharedRoutes},
+    content_encoding::{decode_request_body, get_content_encoding},
     credentials::SecretMaterial,
     domain::ProxyRequestEvent,
     providers,
@@ -180,7 +181,11 @@ fn response_usage(value: &Value) -> (i64, i64, i64) {
     )
 }
 
-async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn responses(
+    State(state): State<ProxyState>,
+    mut headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if !authorized(&headers, &state.secret) {
         return error_response(
             StatusCode::UNAUTHORIZED,
@@ -188,10 +193,31 @@ async fn responses(State(state): State<ProxyState>, headers: HeaderMap, body: By
             "Invalid local proxy token",
         );
     }
+    // ChatGPT Desktop (logged-in) often sends zstd-compressed JSON bodies.
+    // Parse only after Content-Encoding has been applied.
+    let body = match decode_request_body(&mut headers, body) {
+        Ok(body) => body,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_encoding", &message);
+        }
+    };
     let mut parsed = match parse_json_object_body(&body) {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_json", &message);
+            let hint = get_content_encoding(&headers)
+                .map(|encoding| format!(" content-encoding={encoding}"))
+                .unwrap_or_default();
+            let first = body
+                .iter()
+                .take(8)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                &format!("{message}{hint}; first_bytes=[{first}]"),
+            );
         }
     };
     let affinity = affinity_inputs(&headers, &parsed);
@@ -553,13 +579,32 @@ async fn adapt_chat_stream(
     model_id: &str,
 ) -> Response {
     let status = upstream.status();
-    let body = match upstream.text().await {
+    // reqwest is built without auto-decompress; honor Content-Encoding ourselves.
+    let encoding = get_content_encoding(upstream.headers());
+    let raw = match upstream.bytes().await {
         Ok(body) => body,
         Err(error) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "upstream_body_error",
                 &error.to_string(),
+            )
+        }
+    };
+    let body_bytes = match encoding.as_deref() {
+        Some(encoding) => match crate::content_encoding::decompress_body(encoding, &raw) {
+            Ok(Some(decoded)) => Bytes::from(decoded),
+            Ok(None) | Err(_) => raw,
+        },
+        None => raw,
+    };
+    let body = match String::from_utf8(body_bytes.to_vec()) {
+        Ok(text) => text,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_body_error",
+                &format!("Upstream body was not valid UTF-8: {error}"),
             )
         }
     };
@@ -1515,6 +1560,23 @@ mod tests {
         let as_string = serde_json::to_vec(&Value::String(encoded)).unwrap();
         let parsed = parse_json_object_body(&Bytes::from(as_string)).expect("decode");
         assert_eq!(parsed["model"], "x");
+    }
+
+    #[test]
+    fn decode_request_body_unlocks_zstd_json_for_proxy() {
+        let nested = json!({"model": "spur-route-test", "input": "hi"});
+        let plain = serde_json::to_vec(&nested).unwrap();
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&plain[..]), 0).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_ENCODING,
+            header::HeaderValue::from_static("zstd"),
+        );
+        let decoded =
+            decode_request_body(&mut headers, Bytes::from(compressed)).expect("decompress");
+        let parsed = parse_json_object_body(&decoded).expect("json");
+        assert_eq!(parsed["model"], "spur-route-test");
+        assert!(headers.get(header::CONTENT_ENCODING).is_none());
     }
 
     #[test]
