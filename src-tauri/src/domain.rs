@@ -23,6 +23,7 @@ pub struct CodexBindingStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSummary {
     pub id: String,
+    pub kind: String,
     pub name: String,
     pub region: String,
     pub protocol: String,
@@ -36,6 +37,10 @@ pub struct ProviderSummary {
     pub credential_count: u32,
     pub healthy_credential_count: u32,
     pub pool_count: u32,
+    pub active_pool_id: Option<String>,
+    /// `pool` or `fixed` — multi-account routing mode.
+    pub routing_mode: String,
+    pub fixed_credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +99,54 @@ pub struct AccountPoolSummary {
     pub enabled: bool,
     pub account_count: u32,
     pub healthy_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRouting {
+    pub provider_id: String,
+    pub routing_mode: String,
+    pub fixed_credential_id: Option<String>,
+    pub active_pool_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequestEvent {
+    pub id: String,
+    pub created_at: String,
+    pub route_slug: Option<String>,
+    pub display_name: Option<String>,
+    pub provider_id: Option<String>,
+    pub upstream_model: Option<String>,
+    pub protocol: Option<String>,
+    pub selection_layer: String,
+    pub sticky_escaped: bool,
+    pub account_fingerprint: Option<String>,
+    pub schedule_state: Option<String>,
+    pub result_category: String,
+    pub failover_attempt: u32,
+    pub latency_ms_total: Option<i64>,
+    pub first_token_ms: Option<i64>,
+    pub cooldown_applied: bool,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolMemberDetail {
+    pub pool_id: String,
+    pub credential_id: String,
+    pub weight: i64,
+    pub priority: i64,
+    pub enabled: bool,
+    pub concurrency_limit: i64,
+    pub label: Option<String>,
+    pub masked_email: Option<String>,
+    pub healthy: bool,
+    pub schedule_state: String,
+    pub cooldown_until: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +217,13 @@ pub struct CodexApplyOutcome {
     pub before_hash: Option<String>,
     pub after_hash: String,
     pub restart_required: bool,
+    pub model_count: u32,
+    pub selected_model: Option<String>,
+    /// Display names written into the catalog (for toast / diagnostics).
+    #[serde(default)]
+    pub model_labels: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +252,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    /// Full internal ladder used by proxy reasoning patches.
     pub const ALL: [Self; 8] = [
         Self::None,
         Self::Minimal,
@@ -217,61 +278,129 @@ impl ReasoningEffort {
     }
 }
 
+/// Codex model-catalog entries use snake_case (see Nice/CC Switch catalogs).
+/// Aliases accept legacy camelCase rows already stored in SQLite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct ReasoningEffortPreset {
     pub effort: ReasoningEffort,
     pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct CatalogModel {
     pub slug: String,
+    #[serde(alias = "displayName")]
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, alias = "defaultReasoningLevel", skip_serializing_if = "Option::is_none")]
     pub default_reasoning_level: Option<ReasoningEffort>,
+    #[serde(alias = "supportedReasoningLevels")]
     pub supported_reasoning_levels: Vec<ReasoningEffortPreset>,
+    #[serde(alias = "shellType")]
     pub shell_type: String,
     pub visibility: String,
+    #[serde(alias = "supportedInApi")]
     pub supported_in_api: bool,
     pub priority: i32,
+    #[serde(default, alias = "additionalSpeedTiers")]
     pub additional_speed_tiers: Vec<String>,
+    #[serde(default, alias = "serviceTiers")]
     pub service_tiers: Vec<serde_json::Value>,
+    #[serde(default, alias = "defaultServiceTier", skip_serializing_if = "Option::is_none")]
     pub default_service_tier: Option<String>,
+    #[serde(default, alias = "availabilityNux")]
     pub availability_nux: Option<serde_json::Value>,
+    #[serde(default)]
     pub upgrade: Option<serde_json::Value>,
+    #[serde(default, alias = "baseInstructions", skip_serializing_if = "String::is_empty")]
     pub base_instructions: String,
+    #[serde(default, alias = "modelMessages", skip_serializing_if = "Option::is_none")]
     pub model_messages: Option<serde_json::Value>,
+    // Bools must always serialize: Codex ModelInfo rejects missing required fields
+    // (e.g. `support_verbosity`) even when the value is false.
+    #[serde(default, alias = "includeSkillsUsageInstructions")]
     pub include_skills_usage_instructions: bool,
+    /// Working third-party catalogs expose this name.
+    #[serde(default, alias = "supportsReasoningSummaries")]
+    pub supports_reasoning_summaries: bool,
+    #[serde(default, alias = "supportsReasoningSummaryParameter")]
     pub supports_reasoning_summary_parameter: bool,
+    #[serde(default = "default_reasoning_summary_value", alias = "defaultReasoningSummary")]
     pub default_reasoning_summary: serde_json::Value,
+    #[serde(default, alias = "supportVerbosity")]
     pub support_verbosity: bool,
+    #[serde(default, alias = "defaultVerbosity", skip_serializing_if = "Option::is_none")]
     pub default_verbosity: Option<serde_json::Value>,
+    #[serde(default, alias = "applyPatchToolType", skip_serializing_if = "Option::is_none")]
     pub apply_patch_tool_type: Option<String>,
-    pub web_search_tool_type: String,
+    #[serde(
+        default,
+        alias = "webSearchToolType",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub web_search_tool_type: Option<String>,
+    #[serde(default, alias = "truncationPolicy")]
     pub truncation_policy: TruncationPolicy,
+    #[serde(default, alias = "supportsParallelToolCalls")]
     pub supports_parallel_tool_calls: bool,
+    #[serde(default, alias = "supportsImageDetailOriginal")]
     pub supports_image_detail_original: bool,
+    #[serde(default, alias = "contextWindow", skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
+    #[serde(default, alias = "maxContextWindow", skip_serializing_if = "Option::is_none")]
     pub max_context_window: Option<i64>,
+    #[serde(default, alias = "autoCompactTokenLimit", skip_serializing_if = "Option::is_none")]
     pub auto_compact_token_limit: Option<i64>,
+    #[serde(default, alias = "compHash", skip_serializing_if = "Option::is_none")]
     pub comp_hash: Option<String>,
+    #[serde(default = "default_effective_context_window_percent", alias = "effectiveContextWindowPercent")]
     pub effective_context_window_percent: i64,
+    // Codex requires this field present (even as []) — do not skip when empty.
+    #[serde(default, alias = "experimentalSupportedTools")]
     pub experimental_supported_tools: Vec<String>,
+    #[serde(default = "default_input_modalities", alias = "inputModalities")]
     pub input_modalities: Vec<String>,
+    #[serde(default, alias = "supportsSearchTool")]
     pub supports_search_tool: bool,
+    #[serde(default, alias = "useResponsesLite")]
     pub use_responses_lite: bool,
+    #[serde(default, alias = "autoReviewModelOverride", skip_serializing_if = "Option::is_none")]
     pub auto_review_model_override: Option<String>,
+    #[serde(default, alias = "toolMode", skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<String>,
+    #[serde(default, alias = "multiAgentVersion", skip_serializing_if = "Option::is_none")]
     pub multi_agent_version: Option<String>,
 }
 
+fn default_reasoning_summary_value() -> serde_json::Value {
+    serde_json::Value::String("auto".into())
+}
+
+fn default_effective_context_window_percent() -> i64 {
+    95
+}
+
+fn default_input_modalities() -> Vec<String> {
+    vec!["text".into()]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", default)]
 pub struct TruncationPolicy {
     pub mode: String,
     pub limit: i64,
+}
+
+impl Default for TruncationPolicy {
+    fn default() -> Self {
+        Self {
+            mode: "tokens".into(),
+            limit: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

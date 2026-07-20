@@ -170,17 +170,48 @@ fn collect_objects(value: &Value) -> Vec<&Value> {
     }
 }
 
+/// Resolve the object that holds token / secret fields.
+/// - Codex Tools: nested native auth under `authJson` / `auth_json`
+/// - Sub2API exports: OAuth secrets under `credentials`
+fn auth_surface(object: &serde_json::Map<String, Value>) -> &serde_json::Map<String, Value> {
+    object
+        .get("authJson")
+        .or_else(|| object.get("auth_json"))
+        .or_else(|| object.get("credentials"))
+        .and_then(Value::as_object)
+        .unwrap_or(object)
+}
+
+fn nested_tokens_map<'a>(
+    auth: &'a serde_json::Map<String, Value>,
+    object: &'a serde_json::Map<String, Value>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    auth.get("tokens")
+        .and_then(Value::as_object)
+        .or_else(|| object.get("tokens").and_then(Value::as_object))
+}
+
+fn field_string(
+    auth: &serde_json::Map<String, Value>,
+    object: &serde_json::Map<String, Value>,
+    nested_tokens: Option<&serde_json::Map<String, Value>>,
+    name: &str,
+) -> Option<String> {
+    auth.get(name)
+        .or_else(|| object.get(name))
+        .or_else(|| nested_tokens.and_then(|tokens| tokens.get(name)))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportError>> {
     let object = value.as_object()?;
-    let nested_tokens = object.get("tokens").and_then(Value::as_object);
-    let token = |name: &str| {
-        object
-            .get(name)
-            .or_else(|| nested_tokens.and_then(|tokens| tokens.get(name)))
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
-    };
+    // Unwrap nested auth containers once (Codex Tools accounts export), then
+    // reuse the same field extraction path as native auth.json / flat tokens.
+    let auth = auth_surface(object);
+    let nested_tokens = nested_tokens_map(auth, object);
+    let token = |name: &str| field_string(auth, object, nested_tokens, name);
     let access_token = token("access_token").or_else(|| token("accessToken"));
     let refresh_token = token("refresh_token").or_else(|| token("refreshToken"));
     let id_token = token("id_token").or_else(|| token("idToken"));
@@ -194,15 +225,20 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
 
     let provider_id = object
         .get("provider")
+        .or_else(|| object.get("platform"))
+        .or_else(|| auth.get("provider"))
+        .or_else(|| auth.get("platform"))
         .and_then(Value::as_str)
         .unwrap_or("openai")
         .to_lowercase();
     let email = object
         .get("email")
         .and_then(Value::as_str)
+        .or_else(|| auth.get("email").and_then(Value::as_str))
         .or_else(|| {
             object
                 .get("user")
+                .or_else(|| auth.get("user"))
                 .and_then(|user| user.get("email"))
                 .and_then(Value::as_str)
         })
@@ -217,9 +253,14 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
         .get("account_id")
         .and_then(Value::as_str)
         .or_else(|| object.get("accountId").and_then(Value::as_str))
+        .or_else(|| object.get("chatgpt_account_id").and_then(Value::as_str))
+        .or_else(|| auth.get("account_id").and_then(Value::as_str))
+        .or_else(|| auth.get("accountId").and_then(Value::as_str))
+        .or_else(|| auth.get("chatgpt_account_id").and_then(Value::as_str))
         .or_else(|| {
             object
                 .get("account")
+                .or_else(|| auth.get("account"))
                 .and_then(|account| account.get("id"))
                 .and_then(Value::as_str)
         })
@@ -244,7 +285,9 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
         .get("expires_at")
         .and_then(Value::as_i64)
         .or_else(|| object.get("expiresAt").and_then(Value::as_i64))
-        .or_else(|| object.get("expires").and_then(Value::as_i64));
+        .or_else(|| object.get("expires").and_then(Value::as_i64))
+        .or_else(|| auth.get("expires_at").and_then(Value::as_i64))
+        .or_else(|| auth.get("expiresAt").and_then(Value::as_i64));
     let kind = if api_key.is_some() {
         CredentialKind::ApiKey
     } else if session_token.is_some() && refresh_token.is_none() {
@@ -273,7 +316,11 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
         provider_id,
         label: object
             .get("label")
+            .or_else(|| object.get("name"))
+            .or_else(|| auth.get("label"))
+            .or_else(|| auth.get("name"))
             .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
             .map(ToOwned::to_owned),
         email,
         account_id,
@@ -335,5 +382,163 @@ mod tests {
         assert_eq!(items[0].provider_id, "openai");
         assert_eq!(items[0].account_id.as_deref(), Some("acct"));
         assert_eq!(items[0].secret.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(items[0].state, CredentialState::Refreshable);
+        assert!(items[0].refreshable);
+        assert!(items[0].secret.has_refresh_token());
+    }
+
+    #[test]
+    fn parses_codex_tools_accounts_with_nested_auth_json() {
+        // Codex Tools accounts export nests real Codex auth under authJson.tokens.
+        // This was the failure mode behind: "account object does not contain a usable credential".
+        let input = r#"{
+            "accounts": [
+                {
+                    "email": "user@example.com",
+                    "label": "primary",
+                    "authJson": {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": "access",
+                            "refresh_token": "refresh",
+                            "account_id": "acct-nested"
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let parsed = parse_json_import(input).expect("nested authJson imports");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, CredentialKind::OAuth);
+        assert_eq!(parsed[0].state, CredentialState::Refreshable);
+        assert_eq!(parsed[0].email.as_deref(), Some("user@example.com"));
+        assert_eq!(parsed[0].label.as_deref(), Some("primary"));
+        assert_eq!(parsed[0].account_id.as_deref(), Some("acct-nested"));
+        assert_eq!(parsed[0].secret.access_token.as_deref(), Some("access"));
+        assert_eq!(parsed[0].secret.refresh_token.as_deref(), Some("refresh"));
+        assert!(parsed[0].refreshable);
+        assert!(parsed[0].secret.has_refresh_token());
+        // Must not surface the missing-credential error for this shape.
+        let err = ImportError::MissingCredential.to_string();
+        assert!(err.contains("usable credential"));
+    }
+
+    #[test]
+    fn parses_auth_json_snake_case_wrapper() {
+        let input = r#"{
+            "accounts": [{
+                "auth_json": {
+                    "tokens": {
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "account_id": "acct-snake"
+                    }
+                }
+            }]
+        }"#;
+        let parsed = parse_json_import(input).expect("auth_json wrapper imports");
+        assert_eq!(parsed[0].account_id.as_deref(), Some("acct-snake"));
+        assert_eq!(parsed[0].state, CredentialState::Refreshable);
+    }
+
+    #[test]
+    fn parses_flat_api_key_object() {
+        let parsed =
+            parse_json_import(r#"{"api_key":"sk-live-test","provider":"openai"}"#).expect("api key");
+        assert_eq!(parsed[0].kind, CredentialKind::ApiKey);
+        assert_eq!(parsed[0].secret.api_key.as_deref(), Some("sk-live-test"));
+    }
+
+    #[test]
+    fn rejects_metadata_only_account_without_secrets() {
+        let err = parse_json_import(r#"{"accounts":[{"email":"a@example.com","label":"empty"}]}"#)
+            .expect_err("metadata-only must fail");
+        assert!(matches!(err, ImportError::MissingCredential));
+        assert_eq!(
+            err.to_string(),
+            "account object does not contain a usable credential"
+        );
+    }
+
+    #[test]
+    fn parses_sub2api_nested_credentials_export() {
+        // Sub2API plus-usable-style export: secrets live under accounts[].credentials,
+        // not top-level and not under authJson/tokens.
+        let input = r#"{
+            "type": "sub2api-data",
+            "version": 1,
+            "accounts": [
+                {
+                    "name": "acct-one",
+                    "platform": "openai",
+                    "type": "oauth",
+                    "credentials": {
+                        "email": "a@example.com",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "id_token": "idtok",
+                        "account_id": "acct-1",
+                        "chatgpt_account_id": "acct-1",
+                        "expires_at": 1785124169
+                    },
+                    "extra": {"source": "go-pool"}
+                },
+                {
+                    "name": "acct-two",
+                    "platform": "openai",
+                    "type": "oauth",
+                    "credentials": {
+                        "email": "b@example.com",
+                        "access_token": "access-2",
+                        "refresh_token": "refresh-2",
+                        "chatgpt_account_id": "acct-2"
+                    }
+                }
+            ]
+        }"#;
+        let parsed = parse_json_import(input).expect("sub2api nested credentials import");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].kind, CredentialKind::OAuth);
+        assert_eq!(parsed[0].state, CredentialState::Refreshable);
+        assert_eq!(parsed[0].provider_id, "openai");
+        assert_eq!(parsed[0].label.as_deref(), Some("acct-one"));
+        assert_eq!(parsed[0].email.as_deref(), Some("a@example.com"));
+        assert_eq!(parsed[0].account_id.as_deref(), Some("acct-1"));
+        assert_eq!(parsed[0].expires_at, Some(1785124169));
+        assert_eq!(parsed[0].secret.access_token.as_deref(), Some("access"));
+        assert_eq!(parsed[0].secret.refresh_token.as_deref(), Some("refresh"));
+        assert_eq!(parsed[0].secret.id_token.as_deref(), Some("idtok"));
+        assert!(parsed[0].refreshable);
+        assert!(parsed[0].secret.has_refresh_token());
+        assert_eq!(parsed[1].account_id.as_deref(), Some("acct-2"));
+        assert_eq!(parsed[1].email.as_deref(), Some("b@example.com"));
+        assert_eq!(parsed[1].secret.access_token.as_deref(), Some("access-2"));
+        assert!(format!("{:?}", parsed[0].secret).contains("REDACTED"));
+        assert!(!format!("{:?}", parsed[0].secret).contains("access"));
+    }
+
+    #[test]
+    fn parses_sub2api_credentials_without_top_level_identity() {
+        // Identity only under credentials; name/platform only on the account shell.
+        let input = r#"{
+            "type":"sub2api-data",
+            "accounts":[{
+                "name":"n",
+                "platform":"openai",
+                "type":"oauth",
+                "credentials":{
+                    "email":"a@example.com",
+                    "access_token":"access",
+                    "refresh_token":"refresh",
+                    "account_id":"acct-1"
+                }
+            }]
+        }"#;
+        let parsed = parse_json_import(input).expect("imports");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].state, CredentialState::Refreshable);
+        assert_eq!(parsed[0].email.as_deref(), Some("a@example.com"));
+        assert_eq!(parsed[0].account_id.as_deref(), Some("acct-1"));
+        assert_eq!(parsed[0].label.as_deref(), Some("n"));
     }
 }

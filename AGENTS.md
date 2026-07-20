@@ -55,7 +55,7 @@ Do not delete, move, or reinterpret unknown user files without explicit approval
 ## 4. Security and privacy rules
 
 - Secrets are local-only. No telemetry or remote service may receive imported credentials.
-- Store the random master key in macOS Keychain. Store credential payloads in SQLite as AES-256-GCM ciphertext with unique nonces, authenticated metadata, and a credential version.
+- Store the random master key only in a local `0600` file under the app data dir (`master_key.hex`). Do **not** use macOS Keychain for the master key: unsigned/dev rebuilds get a new code identity and Keychain re-prompts the login password on every launch. Store credential payloads in SQLite as AES-256-GCM ciphertext with unique nonces, authenticated metadata, and a credential version.
 - Use keyed irreversible fingerprints for deduplication; do not persist raw token hashes that can be correlated across installations.
 - Zeroize decrypted secret buffers where practical and keep their lifetime narrow.
 - Never place secrets in:
@@ -70,9 +70,16 @@ Do not delete, move, or reinterpret unknown user files without explicit approval
 - Reset-credit consumption is an important, irreversible action: require an explicit confirmation, use an idempotency key, and never retry with a new key after an ambiguous timeout.
 - The product must not bypass account restrictions, CAPTCHAs, phone verification, plan entitlements, or provider abuse controls.
 
-## 5. Account and scheduling invariants
+## 5. Provider instances and scheduling invariants
 
-OpenAI routing has exactly two user-visible modes:
+The primary user-facing object is a **provider instance** (CC Switch–style), not an account-pool product.
+
+- Users may add unlimited instances of the same kind (several OpenAI, several Kimi, several DeepSeek, …).
+- Adding is the primary action: choose kind + entry method → save and fetch models → a new row appears on the Overview provider list.
+- Entry methods for OpenAI include: API/official form, import provider config JSON, and import multi-account credentials JSON.
+- “Account pool” is an internal runtime construct (default pool per instance) for multi-credential scheduling. It must not be a co-equal primary UI surface next to API/JSON configuration.
+
+Within a multi-account OpenAI instance, routing has exactly two modes:
 
 ```text
 Pool { pool_id }

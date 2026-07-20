@@ -136,7 +136,7 @@ Primary destinations:
 4. Diagnostics
 5. Settings
 
-Provider and account-pool configuration is intentionally consolidated into the Overview provider sheet. Do not duplicate Providers or Accounts as primary sidebar destinations.
+Provider configuration is intentionally consolidated into the Overview: a multi-instance provider list, an Add Provider wizard, and a single-instance edit sheet. Do not promote account-pool management as a primary sidebar destination or as a peer top-level config tab.
 
 Navigation rows are 32px high with 8px horizontal padding. Use specific labels; avoid vague categories such as “Manage.”
 
@@ -294,25 +294,42 @@ Below it:
 
 ### Providers
 
-Provider list uses rows with:
+The Overview provider list shows **user-created instances only**. Fresh installs start empty. Multiple rows of the same kind are normal (e.g. three OpenAI entries).
+
+List rows show:
 
 - vendor icon or monogram;
-- name and region;
-- protocol badge;
-- credential status;
-- last model fetch;
-- selected/available model count;
-- overflow menu.
+- instance name (e.g. OpenAI, OpenAI 2);
+- kind · region · protocol;
+- configured badge;
+- selected/discovered model count and healthy/total accounts;
+- chevron into edit sheet.
 
-Preset cards are allowed only in the Add Provider sheet. They must not remain as oversized cards in the main list.
+Primary list action: **添加供应商**. Row click edits that instance.
 
-Provider editor sections:
+#### Add Provider wizard
 
-1. Region and base URL
-2. Authentication
-3. Protocol and models endpoint
-4. Connection test
-5. Advanced headers and capability defaults
+Preset/method cards live only in the add wizard (CC Switch style), never as permanent empty rows on the main list.
+
+OpenAI methods:
+
+1. OpenAI — official subscription or API Key + Base URL → 保存并拉取模型
+2. OpenAI · 导入 JSON — provider config JSON (`base_url`, optional `api_key`, optional `models`)
+3. OpenAI · 导入账号池 — multi-account credentials JSON into this instance, then fetch models
+
+Other kinds: API Key form and optional 导入供应商配置 JSON.
+
+Successful save immediately materializes a new Overview row.
+
+#### Edit instance sheet
+
+1. Name and kind summary
+2. Connection (Base URL / channel)
+3. Re-fetch models
+4. Credentials summary + import more accounts when multi-account
+5. Delete instance (confirm)
+
+Do not show a primary “账号池” tab. Multi-pool membership UI is advanced/hidden; default is one instance → one default pool → all of that instance’s accounts.
 
 API keys are write-only. After save, show only “Key stored” and a replacement action.
 
@@ -372,15 +389,15 @@ The inspector includes:
 - Save override
 - A plain-language explanation of why multiple Codex levels may map to one upstream level
 
-### Accounts
+### Accounts (within a multi-account provider instance)
 
-Top segmented control:
+Accounts are managed under a provider instance, not as a global pool product. When an OpenAI instance holds multiple credentials, optional routing mode:
 
 ```text
 Pool | Fixed
 ```
 
-Pool mode shows a dense account table. Fixed mode shows the same account row design with a selected radio state; do not create an unrelated second visual system.
+Pool mode shows a dense account table for that instance. Fixed mode shows the same account row design with a selected radio state; do not create an unrelated second visual system.
 
 Account row content:
 

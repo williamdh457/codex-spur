@@ -6,6 +6,7 @@ authors = ["Codex Spur"]
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
+default-run = "codex-spur"
 
 [lib]
 name = "codex_select_lib"
@@ -14,6 +15,11 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "codex-spur"
 path = "src/main.rs"
+
+[[bin]]
+name = "codex-spur-publish"
+path = "src/bin/codex_spur_publish.rs"
+required-features = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -25,7 +31,6 @@ axum = "0.8"
 directories = "6"
 hex = "0.4"
 getrandom = "0.4"
-keyring = "4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

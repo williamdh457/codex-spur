@@ -12,9 +12,13 @@ use crate::{
     credentials::CanonicalCredential,
     domain::{
         AccountPoolSummary, CredentialSummary, ModelRouteSummary, OpenAiQuotaSnapshot,
-        ProviderSummary,
+        PoolMemberDetail, ProviderRouting, ProviderSummary, ProxyRequestEvent,
     },
     providers::RouteCatalogPayload,
+    scheduler::{
+        select_account, BindingKind, CandidateAccount, PoolSchedulerConfig, RoutingMode,
+        ScheduleState, SelectOutcome, SelectRequest, SelectionLayer,
+    },
     vault::EncryptedSecret,
 };
 
@@ -22,6 +26,7 @@ use crate::{
 pub struct StoredRoute {
     pub id: String,
     pub provider_id: String,
+    pub kind: String,
     pub upstream_model: String,
     pub display_name: String,
     pub enabled: bool,
@@ -40,7 +45,10 @@ pub struct StoredCredential {
 
 #[derive(Debug, Clone)]
 pub struct Lease {
+    pub id: String,
     pub credential_id: String,
+    pub layer: SelectionLayer,
+    pub sticky_escaped: bool,
 }
 
 pub struct UsageDelta {
@@ -78,69 +86,201 @@ impl Storage {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let storage = Self { pool, path };
-        storage.ensure_provider_presets().await?;
+        storage.normalize_provider_kinds().await?;
+        storage.cleanup_empty_seed_providers().await?;
         Ok(storage)
     }
 
-    async fn ensure_provider_presets(&self) -> Result<(), sqlx::Error> {
-        for (id, name, region, protocol) in [
-            ("kimi", "Kimi", "中国 / Global", "Chat Completions"),
-            ("deepseek", "DeepSeek", "Global", "Chat Completions"),
-            ("minimax", "MiniMax", "中国 / Global", "Responses preferred"),
-            ("openai", "OpenAI", "Official", "Responses"),
-            ("custom", "自定义供应商", "Custom", "OpenAI-compatible"),
-        ] {
-            sqlx::query(
-                "INSERT INTO providers (id, name, region, protocol) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, region = excluded.region, protocol = excluded.protocol",
-            )
-            .bind(id)
-            .bind(name)
-            .bind(region)
-            .bind(protocol)
+    /// Backfill kind for legacy rows; kinds are templates in code, not seeded list rows.
+    async fn normalize_provider_kinds(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE providers SET kind = id WHERE kind = '' OR kind IS NULL")
             .execute(&self.pool)
             .await?;
-        }
         Ok(())
+    }
+
+    /// Remove legacy empty seed rows (id == kind, never configured, no credentials/routes).
+    async fn cleanup_empty_seed_providers(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM providers
+             WHERE id = kind
+               AND configured = 0
+               AND id IN ('openai', 'kimi', 'deepseek', 'minimax', 'custom')
+               AND NOT EXISTS (SELECT 1 FROM credentials c WHERE c.provider_id = providers.id)
+               AND NOT EXISTS (SELECT 1 FROM model_routes m WHERE m.provider_id = providers.id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn map_provider_row(row: &sqlx::sqlite::SqliteRow) -> ProviderSummary {
+        let kind: String = row.get("kind");
+        let kind = if kind.is_empty() {
+            row.get::<String, _>("id")
+        } else {
+            kind
+        };
+        ProviderSummary {
+            id: row.get("id"),
+            kind: kind.clone(),
+            name: row.get("name"),
+            region: row.get("region"),
+            protocol: row.get("protocol"),
+            configured: row.get::<i64, _>("configured") != 0,
+            selected_models: row.get::<i64, _>("selected_models") as u32,
+            discovered_models: row.get::<i64, _>("discovered_models") as u32,
+            last_fetched_at: row.get("last_fetched_at"),
+            base_url: row.get("base_url"),
+            default_base_url: crate::providers::default_base_url_for_kind(&kind),
+            supports_official_account: kind == "openai",
+            credential_count: row.get::<i64, _>("credential_count") as u32,
+            healthy_credential_count: row.get::<i64, _>("healthy_credential_count") as u32,
+            pool_count: row.get::<i64, _>("pool_count") as u32,
+            active_pool_id: row.get("active_pool_id"),
+            routing_mode: row
+                .try_get::<String, _>("routing_mode")
+                .unwrap_or_else(|_| "pool".into()),
+            fixed_credential_id: row
+                .try_get::<Option<String>, _>("fixed_credential_id")
+                .unwrap_or(None),
+        }
     }
 
     pub async fn list_providers(&self) -> Result<Vec<ProviderSummary>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url,
+            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id) AS credential_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
                 (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count
              FROM providers
-             ORDER BY CASE id WHEN 'openai' THEN 0 WHEN 'kimi' THEN 1 WHEN 'deepseek' THEN 2 WHEN 'minimax' THEN 3 ELSE 4 END, name",
+             ORDER BY CASE kind WHEN 'openai' THEN 0 WHEN 'kimi' THEN 1 WHEN 'deepseek' THEN 2 WHEN 'minimax' THEN 3 ELSE 4 END, name, id",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| ProviderSummary {
-                id: row.get("id"),
-                name: row.get("name"),
-                region: row.get("region"),
-                protocol: row.get("protocol"),
-                configured: row.get::<i64, _>("configured") != 0,
-                selected_models: row.get::<i64, _>("selected_models") as u32,
-                discovered_models: row.get::<i64, _>("discovered_models") as u32,
-                last_fetched_at: row.get("last_fetched_at"),
-                base_url: row.get("base_url"),
-                default_base_url: match row.get::<String, _>("id").as_str() {
-                    "openai" => Some("https://chatgpt.com/backend-api/codex".into()),
-                    "kimi" => Some("https://api.kimi.com/coding/v1".into()),
-                    "deepseek" => Some("https://api.deepseek.com/v1".into()),
-                    "minimax" => Some("https://api.minimaxi.com/v1".into()),
-                    _ => None,
-                },
-                supports_official_account: row.get::<String, _>("id") == "openai",
-                credential_count: row.get::<i64, _>("credential_count") as u32,
-                healthy_credential_count: row.get::<i64, _>("healthy_credential_count") as u32,
-                pool_count: row.get::<i64, _>("pool_count") as u32,
-            })
-            .collect())
+        Ok(rows.iter().map(Self::map_provider_row).collect())
     }
 
+    pub async fn get_provider(&self, provider_id: &str) -> Result<Option<ProviderSummary>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id,
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id) AS credential_count,
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
+                (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count
+             FROM providers WHERE id = ?",
+        )
+        .bind(provider_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(Self::map_provider_row))
+    }
+
+    pub async fn create_provider_instance(
+        &self,
+        kind: &str,
+        name: Option<&str>,
+    ) -> Result<String, sqlx::Error> {
+        let (default_name, region, protocol, _) = crate::providers::kind_meta(kind).ok_or_else(|| {
+            sqlx::Error::Configuration(format!("unknown provider kind: {kind}").into())
+        })?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let display = if let Some(custom) = name.map(str::trim).filter(|value| !value.is_empty()) {
+            custom.to_owned()
+        } else {
+            let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE kind = ?")
+                .bind(kind)
+                .fetch_one(&self.pool)
+                .await?;
+            if existing <= 0 {
+                default_name.to_string()
+            } else {
+                format!("{} {}", default_name, existing + 1)
+            }
+        };
+        sqlx::query(
+            "INSERT INTO providers (id, kind, name, region, protocol, configured) VALUES (?, ?, ?, ?, ?, 0)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&display)
+        .bind(region)
+        .bind(protocol)
+        .execute(&self.pool)
+        .await?;
+        let pool_id = self.ensure_default_pool(&id).await?;
+        sqlx::query("UPDATE providers SET active_pool_id = ? WHERE id = ?")
+            .bind(&pool_id)
+            .bind(&id)
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn delete_provider_instance(&self, provider_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM providers WHERE id = ?")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn rename_provider_instance(
+        &self,
+        provider_id: &str,
+        name: &str,
+    ) -> Result<(), sqlx::Error> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("UPDATE providers SET name = ? WHERE id = ?")
+            .bind(trimmed)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_active_pool(
+        &self,
+        provider_id: &str,
+        pool_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE providers SET active_pool_id = ? WHERE id = ? AND EXISTS (SELECT 1 FROM account_pools WHERE id = ? AND provider_id = ?)",
+        )
+        .bind(pool_id)
+        .bind(provider_id)
+        .bind(pool_id)
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn active_pool_id(&self, provider_id: &str) -> Result<Option<String>, sqlx::Error> {
+        if let Some(active) = sqlx::query("SELECT active_pool_id FROM providers WHERE id = ?")
+            .bind(provider_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .and_then(|row| row.get::<Option<String>, _>("active_pool_id"))
+        {
+            let exists = sqlx::query(
+                "SELECT 1 AS ok FROM account_pools WHERE id = ? AND provider_id = ? AND enabled = 1",
+            )
+            .bind(&active)
+            .bind(provider_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            if exists {
+                return Ok(Some(active));
+            }
+        }
+        self.default_pool_id(provider_id).await
+    }
+
+    #[allow(dead_code)]
     pub async fn provider_base_url(
         &self,
         provider_id: &str,
@@ -154,9 +294,9 @@ impl Storage {
 
     pub async fn list_routes(&self, enabled_only: bool) -> Result<Vec<StoredRoute>, sqlx::Error> {
         let query = if enabled_only {
-            "SELECT mr.id, mr.provider_id, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
         } else {
-            "SELECT mr.id, mr.provider_id, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
         };
         let rows = sqlx::query(query).fetch_all(&self.pool).await?;
         Ok(rows
@@ -164,6 +304,7 @@ impl Storage {
             .map(|row| StoredRoute {
                 id: row.get("id"),
                 provider_id: row.get("provider_id"),
+                kind: row.get("kind"),
                 upstream_model: row.get("upstream_model"),
                 display_name: row.get("display_name"),
                 enabled: row.get::<i64, _>("enabled") != 0,
@@ -222,6 +363,46 @@ impl Storage {
         self.list_routes(false).await
     }
 
+    /// Persist a healed snake_case `catalog_json` for one route (startup scrub / re-fetch).
+    pub async fn update_route_catalog_json(
+        &self,
+        route_id: &str,
+        catalog_json: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE model_routes SET catalog_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(catalog_json)
+        .bind(route_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Rewrite every stored route's catalog_json into the Codex-safe snake_case shape.
+    /// Returns how many rows were updated. Failures on individual rows are skipped with a warn.
+    pub async fn heal_all_route_catalogs(&self) -> Result<u32, sqlx::Error> {
+        let routes = self.list_routes(false).await?;
+        let mut updated = 0u32;
+        for route in routes {
+            match crate::catalog::heal_stored_catalog_json(&route) {
+                Ok(healed) if healed != route.catalog_json => {
+                    self.update_route_catalog_json(&route.id, &healed).await?;
+                    updated += 1;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        route_id = %route.id,
+                        error = %error,
+                        "跳过无法 heal 的 model_routes.catalog_json"
+                    );
+                }
+            }
+        }
+        Ok(updated)
+    }
+
     pub async fn set_route_enabled(
         &self,
         route_id: &str,
@@ -238,6 +419,29 @@ impl Storage {
             .bind(route_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    pub async fn record_apply_revision(
+        &self,
+        id: &str,
+        catalog_path: &str,
+        config_path: &str,
+        config_hash_before: Option<&str>,
+        config_hash_after: &str,
+        state: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO apply_revisions (id, catalog_path, config_path, config_hash_before, config_hash_after, state) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(catalog_path)
+        .bind(config_path)
+        .bind(config_hash_before)
+        .bind(config_hash_after)
+        .bind(state)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -348,13 +552,841 @@ impl Storage {
 
     pub async fn ensure_default_pool(&self, provider_id: &str) -> Result<String, sqlx::Error> {
         let id = format!("default-{provider_id}");
-        sqlx::query("INSERT INTO account_pools (id, name, provider_id, strategy, sticky_ttl_secs) VALUES (?, ?, ?, 'least_active', 3600) ON CONFLICT(id) DO NOTHING")
-            .bind(&id)
-            .bind(format!("{} 默认账号池", provider_id))
+        let defaults = PoolSchedulerConfig::default().to_json();
+        sqlx::query(
+            "INSERT INTO account_pools (id, name, provider_id, strategy, sticky_ttl_secs, scheduler_config_json)
+             VALUES (?, ?, ?, 'load_aware_top_k', 3600, ?)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(format!("{} 默认账号池", provider_id))
+        .bind(provider_id)
+        .bind(&defaults)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn get_provider_routing(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<ProviderRouting>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, routing_mode, fixed_credential_id, active_pool_id FROM providers WHERE id = ?",
+        )
+        .bind(provider_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| ProviderRouting {
+            provider_id: row.get("id"),
+            routing_mode: row
+                .try_get::<String, _>("routing_mode")
+                .unwrap_or_else(|_| "pool".into()),
+            fixed_credential_id: row
+                .try_get::<Option<String>, _>("fixed_credential_id")
+                .unwrap_or(None),
+            active_pool_id: row.get("active_pool_id"),
+        }))
+    }
+
+    pub async fn set_provider_routing(
+        &self,
+        provider_id: &str,
+        routing_mode: &str,
+        fixed_credential_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let mode = RoutingMode::parse(routing_mode);
+        let fixed = if mode == RoutingMode::Fixed {
+            fixed_credential_id.map(str::to_string)
+        } else {
+            None
+        };
+        if mode == RoutingMode::Fixed {
+            let Some(cred) = fixed.as_deref() else {
+                return Err(sqlx::Error::Protocol(
+                    "fixed routing requires fixed_credential_id".into(),
+                ));
+            };
+            let ok = sqlx::query(
+                "SELECT 1 AS ok FROM credentials WHERE id = ? AND provider_id = ?",
+            )
+            .bind(cred)
             .bind(provider_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            if !ok {
+                return Err(sqlx::Error::Protocol(
+                    "fixed credential does not belong to provider".into(),
+                ));
+            }
+        }
+        sqlx::query(
+            "UPDATE providers SET routing_mode = ?, fixed_credential_id = ? WHERE id = ?",
+        )
+        .bind(mode.as_str())
+        .bind(fixed.as_deref())
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_pool_scheduler_config(
+        &self,
+        pool_id: &str,
+    ) -> Result<PoolSchedulerConfig, sqlx::Error> {
+        let row = sqlx::query("SELECT scheduler_config_json, sticky_ttl_secs FROM account_pools WHERE id = ?")
+            .bind(pool_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(PoolSchedulerConfig::default());
+        };
+        let json: String = row
+            .try_get("scheduler_config_json")
+            .unwrap_or_else(|_| "{}".into());
+        let mut config = PoolSchedulerConfig::from_json(&json);
+        // Honor legacy sticky_ttl_secs when config still has defaults and json empty-ish.
+        if json.trim() == "{}" {
+            if let Ok(ttl) = row.try_get::<i64, _>("sticky_ttl_secs") {
+                if ttl > 0 {
+                    config.sticky_session_ttl_secs = ttl;
+                    config.sticky_response_id_ttl_secs = ttl;
+                }
+            }
+        }
+        config.sanitize();
+        Ok(config)
+    }
+
+    pub async fn update_pool_scheduler_config(
+        &self,
+        pool_id: &str,
+        config: &PoolSchedulerConfig,
+    ) -> Result<(), sqlx::Error> {
+        let mut config = config.clone();
+        config.sanitize();
+        let json = config.to_json();
+        sqlx::query(
+            "UPDATE account_pools SET scheduler_config_json = ?, sticky_ttl_secs = ?, strategy = 'load_aware_top_k', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(&json)
+        .bind(config.sticky_session_ttl_secs)
+        .bind(pool_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_pool_members_detailed(
+        &self,
+        pool_id: &str,
+    ) -> Result<Vec<PoolMemberDetail>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT pm.pool_id, pm.credential_id, pm.weight, pm.priority, pm.enabled, pm.concurrency_limit,
+                    c.label, c.email, c.healthy, c.schedule_state, c.cooldown_until, c.last_error
+             FROM pool_members pm
+             JOIN credentials c ON c.id = pm.credential_id
+             WHERE pm.pool_id = ?
+             ORDER BY pm.priority DESC, pm.created_at",
+        )
+        .bind(pool_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PoolMemberDetail {
+                pool_id: row.get("pool_id"),
+                credential_id: row.get("credential_id"),
+                weight: row.get("weight"),
+                priority: row.get("priority"),
+                enabled: row.get::<i64, _>("enabled") != 0,
+                concurrency_limit: row
+                    .try_get::<i64, _>("concurrency_limit")
+                    .unwrap_or(1)
+                    .max(1),
+                label: row.get("label"),
+                masked_email: row
+                    .get::<Option<String>, _>("email")
+                    .as_deref()
+                    .map(mask_identity),
+                healthy: row.get::<i64, _>("healthy") != 0,
+                schedule_state: row
+                    .try_get::<String, _>("schedule_state")
+                    .unwrap_or_else(|_| "ready".into()),
+                cooldown_until: row.try_get("cooldown_until").unwrap_or(None),
+                last_error: row.get("last_error"),
+            })
+            .collect())
+    }
+
+    pub async fn update_pool_member(
+        &self,
+        pool_id: &str,
+        credential_id: &str,
+        weight: i64,
+        priority: i64,
+        enabled: bool,
+        concurrency_limit: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE pool_members SET weight = ?, priority = ?, enabled = ?, concurrency_limit = ?
+             WHERE pool_id = ? AND credential_id = ?",
+        )
+        .bind(weight.max(1))
+        .bind(priority)
+        .bind(enabled as i64)
+        .bind(concurrency_limit.max(1))
+        .bind(pool_id)
+        .bind(credential_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn hash_binding_key(raw: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex-select-sticky-v1\0");
+        hasher.update(raw.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    pub async fn get_sticky_binding(
+        &self,
+        pool_id: &str,
+        kind: BindingKind,
+        raw_key: &str,
+        now_unix: i64,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let key_hash = Self::hash_binding_key(raw_key);
+        let row = sqlx::query(
+            "SELECT credential_id, expires_at FROM sticky_bindings
+             WHERE pool_id = ? AND binding_kind = ? AND binding_key_hash = ?",
+        )
+        .bind(pool_id)
+        .bind(kind.as_str())
+        .bind(&key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let expires_at: i64 = row.get("expires_at");
+        if expires_at <= now_unix {
+            sqlx::query(
+                "DELETE FROM sticky_bindings WHERE pool_id = ? AND binding_kind = ? AND binding_key_hash = ?",
+            )
+            .bind(pool_id)
+            .bind(kind.as_str())
+            .bind(&key_hash)
             .execute(&self.pool)
             .await?;
-        Ok(id)
+            return Ok(None);
+        }
+        Ok(Some(row.get("credential_id")))
+    }
+
+    pub async fn put_sticky_binding(
+        &self,
+        pool_id: &str,
+        kind: BindingKind,
+        raw_key: &str,
+        credential_id: &str,
+        ttl_secs: i64,
+        now_unix: i64,
+    ) -> Result<(), sqlx::Error> {
+        let key_hash = Self::hash_binding_key(raw_key);
+        let expires_at = now_unix + ttl_secs.max(60);
+        sqlx::query(
+            "INSERT INTO sticky_bindings (pool_id, binding_kind, binding_key_hash, credential_id, expires_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(pool_id, binding_kind, binding_key_hash) DO UPDATE SET
+               credential_id = excluded.credential_id,
+               expires_at = excluded.expires_at,
+               updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(pool_id)
+        .bind(kind.as_str())
+        .bind(&key_hash)
+        .bind(credential_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_pool_candidates(
+        &self,
+        pool_id: &str,
+    ) -> Result<Vec<CandidateAccount>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT pm.credential_id, pm.weight, pm.priority, pm.enabled, pm.concurrency_limit,
+                    c.healthy, c.schedule_state, c.cooldown_until, c.error_rate_ewma, c.ttft_ewma_ms,
+                    (SELECT COUNT(*) FROM account_leases l
+                      WHERE l.credential_id = pm.credential_id
+                        AND l.released_at IS NULL
+                        AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)
+                    ) AS active_leases
+             FROM pool_members pm
+             JOIN credentials c ON c.id = pm.credential_id
+             WHERE pm.pool_id = ?",
+        )
+        .bind(pool_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CandidateAccount {
+                credential_id: row.get("credential_id"),
+                weight: row.get::<i64, _>("weight").max(1),
+                priority: row.get("priority"),
+                enabled: row.get::<i64, _>("enabled") != 0,
+                healthy: row.get::<i64, _>("healthy") != 0,
+                schedule_state: ScheduleState::parse(
+                    &row
+                        .try_get::<String, _>("schedule_state")
+                        .unwrap_or_else(|_| "ready".into()),
+                ),
+                cooldown_until: row.try_get("cooldown_until").unwrap_or(None),
+                active_leases: row.get("active_leases"),
+                concurrency_limit: row
+                    .try_get::<i64, _>("concurrency_limit")
+                    .unwrap_or(1)
+                    .max(1),
+                error_rate_ewma: row.try_get("error_rate_ewma").unwrap_or(0.0),
+                ttft_ewma_ms: row.try_get("ttft_ewma_ms").unwrap_or(0.0),
+                quota_remaining: None,
+                session_reset_at: None,
+                quota_fetched_at: None,
+            })
+            .collect())
+    }
+
+    async fn hydrate_quota_fields(
+        &self,
+        candidates: &mut [CandidateAccount],
+    ) -> Result<(), sqlx::Error> {
+        for candidate in candidates.iter_mut() {
+            if let Some(snapshot) = self.cached_quota_snapshot(&candidate.credential_id).await? {
+                candidate.quota_fetched_at = Some(snapshot.fetched_at);
+                if let Some(five) = snapshot.five_hour.as_ref() {
+                    candidate.quota_remaining = Some((five.remaining_percent / 100.0).clamp(0.0, 1.0));
+                    candidate.session_reset_at = five.reset_at.or(candidate.session_reset_at);
+                } else if let Some(seven) = snapshot.seven_day.as_ref() {
+                    candidate.quota_remaining =
+                        Some((seven.remaining_percent / 100.0).clamp(0.0, 1.0));
+                }
+                if candidate.session_reset_at.is_none() {
+                    candidate.session_reset_at = snapshot
+                        .seven_day
+                        .as_ref()
+                        .and_then(|window| window.reset_at);
+                }
+                // Secondary 7d low-remain pressure: when 7d remaining is very low, shrink headroom.
+                if let (Some(five_rem), Some(seven)) =
+                    (candidate.quota_remaining, snapshot.seven_day.as_ref())
+                {
+                    let seven_rem = (seven.remaining_percent / 100.0).clamp(0.0, 1.0);
+                    if seven_rem < 0.10 {
+                        candidate.quota_remaining = Some(five_rem.min(seven_rem));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Select a credential for a provider request (Sub2API-like pipeline).
+    pub async fn select_for_request(
+        &self,
+        provider_id: &str,
+        previous_response_id: Option<&str>,
+        session_key: Option<&str>,
+        exclude_credential_ids: &[String],
+    ) -> Result<Option<Lease>, sqlx::Error> {
+        // Expire stale leases first.
+        sqlx::query(
+            "UPDATE account_leases SET released_at = CURRENT_TIMESTAMP
+             WHERE released_at IS NULL AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        let routing = self.get_provider_routing(provider_id).await?;
+        let routing_mode = RoutingMode::parse(
+            routing
+                .as_ref()
+                .map(|r| r.routing_mode.as_str())
+                .unwrap_or("pool"),
+        );
+        let fixed_id = routing
+            .as_ref()
+            .and_then(|r| r.fixed_credential_id.clone());
+
+        let pool_id = match self.active_pool_id(provider_id).await? {
+            Some(id) => id,
+            None => {
+                // No pool: fixed credential or first healthy.
+                if routing_mode == RoutingMode::Fixed {
+                    if let Some(id) = fixed_id {
+                        return self.acquire_direct_lease(provider_id, &id, SelectionLayer::Fixed).await;
+                    }
+                }
+                return Ok(None);
+            }
+        };
+
+        let config = self.get_pool_scheduler_config(&pool_id).await?;
+        let now_unix = Self::now_unix();
+
+        let previous_binding = if let Some(raw) = previous_response_id {
+            self.get_sticky_binding(&pool_id, BindingKind::PreviousResponse, raw, now_unix)
+                .await?
+        } else {
+            None
+        };
+        let session_binding = if let Some(raw) = session_key {
+            self.get_sticky_binding(&pool_id, BindingKind::Session, raw, now_unix)
+                .await?
+        } else {
+            None
+        };
+
+        let mut candidates = if routing_mode == RoutingMode::Fixed {
+            // Fixed may use a credential that is not in pool_members; synthesize a candidate.
+            let mut list = self.load_pool_candidates(&pool_id).await?;
+            if let Some(ref fixed) = fixed_id {
+                if !list.iter().any(|c| &c.credential_id == fixed) {
+                    if let Some(row) = sqlx::query(
+                        "SELECT id, healthy, schedule_state, cooldown_until, error_rate_ewma, ttft_ewma_ms FROM credentials WHERE id = ? AND provider_id = ?",
+                    )
+                    .bind(fixed)
+                    .bind(provider_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    {
+                        list.push(CandidateAccount {
+                            credential_id: row.get("id"),
+                            weight: 1,
+                            priority: 0,
+                            enabled: true,
+                            healthy: row.get::<i64, _>("healthy") != 0,
+                            schedule_state: ScheduleState::parse(
+                                &row
+                                    .try_get::<String, _>("schedule_state")
+                                    .unwrap_or_else(|_| "ready".into()),
+                            ),
+                            cooldown_until: row.try_get("cooldown_until").unwrap_or(None),
+                            active_leases: 0,
+                            concurrency_limit: 1,
+                            error_rate_ewma: row.try_get("error_rate_ewma").unwrap_or(0.0),
+                            ttft_ewma_ms: row.try_get("ttft_ewma_ms").unwrap_or(0.0),
+                            quota_remaining: None,
+                            session_reset_at: None,
+                            quota_fetched_at: None,
+                        });
+                    }
+                }
+            }
+            list
+        } else {
+            self.load_pool_candidates(&pool_id).await?
+        };
+        self.hydrate_quota_fields(&mut candidates).await?;
+
+        if candidates.is_empty() && routing_mode == RoutingMode::Pool {
+            // Fallback: any healthy credential on provider (single-account instances).
+            if let Some(cred) = self.first_healthy_credential(provider_id).await? {
+                return self
+                    .acquire_direct_lease(provider_id, &cred.id, SelectionLayer::LoadBalance)
+                    .await;
+            }
+            return Ok(None);
+        }
+
+        let request = SelectRequest {
+            routing: routing_mode,
+            fixed_credential_id: fixed_id,
+            previous_response_id: previous_response_id.map(str::to_string),
+            session_key: session_key.map(str::to_string),
+            exclude_credential_ids: exclude_credential_ids.to_vec(),
+            now_unix,
+            previous_response_binding: previous_binding,
+            session_binding,
+        };
+
+        let seed = uuid::Uuid::new_v4();
+        let seed_u64 = u64::from_le_bytes(seed.as_bytes()[..8].try_into().unwrap_or([0; 8]));
+        let Some(outcome) = select_account(&candidates, &config, &request, seed_u64) else {
+            return Ok(None);
+        };
+
+        self.finalize_selection(&pool_id, &config, previous_response_id, session_key, &outcome, now_unix)
+            .await
+    }
+
+    async fn acquire_direct_lease(
+        &self,
+        _provider_id: &str,
+        credential_id: &str,
+        layer: SelectionLayer,
+    ) -> Result<Option<Lease>, sqlx::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let ttl = PoolSchedulerConfig::default().lease_ttl_secs;
+        // Use a synthetic pool id slot if needed — lease table requires pool_id.
+        // Attach to any pool of this credential's provider or skip.
+        let pool_id: Option<String> = sqlx::query_scalar(
+            "SELECT p.id FROM account_pools p
+             JOIN credentials c ON c.provider_id = p.provider_id
+             WHERE c.id = ? AND p.enabled = 1
+             ORDER BY p.created_at LIMIT 1",
+        )
+        .bind(credential_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(pool_id) = pool_id else {
+            return Ok(Some(Lease {
+                id: id.clone(),
+                credential_id: credential_id.to_string(),
+                layer,
+                sticky_escaped: false,
+            }));
+        };
+        sqlx::query(
+            "INSERT INTO account_leases (id, pool_id, credential_id, affinity_key, expires_at)
+             VALUES (?, ?, ?, NULL, datetime(CURRENT_TIMESTAMP, '+' || ? || ' seconds'))",
+        )
+        .bind(&id)
+        .bind(&pool_id)
+        .bind(credential_id)
+        .bind(ttl)
+        .execute(&self.pool)
+        .await?;
+        Ok(Some(Lease {
+            id,
+            credential_id: credential_id.to_string(),
+            layer,
+            sticky_escaped: false,
+        }))
+    }
+
+    async fn finalize_selection(
+        &self,
+        pool_id: &str,
+        config: &PoolSchedulerConfig,
+        previous_response_id: Option<&str>,
+        session_key: Option<&str>,
+        outcome: &SelectOutcome,
+        now_unix: i64,
+    ) -> Result<Option<Lease>, sqlx::Error> {
+        if outcome.rebind_previous_response {
+            if let Some(raw) = previous_response_id {
+                self.put_sticky_binding(
+                    pool_id,
+                    BindingKind::PreviousResponse,
+                    raw,
+                    &outcome.credential_id,
+                    config.sticky_response_id_ttl_secs,
+                    now_unix,
+                )
+                .await?;
+            }
+        } else if outcome.layer == SelectionLayer::PreviousResponse {
+            // Refresh TTL on hit.
+            if let Some(raw) = previous_response_id {
+                self.put_sticky_binding(
+                    pool_id,
+                    BindingKind::PreviousResponse,
+                    raw,
+                    &outcome.credential_id,
+                    config.sticky_response_id_ttl_secs,
+                    now_unix,
+                )
+                .await?;
+            }
+        }
+
+        if outcome.rebind_session || outcome.layer == SelectionLayer::Session {
+            if let Some(raw) = session_key {
+                self.put_sticky_binding(
+                    pool_id,
+                    BindingKind::Session,
+                    raw,
+                    &outcome.credential_id,
+                    config.sticky_session_ttl_secs,
+                    now_unix,
+                )
+                .await?;
+            }
+        } else if outcome.layer == SelectionLayer::LoadBalance {
+            if let Some(raw) = session_key {
+                self.put_sticky_binding(
+                    pool_id,
+                    BindingKind::Session,
+                    raw,
+                    &outcome.credential_id,
+                    config.sticky_session_ttl_secs,
+                    now_unix,
+                )
+                .await?;
+            }
+            if let Some(raw) = previous_response_id {
+                self.put_sticky_binding(
+                    pool_id,
+                    BindingKind::PreviousResponse,
+                    raw,
+                    &outcome.credential_id,
+                    config.sticky_response_id_ttl_secs,
+                    now_unix,
+                )
+                .await?;
+            }
+        }
+
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO account_leases (id, pool_id, credential_id, affinity_key, expires_at)
+             VALUES (?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, '+' || ? || ' seconds'))",
+        )
+        .bind(&lease_id)
+        .bind(pool_id)
+        .bind(&outcome.credential_id)
+        .bind(outcome.layer.as_str())
+        .bind(config.lease_ttl_secs)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Some(Lease {
+            id: lease_id,
+            credential_id: outcome.credential_id.clone(),
+            layer: outcome.layer,
+            sticky_escaped: outcome.sticky_escaped,
+        }))
+    }
+
+    pub async fn release_lease(&self, lease_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE account_leases SET released_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND released_at IS NULL",
+        )
+        .bind(lease_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn release_all_leases(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE account_leases SET released_at = CURRENT_TIMESTAMP WHERE released_at IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn mark_schedule_state(
+        &self,
+        credential_id: &str,
+        state: ScheduleState,
+        healthy: bool,
+        error: Option<&str>,
+        cooldown_until: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE credentials SET schedule_state = ?, healthy = ?, last_error = ?,
+                cooldown_until = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(state.as_str())
+        .bind(healthy as i64)
+        .bind(error)
+        .bind(cooldown_until)
+        .bind(credential_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn apply_rate_limit_cooldown(
+        &self,
+        credential_id: &str,
+        cooldown_secs: i64,
+        retry_after_secs: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        let secs = retry_after_secs.unwrap_or(cooldown_secs).max(1);
+        let until = Self::now_unix() + secs;
+        self.mark_schedule_state(
+            credential_id,
+            ScheduleState::RateLimited,
+            true,
+            Some("上游限流 (429)"),
+            Some(until),
+        )
+        .await
+    }
+
+    pub async fn max_failover_switches(&self, provider_id: &str) -> Result<u32, sqlx::Error> {
+        if let Some(pool_id) = self.active_pool_id(provider_id).await? {
+            let config = self.get_pool_scheduler_config(&pool_id).await?;
+            return Ok(config.max_failover_switches.max(1));
+        }
+        Ok(3)
+    }
+
+    pub async fn default_429_cooldown_secs(&self, provider_id: &str) -> Result<i64, sqlx::Error> {
+        if let Some(pool_id) = self.active_pool_id(provider_id).await? {
+            let config = self.get_pool_scheduler_config(&pool_id).await?;
+            return Ok(config.default_429_cooldown_secs.max(1));
+        }
+        Ok(30)
+    }
+
+    pub async fn credential_fingerprint_prefix(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query("SELECT fingerprint FROM credentials WHERE id = ?")
+            .bind(credential_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| {
+            row.get::<String, _>("fingerprint")
+                .chars()
+                .take(12)
+                .collect()
+        }))
+    }
+
+    pub async fn record_proxy_request_event(
+        &self,
+        event: &ProxyRequestEvent,
+        max_events: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO proxy_request_events (
+                id, created_at, route_slug, display_name, provider_id, upstream_model, protocol,
+                selection_layer, sticky_escaped, account_fingerprint, schedule_state,
+                result_category, failover_attempt, latency_ms_total, first_token_ms,
+                cooldown_applied, error_summary
+             ) VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&event.id)
+        .bind(if event.created_at.is_empty() {
+            None::<String>
+        } else {
+            Some(event.created_at.clone())
+        })
+        .bind(&event.route_slug)
+        .bind(&event.display_name)
+        .bind(&event.provider_id)
+        .bind(&event.upstream_model)
+        .bind(&event.protocol)
+        .bind(&event.selection_layer)
+        .bind(event.sticky_escaped as i64)
+        .bind(&event.account_fingerprint)
+        .bind(&event.schedule_state)
+        .bind(&event.result_category)
+        .bind(event.failover_attempt as i64)
+        .bind(event.latency_ms_total)
+        .bind(event.first_token_ms)
+        .bind(event.cooldown_applied as i64)
+        .bind(&event.error_summary)
+        .execute(&self.pool)
+        .await?;
+
+        let cap = max_events.clamp(50, 1000);
+        sqlx::query(
+            "DELETE FROM proxy_request_events WHERE id IN (
+                SELECT id FROM proxy_request_events
+                ORDER BY created_at DESC
+                LIMIT -1 OFFSET ?
+             )",
+        )
+        .bind(cap)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_proxy_request_events(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ProxyRequestEvent>, sqlx::Error> {
+        let limit = limit.clamp(1, 1000);
+        let rows = sqlx::query(
+            "SELECT id, created_at, route_slug, display_name, provider_id, upstream_model, protocol,
+                    selection_layer, sticky_escaped, account_fingerprint, schedule_state,
+                    result_category, failover_attempt, latency_ms_total, first_token_ms,
+                    cooldown_applied, error_summary
+             FROM proxy_request_events
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProxyRequestEvent {
+                id: row.get("id"),
+                created_at: row.get("created_at"),
+                route_slug: row.get("route_slug"),
+                display_name: row.get("display_name"),
+                provider_id: row.get("provider_id"),
+                upstream_model: row.get("upstream_model"),
+                protocol: row.get("protocol"),
+                selection_layer: row.get("selection_layer"),
+                sticky_escaped: row.get::<i64, _>("sticky_escaped") != 0,
+                account_fingerprint: row.get("account_fingerprint"),
+                schedule_state: row.get("schedule_state"),
+                result_category: row.get("result_category"),
+                failover_attempt: row.get::<i64, _>("failover_attempt") as u32,
+                latency_ms_total: row.get("latency_ms_total"),
+                first_token_ms: row.get("first_token_ms"),
+                cooldown_applied: row.get::<i64, _>("cooldown_applied") != 0,
+                error_summary: row.get("error_summary"),
+            })
+            .collect())
+    }
+
+    pub async fn clear_proxy_request_events(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM proxy_request_events")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn diagnostics_max_events(&self) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'diagnostics.max_events'")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .and_then(|row| {
+                let json: String = row.get("value_json");
+                serde_json::from_str::<i64>(&json).ok()
+            })
+            .unwrap_or(200)
+            .clamp(50, 1000))
+    }
+
+    pub async fn set_diagnostics_max_events(&self, max_events: i64) -> Result<i64, sqlx::Error> {
+        let value = max_events.clamp(50, 1000);
+        sqlx::query(
+            "INSERT INTO app_settings (key, value_json) VALUES ('diagnostics.max_events', ?)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(value.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(value)
     }
 
     pub async fn default_pool_id(&self, provider_id: &str) -> Result<Option<String>, sqlx::Error> {
@@ -368,12 +1400,25 @@ impl Storage {
 
     pub async fn create_pool(&self, provider_id: &str, name: &str) -> Result<String, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO account_pools (id, name, provider_id) VALUES (?, ?, ?)")
-            .bind(&id)
-            .bind(name)
-            .bind(provider_id)
-            .execute(&self.pool)
-            .await?;
+        let defaults = PoolSchedulerConfig::default().to_json();
+        sqlx::query(
+            "INSERT INTO account_pools (id, name, provider_id, strategy, sticky_ttl_secs, scheduler_config_json)
+             VALUES (?, ?, ?, 'load_aware_top_k', 3600, ?)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(provider_id)
+        .bind(&defaults)
+        .execute(&self.pool)
+        .await?;
+        // If this provider has no active pool yet, activate the new one.
+        sqlx::query(
+            "UPDATE providers SET active_pool_id = ? WHERE id = ? AND (active_pool_id IS NULL OR active_pool_id = '')",
+        )
+        .bind(&id)
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
         Ok(id)
     }
 
@@ -429,58 +1474,18 @@ impl Storage {
             .collect())
     }
 
-    pub async fn acquire_lease(
-        &self,
-        pool_id: &str,
-        affinity_key: Option<&str>,
-        ttl_secs: i64,
-    ) -> Result<Option<Lease>, sqlx::Error> {
-        sqlx::query("UPDATE account_leases SET released_at = CURRENT_TIMESTAMP WHERE released_at IS NULL AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP")
-            .execute(&self.pool)
-            .await?;
-        if let Some(key) = affinity_key {
-            if let Some(row) = sqlx::query("SELECT l.id, l.pool_id, l.credential_id, l.affinity_key FROM account_leases l JOIN credentials c ON c.id = l.credential_id WHERE l.pool_id = ? AND l.affinity_key = ? AND l.released_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP) AND c.healthy = 1 ORDER BY l.acquired_at DESC LIMIT 1")
-                .bind(pool_id).bind(key).fetch_optional(&self.pool).await? {
-                return Ok(Some(Lease { credential_id: row.get("credential_id") }));
-            }
-        }
-        let candidates = sqlx::query("SELECT pm.credential_id, MAX(pm.weight, 1) AS weight FROM pool_members pm JOIN credentials c ON c.id = pm.credential_id WHERE pm.pool_id = ? AND pm.enabled = 1 AND c.healthy = 1 ORDER BY (SELECT COUNT(*) FROM account_leases l WHERE l.credential_id = pm.credential_id AND l.released_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)), pm.priority DESC, pm.created_at LIMIT 3")
-            .bind(pool_id).fetch_all(&self.pool).await?;
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-        let total_weight: i64 = candidates
-            .iter()
-            .map(|row| row.get::<i64, _>("weight").max(1))
-            .sum();
-        let selection_seed = uuid::Uuid::new_v4();
-        let mut ticket = u64::from_le_bytes(selection_seed.as_bytes()[..8].try_into().unwrap())
-            % total_weight as u64;
-        let mut credential_id = candidates[0].get::<String, _>("credential_id");
-        for row in candidates {
-            let weight = row.get::<i64, _>("weight").max(1) as u64;
-            if ticket < weight {
-                credential_id = row.get("credential_id");
-                break;
-            }
-            ticket -= weight;
-        }
-        let id = selection_seed.to_string();
-        let affinity = affinity_key.map(ToOwned::to_owned);
-        sqlx::query("INSERT INTO account_leases (id, pool_id, credential_id, affinity_key, expires_at) VALUES (?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, '+' || ? || ' seconds'))")
-            .bind(&id).bind(pool_id).bind(&credential_id).bind(&affinity).bind(ttl_secs).execute(&self.pool).await?;
-        Ok(Some(Lease { credential_id }))
-    }
-
     pub async fn mark_credential_health(
         &self,
         id: &str,
         healthy: bool,
         error: Option<&str>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE credentials SET healthy = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(healthy as i64).bind(error).bind(id).execute(&self.pool).await?;
-        Ok(())
+        let state = if healthy {
+            ScheduleState::Ready
+        } else {
+            ScheduleState::AuthInvalid
+        };
+        self.mark_schedule_state(id, state, healthy, error, None).await
     }
 
     pub async fn record_usage(

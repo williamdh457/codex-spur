@@ -1,12 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountPoolSummary,
+  PoolMemberDetail,
+  PoolSchedulerConfig,
+  ProviderRouting,
+  ProxyRequestEvent,
   AppSnapshot,
   ApplyPreview,
   CodexApplyOutcome,
   CredentialSummary,
   ModelRouteSummary,
   OpenAiQuotaSnapshot,
+  ProviderSummary,
   UsageSnapshot,
 } from "./types";
 
@@ -24,15 +29,11 @@ const browserFallback: AppSnapshot = {
     providerId: "codex_select",
     catalogPath: "~/.codex/codex-select/model-catalog.json",
   },
-  providers: [
-    { id: "openai", name: "OpenAI", region: "Official", protocol: "Responses", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://chatgpt.com/backend-api/codex", supportsOfficialAccount: true, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
-    { id: "kimi", name: "Kimi", region: "中国 / Global", protocol: "Chat Completions", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://api.kimi.com/coding/v1", supportsOfficialAccount: false, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
-    { id: "deepseek", name: "DeepSeek", region: "Global", protocol: "Chat Completions", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://api.deepseek.com/v1", supportsOfficialAccount: false, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
-    { id: "minimax", name: "MiniMax", region: "中国 / Global", protocol: "Responses preferred", configured: false, selectedModels: 0, discoveredModels: 0, lastFetchedAt: null, baseUrl: null, defaultBaseUrl: "https://api.minimaxi.com/v1", supportsOfficialAccount: false, credentialCount: 0, healthyCredentialCount: 0, poolCount: 0 },
-  ],
+  // Empty by default — CC Switch style: user adds instances.
+  providers: [],
   publishedModels: 0,
   healthyAccounts: 0,
-  attentionItems: ["添加供应商凭据并拉取模型后，才能应用到 Codex。"],
+  attentionItems: ["添加供应商并拉取模型后，才能应用到 Codex。"],
 };
 
 function isTauriRuntime(): boolean {
@@ -75,6 +76,82 @@ export async function discoverProviderModels(providerId: string, baseUrl: string
   return invoke<ModelRouteSummary[]>("discover_provider_models", { providerId, baseUrl, apiKey: apiKey || null });
 }
 
+export async function importProviderConfigJson(providerId: string, input: string): Promise<ModelRouteSummary[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<ModelRouteSummary[]>("import_provider_config_json", { providerId, input });
+}
+
+export async function createProviderInstance(kind: string, name?: string): Promise<ProviderSummary> {
+  return invoke<ProviderSummary>("create_provider_instance", { kind, name: name ?? null });
+}
+
+export type DeviceLoginStart = {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  intervalSecs: number;
+  expiresIn: number;
+};
+
+export type DeviceLoginTokens = {
+  accessToken: string;
+  refreshToken: string | null;
+  idToken: string | null;
+  accountId: string;
+  email: string | null;
+  expiresAt: number | null;
+};
+
+export type DeviceLoginPoll = {
+  status: string;
+  tokens: DeviceLoginTokens | null;
+  message: string | null;
+};
+
+export type OpenAiLoginComplete = {
+  provider: ProviderSummary;
+  modelCount: number;
+  modelError: string | null;
+};
+
+export async function startOpenAiDeviceLogin(): Promise<DeviceLoginStart> {
+  return invoke<DeviceLoginStart>("start_openai_device_login");
+}
+
+export async function pollOpenAiDeviceLogin(deviceCode: string): Promise<DeviceLoginPoll> {
+  return invoke<DeviceLoginPoll>("poll_openai_device_login", { deviceCode });
+}
+
+export async function cancelOpenAiDeviceLogin(deviceCode: string): Promise<void> {
+  return invoke<void>("cancel_openai_device_login", { deviceCode });
+}
+
+export async function completeOpenAiDeviceLogin(
+  tokens: DeviceLoginTokens,
+  name?: string,
+): Promise<OpenAiLoginComplete> {
+  return invoke<OpenAiLoginComplete>("complete_openai_device_login", {
+    tokens,
+    name: name ?? null,
+  });
+}
+
+export async function openExternalUrl(url: string): Promise<void> {
+  return invoke<void>("open_external_url", { url });
+}
+
+export async function deleteProviderInstance(providerId: string): Promise<void> {
+  return invoke<void>("delete_provider_instance", { providerId });
+}
+
+export async function renameProviderInstance(providerId: string, name: string): Promise<ProviderSummary> {
+  return invoke<ProviderSummary>("rename_provider_instance", { providerId, name });
+}
+
+export async function setActivePool(providerId: string, poolId: string): Promise<void> {
+  return invoke<void>("set_active_pool", { providerId, poolId });
+}
+
 export async function setModelEnabled(routeId: string, enabled: boolean): Promise<ModelRouteSummary[]> {
   if (!isTauriRuntime()) return [];
   return invoke<ModelRouteSummary[]>("set_model_enabled", { routeId, enabled });
@@ -112,6 +189,74 @@ export async function removeAccountFromPool(poolId: string, credentialId: string
 
 export async function listPoolMemberIds(poolId: string): Promise<string[]> {
   return isTauriRuntime() ? invoke<string[]>("list_pool_member_ids", { poolId }) : [];
+}
+
+export async function listPoolMembersDetailed(poolId: string): Promise<PoolMemberDetail[]> {
+  return isTauriRuntime() ? invoke<PoolMemberDetail[]>("list_pool_members_detailed", { poolId }) : [];
+}
+
+export async function updatePoolMember(
+  poolId: string,
+  credentialId: string,
+  weight: number,
+  priority: number,
+  enabled: boolean,
+  concurrencyLimit: number,
+): Promise<void> {
+  return invoke<void>("update_pool_member", {
+    poolId,
+    credentialId,
+    weight,
+    priority,
+    enabled,
+    concurrencyLimit,
+  });
+}
+
+export async function getProviderRouting(providerId: string): Promise<ProviderRouting | null> {
+  return isTauriRuntime() ? invoke<ProviderRouting | null>("get_provider_routing", { providerId }) : null;
+}
+
+export async function setProviderRouting(
+  providerId: string,
+  routingMode: string,
+  fixedCredentialId: string | null,
+): Promise<ProviderRouting> {
+  return invoke<ProviderRouting>("set_provider_routing", {
+    providerId,
+    routingMode,
+    fixedCredentialId,
+  });
+}
+
+export async function getPoolSchedulerConfig(poolId: string): Promise<PoolSchedulerConfig> {
+  return invoke<PoolSchedulerConfig>("get_pool_scheduler_config", { poolId });
+}
+
+export async function updatePoolSchedulerConfig(
+  poolId: string,
+  config: PoolSchedulerConfig,
+): Promise<PoolSchedulerConfig> {
+  return invoke<PoolSchedulerConfig>("update_pool_scheduler_config", { poolId, config });
+}
+
+export async function listProxyRequestEvents(limit = 100): Promise<ProxyRequestEvent[]> {
+  return isTauriRuntime()
+    ? invoke<ProxyRequestEvent[]>("list_proxy_request_events", { limit })
+    : [];
+}
+
+export async function clearProxyRequestEvents(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  return invoke<void>("clear_proxy_request_events");
+}
+
+export async function getDiagnosticsMaxEvents(): Promise<number> {
+  return isTauriRuntime() ? invoke<number>("get_diagnostics_max_events") : 200;
+}
+
+export async function setDiagnosticsMaxEvents(maxEvents: number): Promise<number> {
+  return invoke<number>("set_diagnostics_max_events", { maxEvents });
 }
 
 export async function getUsageSnapshot(): Promise<UsageSnapshot> {
