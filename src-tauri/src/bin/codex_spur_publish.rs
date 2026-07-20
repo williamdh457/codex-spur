@@ -59,16 +59,35 @@ async fn main() -> anyhow::Result<()> {
 
     let result = codex_config::apply(base_url, &bearer, &catalog)?;
     let live = codex_config::inspect_live_binding();
+    let visibility = codex_config::inspect_desktop_visibility(None, Some(base_url));
 
     println!("config={}", result.config_path.display());
     println!("catalog={}", result.catalog_path.display());
     println!("selected={:?}", result.selected_model);
     println!("live_state={}", live.state);
+    println!(
+        "desktop_visibility={} ready={}",
+        visibility.status_label, visibility.ready
+    );
+    for check in &visibility.checks {
+        println!(
+            "  [{}] {} — {}",
+            if check.ok { "ok" } else { "!!" },
+            check.label,
+            check.detail
+        );
+    }
     for warning in &result.warnings {
         println!("warning: {warning}");
     }
     if live.state != "applied" {
         anyhow::bail!("publish 后 live state 仍是 {}，未绑定 codex_select", live.state);
+    }
+    if !visibility.ready {
+        eprintln!(
+            "warn: Desktop 可见性未就绪（{}）。Kimi/DeepSeek 可能仍被 GUI 隐藏。",
+            visibility.status_label
+        );
     }
     println!("OK published {} models to {}", result.model_count, home.display());
     Ok(())

@@ -7,8 +7,23 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
     ApiKey,
+    /// Explicit rename: plain `snake_case` turns `OAuth` into `o_auth` (wrong).
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth,
+    /// Explicit rename: plain `snake_case` turns this into `chat_gpt_web_session`.
+    #[serde(rename = "chatgpt_web_session", alias = "chat_gpt_web_session")]
     ChatGptWebSession,
+}
+
+impl CredentialKind {
+    /// Stable DB / IPC string (never use raw serde for `OAuth` — it becomes `o_auth`).
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::OAuth => "oauth",
+            Self::ChatGptWebSession => "chatgpt_web_session",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,9 +269,24 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
         .and_then(Value::as_str)
         .or_else(|| object.get("accountId").and_then(Value::as_str))
         .or_else(|| object.get("chatgpt_account_id").and_then(Value::as_str))
+        .or_else(|| object.get("chatgptAccountId").and_then(Value::as_str))
         .or_else(|| auth.get("account_id").and_then(Value::as_str))
         .or_else(|| auth.get("accountId").and_then(Value::as_str))
         .or_else(|| auth.get("chatgpt_account_id").and_then(Value::as_str))
+        .or_else(|| auth.get("chatgptAccountId").and_then(Value::as_str))
+        .or_else(|| {
+            // Sub2API credential bag often stores chatgpt_account_id under credentials.
+            object
+                .get("credentials")
+                .and_then(Value::as_object)
+                .and_then(|creds| {
+                    creds
+                        .get("chatgpt_account_id")
+                        .or_else(|| creds.get("account_id"))
+                        .or_else(|| creds.get("organization_id"))
+                })
+                .and_then(Value::as_str)
+        })
         .or_else(|| {
             object
                 .get("account")
@@ -280,7 +310,18 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
                 .and_then(|id_token| id_token.get("chatgpt_account_id"))
                 .and_then(Value::as_str)
         })
-        .map(ToOwned::to_owned);
+        .map(ToOwned::to_owned)
+        // Last resort: decode ChatGPT account id from JWT access/id tokens.
+        .or_else(|| {
+            access_token
+                .as_deref()
+                .and_then(crate::openai_oauth::chatgpt_account_id_from_token)
+        })
+        .or_else(|| {
+            id_token
+                .as_deref()
+                .and_then(crate::openai_oauth::chatgpt_account_id_from_token)
+        });
     let expires_at = object
         .get("expires_at")
         .and_then(Value::as_i64)
@@ -351,6 +392,27 @@ fn fingerprint(provider: &str, identity: Option<&str>, secret: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_kind_serializes_as_oauth_not_o_auth() {
+        assert_eq!(CredentialKind::OAuth.as_db_str(), "oauth");
+        assert_eq!(
+            CredentialKind::ChatGptWebSession.as_db_str(),
+            "chatgpt_web_session"
+        );
+        assert_eq!(
+            serde_json::to_string(&CredentialKind::OAuth).expect("ser"),
+            "\"oauth\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CredentialKind>("\"o_auth\"").expect("legacy"),
+            CredentialKind::OAuth
+        );
+        assert_eq!(
+            serde_json::from_str::<CredentialKind>("\"oauth\"").expect("canonical"),
+            CredentialKind::OAuth
+        );
+    }
 
     #[test]
     fn parses_codex_auth_shape_without_exposing_secret_in_debug() {
@@ -458,6 +520,23 @@ mod tests {
             err.to_string(),
             "account object does not contain a usable credential"
         );
+    }
+
+    #[test]
+    fn parses_sub2api_chatgpt_account_id_from_credentials_bag() {
+        let input = r#"{
+            "accounts": [{
+                "platform": "openai",
+                "credentials": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "chatgpt_account_id": "acct-from-creds"
+                }
+            }]
+        }"#;
+        let parsed = parse_json_import(input).expect("sub2api chatgpt_account_id");
+        assert_eq!(parsed[0].account_id.as_deref(), Some("acct-from-creds"));
+        assert_eq!(parsed[0].state, CredentialState::Refreshable);
     }
 
     #[test]

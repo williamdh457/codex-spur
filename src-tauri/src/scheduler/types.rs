@@ -124,7 +124,8 @@ impl Default for ScoreWeights {
             error_rate: 0.8,
             ttft: 0.5,
             reset: 0.0,
-            quota_headroom: 0.0,
+            // Prefer accounts with remaining quota when snapshots are fresh.
+            quota_headroom: 1.0,
         }
     }
 }
@@ -160,6 +161,33 @@ pub struct PoolSchedulerConfig {
     pub default_429_cooldown_secs: i64,
     pub max_failover_switches: u32,
     pub lease_ttl_secs: i64,
+    /// When a fresh quota snapshot shows remaining ≤ this fraction, skip the account.
+    #[serde(default = "default_true")]
+    pub exclude_zero_quota: bool,
+    /// Exclude when 5h used_percent/100 ≥ threshold (0 disables). Default 1.0 = only fully exhausted.
+    #[serde(default = "default_quota_pause_threshold")]
+    pub quota_auto_pause_5h: f64,
+    /// Exclude when 7d used fraction ≥ threshold (0 disables).
+    #[serde(default = "default_quota_pause_threshold")]
+    pub quota_auto_pause_7d: f64,
+    /// Prefer waiting for a sticky account's concurrency slot instead of switching.
+    #[serde(default = "default_true")]
+    pub sticky_wait_enabled: bool,
+    /// Max seconds to wait for sticky concurrency (desktop default shorter than Sub2API 120s).
+    #[serde(default = "default_sticky_wait_timeout")]
+    pub sticky_wait_timeout_secs: i64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_quota_pause_threshold() -> f64 {
+    1.0
+}
+
+fn default_sticky_wait_timeout() -> i64 {
+    30
 }
 
 impl Default for PoolSchedulerConfig {
@@ -174,6 +202,11 @@ impl Default for PoolSchedulerConfig {
             default_429_cooldown_secs: 30,
             max_failover_switches: 3,
             lease_ttl_secs: 900,
+            exclude_zero_quota: true,
+            quota_auto_pause_5h: 1.0,
+            quota_auto_pause_7d: 1.0,
+            sticky_wait_enabled: true,
+            sticky_wait_timeout_secs: 30,
         }
     }
 }
@@ -220,6 +253,18 @@ impl PoolSchedulerConfig {
         }
         if self.lease_ttl_secs < 60 {
             self.lease_ttl_secs = 60;
+        }
+        self.sticky_wait_timeout_secs = self.sticky_wait_timeout_secs.clamp(0, 120);
+        for value in [
+            &mut self.quota_auto_pause_5h,
+            &mut self.quota_auto_pause_7d,
+        ] {
+            if !value.is_finite() || *value < 0.0 {
+                *value = 0.0;
+            }
+            if *value > 1.0 {
+                *value = 1.0;
+            }
         }
         for value in [
             &mut self.score_weights.priority,

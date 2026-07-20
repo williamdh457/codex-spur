@@ -205,6 +205,55 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
     Ok(serde_json::to_string(&payload)?)
 }
 
+/// Canonical short labels for Desktop-native model ids (terra / sol / luna).
+fn desktop_native_short_label(native_slug: &str) -> &str {
+    match native_slug {
+        "gpt-5.6-terra" => "GPT-5.6-Terra",
+        "gpt-5.6-sol" => "GPT-5.6-Sol",
+        "gpt-5.6-luna" => "GPT-5.6-Luna",
+        other => other,
+    }
+}
+
+/// Strip any existing `Prefix · ` so we can re-apply the current instance name.
+fn bare_model_label(display: &str) -> &str {
+    display
+        .rsplit_once('·')
+        .map(|(_, rest)| rest.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| display.trim())
+}
+
+/// DESIGN.md default: every Codex picker row is `供应商 · 模型`.
+fn format_catalog_display_name(provider_name: &str, model_label: &str) -> String {
+    let provider = provider_name.trim();
+    let bare = bare_model_label(model_label);
+    if provider.is_empty() {
+        return bare.to_string();
+    }
+    if bare.is_empty() {
+        return provider.to_string();
+    }
+    format!("{provider} · {bare}")
+}
+
+/// Prefer native short names; otherwise bare label from catalog / route / upstream id.
+fn catalog_model_label(route: &StoredRoute, model: &CatalogModel) -> String {
+    if let Some(native) = crate::providers::desktop_native_model_slug(&route.upstream_model) {
+        return desktop_native_short_label(native).to_string();
+    }
+    let from_model = model.display_name.trim();
+    let from_route = route.display_name.trim();
+    let raw = if !from_model.is_empty() {
+        from_model
+    } else if !from_route.is_empty() {
+        from_route
+    } else {
+        route.upstream_model.as_str()
+    };
+    bare_model_label(raw).to_string()
+}
+
 pub fn build_from_routes(
     routes: &[StoredRoute],
 ) -> Result<(ModelsResponse, HashMap<String, RouteTarget>)> {
@@ -252,34 +301,28 @@ pub fn build_from_routes(
             );
             let previous_slug = model.slug.clone();
             model.slug = published.clone();
-            // Human-facing label for native Desktop models: short CC Switch-style name.
-            if let Some(native) = crate::providers::desktop_native_model_slug(&route.upstream_model)
-            {
-                if published == native {
-                    let short = match native {
-                        "gpt-5.6-terra" => "GPT-5.6-Terra",
-                        "gpt-5.6-sol" => "GPT-5.6-Sol",
-                        "gpt-5.6-luna" => "GPT-5.6-Luna",
-                        other => other,
-                    };
-                    // Keep provider prefix only when multiple OpenAI instances exist later;
-                    // for the claimed public slug, mirror CC Switch's clean label.
-                    if !model.display_name.contains(short) {
-                        model.display_name = short.into();
-                    } else if model.display_name.contains('·') {
-                        // "OpenAI 2 · GPT-5.6-Terra" → "GPT-5.6-Terra" for picker density.
-                        model.display_name = short.into();
-                    }
-                    if model.description.as_deref().unwrap_or("").is_empty() {
-                        model.description = Some(short.into());
-                    }
-                }
-            }
+            // Always publish "供应商 · 模型" — including OpenAI official subscription
+            // and account-pool instances that previously lost their prefix for native
+            // terra/sol/luna public slugs.
+            let label =
+                format_catalog_display_name(&route.provider_name, &catalog_model_label(route, &model));
+            model.display_name = label.clone();
+            model.description = Some(label);
+            let base_url = if route.kind.eq_ignore_ascii_case("xai") {
+                // Runtime resolve so OAuth subscription never sticks on api.x.ai
+                // even if a row was not yet migrated.
+                crate::providers::resolve_xai_upstream_base(
+                    route.entry_category.as_deref(),
+                    Some(route.base_url.as_str()),
+                )
+            } else {
+                route.base_url.clone()
+            };
             let target = RouteTarget {
                 provider_id: route.provider_id.clone(),
                 kind: route.kind.clone(),
                 upstream_model: route.upstream_model.clone(),
-                base_url: route.base_url.clone(),
+                base_url,
                 protocol: route.protocol.clone(),
             };
             // Publish key + dual-keys so in-flight sessions on old slugs still route.
@@ -385,8 +428,14 @@ mod tests {
     use crate::providers::{legacy_route_slug, opaque_route_slug};
     use crate::storage::StoredRoute;
 
-    fn stale_slash_route(provider: &str, upstream: &str, display: &str, kind: &str) -> StoredRoute {
-        let legacy = legacy_route_slug(provider, upstream);
+    fn stale_slash_route(
+        provider_id: &str,
+        provider_name: &str,
+        upstream: &str,
+        display: &str,
+        kind: &str,
+    ) -> StoredRoute {
+        let legacy = legacy_route_slug(provider_id, upstream);
         // Intentionally stale: slash slug + camelCase + truncated ladder (what used to break GUI).
         let catalog_json = serde_json::json!({
             "model": {
@@ -411,7 +460,8 @@ mod tests {
         .to_string();
         StoredRoute {
             id: legacy,
-            provider_id: provider.into(),
+            provider_id: provider_id.into(),
+            provider_name: provider_name.into(),
             kind: kind.into(),
             upstream_model: upstream.into(),
             display_name: display.into(),
@@ -419,7 +469,24 @@ mod tests {
             catalog_json,
             protocol: "chat_completions".into(),
             base_url: "https://example.invalid/v1".into(),
+            entry_category: None,
         }
+    }
+
+    #[test]
+    fn format_catalog_display_name_always_prefixes_provider() {
+        assert_eq!(
+            format_catalog_display_name("OpenAI", "GPT-5.6-Sol"),
+            "OpenAI · GPT-5.6-Sol"
+        );
+        assert_eq!(
+            format_catalog_display_name("账号池", "OpenAI · GPT-5.6-Sol"),
+            "账号池 · GPT-5.6-Sol"
+        );
+        assert_eq!(
+            format_catalog_display_name("Kimi tian", "K3"),
+            "Kimi tian · K3"
+        );
     }
 
     #[test]
@@ -427,12 +494,14 @@ mod tests {
         let routes = vec![
             stale_slash_route(
                 "c99e00b6-b386-4980-af2c-8b4be927e34a",
+                "OpenAI 2",
                 "gpt-5.6-luna",
                 "OpenAI 2 · GPT-5.6-Luna",
                 "openai",
             ),
             stale_slash_route(
                 "d643a92a-76ae-458a-a567-81c0ea171ea5",
+                "Kimi tian",
                 "k3",
                 "Kimi tian · K3",
                 "kimi",
@@ -467,23 +536,31 @@ mod tests {
             // Custom-provider rows never advertise shell/apply_patch (CC Switch shape).
             assert!(model.experimental_supported_tools.is_empty());
             assert!(model.apply_patch_tool_type.is_none());
+            // DESIGN.md: every picker row is "供应商 · 模型".
+            assert!(
+                model.display_name.contains('·'),
+                "display_name must keep provider prefix, got {}",
+                model.display_name
+            );
         }
 
-        // OpenAI luna must use Desktop-native public slug for the power picker.
+        // OpenAI luna: public slug for power picker + instance-prefixed display name.
         let luna = catalog
             .models
             .iter()
             .find(|m| m.slug == "gpt-5.6-luna" || m.display_name.contains("Luna"))
             .expect("luna model");
         assert_eq!(luna.slug, "gpt-5.6-luna");
-        assert_eq!(luna.display_name, "GPT-5.6-Luna");
+        assert_eq!(luna.display_name, "OpenAI 2 · GPT-5.6-Luna");
+        assert_eq!(luna.description.as_deref(), Some("OpenAI 2 · GPT-5.6-Luna"));
 
-        // Kimi stays opaque (not a Desktop power-picker preset).
+        // Kimi stays opaque (not a Desktop power-picker preset) and keeps its prefix.
         let kimi = catalog
             .models
             .iter()
             .find(|m| m.display_name.contains("Kimi"))
             .expect("kimi model");
+        assert_eq!(kimi.display_name, "Kimi tian · K3");
         assert!(
             kimi.slug.starts_with("spur-route-"),
             "kimi slug must stay opaque, got {}",
@@ -526,7 +603,54 @@ mod tests {
         assert!(raw.contains("\"upgrade\": null"));
         assert!(raw.contains("\"effort\": \"max\""));
         assert!(raw.contains("Kimi tian · K3"));
+        assert!(raw.contains("OpenAI 2 · GPT-5.6-Luna"));
         assert!(raw.contains("\"gpt-5.6-luna\""));
+    }
+
+    #[test]
+    fn build_from_routes_keeps_provider_prefix_for_native_openai_and_pool() {
+        // Official subscription instance + account-pool instance both share gpt-5.6-sol;
+        // first claims public slug, second stays opaque — both must keep instance prefix.
+        let routes = vec![
+            stale_slash_route(
+                "official-instance",
+                "官方订阅",
+                "gpt-5.6-sol",
+                "GPT-5.6-Sol", // bare label in stale row — assemble must re-prefix
+                "openai",
+            ),
+            stale_slash_route(
+                "pool-instance",
+                "账号池",
+                "gpt-5.6-sol",
+                "账号池 · GPT-5.6-Sol",
+                "openai",
+            ),
+        ];
+        let (catalog, targets) = build_from_routes(&routes).expect("build catalog");
+        assert_eq!(catalog.models.len(), 2);
+
+        let official = catalog
+            .models
+            .iter()
+            .find(|m| m.display_name.starts_with("官方订阅"))
+            .expect("official");
+        let pool = catalog
+            .models
+            .iter()
+            .find(|m| m.display_name.starts_with("账号池"))
+            .expect("pool");
+
+        assert_eq!(official.display_name, "官方订阅 · GPT-5.6-Sol");
+        assert_eq!(pool.display_name, "账号池 · GPT-5.6-Sol");
+        assert_eq!(official.slug, "gpt-5.6-sol");
+        assert!(
+            pool.slug.starts_with("spur-route-"),
+            "second sol claim stays opaque, got {}",
+            pool.slug
+        );
+        assert!(targets.contains_key("gpt-5.6-sol"));
+        assert!(targets.contains_key(&pool.slug));
     }
 
     #[test]
@@ -562,7 +686,7 @@ mod tests {
 
     #[test]
     fn build_from_routes_rejects_malformed_enabled_rows() {
-        let mut route = stale_slash_route("provider", "k3", "Kimi", "kimi");
+        let mut route = stale_slash_route("provider", "Kimi", "k3", "Kimi", "kimi");
         route.catalog_json = "{not-json".into();
         let error = build_from_routes(&[route]).unwrap_err();
         assert!(error.to_string().contains("catalog_json 无法解析"));
@@ -572,6 +696,7 @@ mod tests {
     fn heal_stored_catalog_json_rewrites_camel_case_to_snake_case() {
         let route = stale_slash_route(
             "d643a92a-76ae-458a-a567-81c0ea171ea5",
+            "Kimi tian",
             "k3",
             "Kimi tian · K3",
             "kimi",

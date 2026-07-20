@@ -23,7 +23,7 @@ export type CodexBindingStatus = {
   catalogPath: string;
 };
 
-export type ProviderKind = "openai" | "kimi" | "deepseek" | "minimax" | "custom";
+export type ProviderKind = "openai" | "xai" | "kimi" | "deepseek" | "minimax" | "custom";
 
 export type ProviderSummary = {
   id: string;
@@ -44,6 +44,8 @@ export type ProviderSummary = {
   activePoolId: string | null;
   routingMode: string;
   fixedCredentialId: string | null;
+  /** Entry channel badge: official (browser) | json (file import) | api (form key). Legacy pool/config normalize to json. */
+  entryCategory: "official" | "json" | "api" | "pool" | "config" | null;
 };
 
 export type ReasoningMapping = {
@@ -60,6 +62,8 @@ export type ReasoningProfile = {
 export type ModelRouteSummary = {
   id: string;
   providerId: string;
+  /** User-facing provider instance name. */
+  providerName: string;
   upstreamModel: string;
   displayName: string;
   enabled: boolean;
@@ -142,6 +146,15 @@ export type PoolSchedulerConfig = {
   default429CooldownSecs: number;
   maxFailoverSwitches: number;
   leaseTtlSecs: number;
+  /** Hard-filter accounts whose fresh quota remaining is ~0. */
+  excludeZeroQuota: boolean;
+  /** Used-fraction threshold for 5h auto-pause (0 disables). */
+  quotaAutoPause5h: number;
+  /** Used-fraction threshold for 7d auto-pause (0 disables). */
+  quotaAutoPause7d: number;
+  /** Wait for sticky account concurrency instead of switching. */
+  stickyWaitEnabled: boolean;
+  stickyWaitTimeoutSecs: number;
 };
 
 export type ProxyRequestEvent = {
@@ -197,6 +210,22 @@ export type UsageSnapshot = {
   sampledAt: number;
 };
 
+export type DesktopVisibilityCheck = {
+  id: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+};
+
+/** Whether ChatGPT Desktop can show custom catalog rows (Kimi/DeepSeek). */
+export type DesktopVisibility = {
+  ready: boolean;
+  /** 就绪 / 缺登录 / 待应用 / 异常 */
+  statusLabel: string;
+  codexHome: string;
+  checks: DesktopVisibilityCheck[];
+};
+
 export type AppSnapshot = {
   proxy: ProxyStatus;
   binding: CodexBindingStatus;
@@ -204,6 +233,7 @@ export type AppSnapshot = {
   publishedModels: number;
   healthyAccounts: number;
   attentionItems: string[];
+  desktopVisibility: DesktopVisibility;
 };
 
 export type ApplyPreview = {

@@ -1,16 +1,17 @@
-use super::scoring::{lottery_weights, score_among_peers};
+use super::scoring::{lottery_weights, score_among_peers, QUOTA_SNAPSHOT_STALE_SECS};
 use super::types::{
     CandidateAccount, PoolSchedulerConfig, RoutingMode, ScheduleState, SelectOutcome,
     SelectRequest, SelectionLayer,
 };
 
-/// Whether a sticky-bound account may still be used.
+/// Whether a sticky-bound account may still be used (health/quota/cooldown).
+/// Concurrency fullness is handled separately so the caller can wait for a slot.
 pub fn sticky_eligible(
     candidate: &CandidateAccount,
     config: &PoolSchedulerConfig,
     now_unix: i64,
 ) -> bool {
-    if !is_base_eligible(candidate, now_unix) {
+    if !is_base_eligible(candidate, config, now_unix, /*require_slot*/ false) {
         return false;
     }
     if !config.sticky_escape.enabled {
@@ -25,7 +26,17 @@ pub fn sticky_eligible(
     true
 }
 
-fn is_base_eligible(candidate: &CandidateAccount, now_unix: i64) -> bool {
+/// Sticky account is healthy but currently at concurrency capacity.
+pub fn sticky_concurrency_full(candidate: &CandidateAccount) -> bool {
+    candidate.active_leases >= candidate.concurrency_limit.max(1)
+}
+
+fn is_base_eligible(
+    candidate: &CandidateAccount,
+    config: &PoolSchedulerConfig,
+    now_unix: i64,
+    require_slot: bool,
+) -> bool {
     if !candidate.enabled || !candidate.healthy {
         return false;
     }
@@ -43,10 +54,47 @@ fn is_base_eligible(candidate: &CandidateAccount, now_unix: i64) -> bool {
             return false;
         }
     }
-    if candidate.active_leases >= candidate.concurrency_limit.max(1) {
+    if quota_blocks(candidate, config, now_unix) {
+        return false;
+    }
+    if require_slot && candidate.active_leases >= candidate.concurrency_limit.max(1) {
         return false;
     }
     true
+}
+
+/// Fresh quota snapshot indicates the account should not be scheduled.
+pub fn quota_blocks(
+    candidate: &CandidateAccount,
+    config: &PoolSchedulerConfig,
+    now_unix: i64,
+) -> bool {
+    let Some(fetched_at) = candidate.quota_fetched_at else {
+        return false;
+    };
+    if now_unix.saturating_sub(fetched_at) > QUOTA_SNAPSHOT_STALE_SECS {
+        return false;
+    }
+    let Some(remaining) = candidate.quota_remaining else {
+        return false;
+    };
+    if config.exclude_zero_quota && remaining <= 0.001 {
+        return true;
+    }
+    // used = 1 - remaining; pause when used >= threshold
+    let used = (1.0 - remaining).clamp(0.0, 1.0);
+    if config.quota_auto_pause_5h > 0.0 && used + 1e-9 >= config.quota_auto_pause_5h {
+        // remaining is nearest-window headroom; treat as auto-pause when exhausted enough.
+        // When only one remaining figure is hydrated, both thresholds share it (safe fail-closed near 100%).
+        return true;
+    }
+    if config.quota_auto_pause_7d > 0.0
+        && config.quota_auto_pause_7d < config.quota_auto_pause_5h
+        && used + 1e-9 >= config.quota_auto_pause_7d
+    {
+        return true;
+    }
+    false
 }
 
 fn excluded(id: &str, exclude: &[String]) -> bool {
@@ -78,7 +126,7 @@ pub fn select_account(
                 return None;
             }
             let candidate = find_candidate(candidates, id)?;
-            if !is_base_eligible(candidate, request.now_unix) {
+            if !is_base_eligible(candidate, config, request.now_unix, true) {
                 return None;
             }
             return Some(SelectOutcome {
@@ -98,15 +146,22 @@ pub fn select_account(
             if !excluded(bound_id, &request.exclude_credential_ids) {
                 if let Some(candidate) = find_candidate(candidates, bound_id) {
                     if sticky_eligible(candidate, config, request.now_unix) {
-                        return Some(SelectOutcome {
-                            credential_id: bound_id.to_string(),
-                            layer: SelectionLayer::PreviousResponse,
-                            rebind_previous_response: false,
-                            rebind_session: false,
-                            sticky_escaped: false,
-                        });
+                        if sticky_concurrency_full(candidate) && !config.sticky_wait_enabled {
+                            sticky_escaped = true;
+                        } else {
+                            // Concurrency-full + wait enabled: still return sticky so storage can wait.
+                            return Some(SelectOutcome {
+                                credential_id: bound_id.to_string(),
+                                layer: SelectionLayer::PreviousResponse,
+                                rebind_previous_response: false,
+                                // Bind session onto the same account for prompt-cache continuity.
+                                rebind_session: request.session_key.is_some(),
+                                sticky_escaped: false,
+                            });
+                        }
+                    } else {
+                        sticky_escaped = true;
                     }
-                    sticky_escaped = true;
                 } else {
                     sticky_escaped = true;
                 }
@@ -120,15 +175,29 @@ pub fn select_account(
             if !excluded(bound_id, &request.exclude_credential_ids) {
                 if let Some(candidate) = find_candidate(candidates, bound_id) {
                     if sticky_eligible(candidate, config, request.now_unix) {
-                        return Some(SelectOutcome {
-                            credential_id: bound_id.to_string(),
-                            layer: SelectionLayer::Session,
-                            rebind_previous_response: request.previous_response_id.is_some(),
-                            rebind_session: false,
-                            sticky_escaped,
-                        });
+                        if sticky_concurrency_full(candidate) {
+                            if config.sticky_wait_enabled {
+                                return Some(SelectOutcome {
+                                    credential_id: bound_id.to_string(),
+                                    layer: SelectionLayer::Session,
+                                    rebind_previous_response: request.previous_response_id.is_some(),
+                                    rebind_session: false,
+                                    sticky_escaped,
+                                });
+                            }
+                            sticky_escaped = true;
+                        } else {
+                            return Some(SelectOutcome {
+                                credential_id: bound_id.to_string(),
+                                layer: SelectionLayer::Session,
+                                rebind_previous_response: request.previous_response_id.is_some(),
+                                rebind_session: false,
+                                sticky_escaped,
+                            });
+                        }
+                    } else {
+                        sticky_escaped = true;
                     }
-                    sticky_escaped = true;
                 } else {
                     sticky_escaped = true;
                 }
@@ -141,7 +210,7 @@ pub fn select_account(
         .iter()
         .filter(|item| {
             !excluded(&item.credential_id, &request.exclude_credential_ids)
-                && is_base_eligible(item, request.now_unix)
+                && is_base_eligible(item, config, request.now_unix, true)
         })
         .collect();
     if eligible.is_empty() {
@@ -209,8 +278,8 @@ fn weighted_pick_f64<'a>(
 mod tests {
     use super::*;
     use crate::scheduler::types::{
-        CandidateAccount, PoolSchedulerConfig, RoutingMode, ScheduleState, SelectRequest,
-        SelectionLayer,
+        CandidateAccount, PoolSchedulerConfig, RoutingMode, ScheduleState, ScoreWeights,
+        SelectRequest, SelectionLayer,
     };
 
     fn candidate(id: &str, weight: i64, priority: i64) -> CandidateAccount {
@@ -405,10 +474,77 @@ mod tests {
         poor.quota_remaining = Some(0.05);
         poor.quota_fetched_at = Some(1_700_000_000);
         let candidates = vec![rich, poor];
-        let mut config = PoolSchedulerConfig::default();
-        config.score_weights.quota_headroom = 2.0;
-        config.lb_top_k = 1; // force highest score only
+        // Disable hard exclude so scoring alone decides.
+        let config = PoolSchedulerConfig {
+            exclude_zero_quota: false,
+            quota_auto_pause_5h: 0.0,
+            quota_auto_pause_7d: 0.0,
+            score_weights: ScoreWeights {
+                quota_headroom: 2.0,
+                ..ScoreWeights::default()
+            },
+            lb_top_k: 1, // force highest score only
+            ..PoolSchedulerConfig::default()
+        };
         let outcome = select_account(&candidates, &config, &req(), 0).unwrap();
         assert_eq!(outcome.credential_id, "rich");
+    }
+
+    #[test]
+    fn zero_quota_excluded_by_default() {
+        let mut empty = candidate("empty", 100, 100);
+        empty.quota_remaining = Some(0.0);
+        empty.quota_fetched_at = Some(1_700_000_000);
+        let mut ok = candidate("ok", 1, 0);
+        ok.quota_remaining = Some(0.5);
+        ok.quota_fetched_at = Some(1_700_000_000);
+        let outcome = select_account(
+            &[empty, ok],
+            &PoolSchedulerConfig::default(),
+            &req(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(outcome.credential_id, "ok");
+    }
+
+    #[test]
+    fn sticky_escapes_when_bound_quota_exhausted() {
+        let mut bound = candidate("sticky", 1, 100);
+        bound.quota_remaining = Some(0.0);
+        bound.quota_fetched_at = Some(1_700_000_000);
+        let mut other = candidate("other", 1, 0);
+        other.quota_remaining = Some(0.8);
+        other.quota_fetched_at = Some(1_700_000_000);
+        let mut request = req();
+        request.session_key = Some("sess".into());
+        request.session_binding = Some("sticky".into());
+        let outcome = select_account(
+            &[bound, other],
+            &PoolSchedulerConfig::default(),
+            &request,
+            0,
+        )
+        .unwrap();
+        assert_eq!(outcome.credential_id, "other");
+        assert!(outcome.sticky_escaped);
+    }
+
+    #[test]
+    fn sticky_returns_full_account_when_wait_enabled() {
+        let mut bound = candidate("sticky", 1, 100);
+        bound.active_leases = 1;
+        bound.concurrency_limit = 1;
+        let other = candidate("other", 1, 0);
+        let mut request = req();
+        request.session_key = Some("sess".into());
+        request.session_binding = Some("sticky".into());
+        let config = PoolSchedulerConfig {
+            sticky_wait_enabled: true,
+            ..PoolSchedulerConfig::default()
+        };
+        let outcome = select_account(&[bound, other], &config, &request, 0).unwrap();
+        assert_eq!(outcome.credential_id, "sticky");
+        assert_eq!(outcome.layer, SelectionLayer::Session);
     }
 }

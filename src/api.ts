@@ -34,6 +34,19 @@ const browserFallback: AppSnapshot = {
   publishedModels: 0,
   healthyAccounts: 0,
   attentionItems: ["添加供应商并拉取模型后，才能应用到 Codex。"],
+  desktopVisibility: {
+    ready: false,
+    statusLabel: "待应用",
+    codexHome: "~/.codex",
+    checks: [
+      {
+        id: "chatgpt_auth",
+        label: "ChatGPT 官方登录",
+        ok: false,
+        detail: "浏览器预览无真实 ~/.codex；请用 Tauri 桌面端查看。",
+      },
+    ],
+  },
 };
 
 function isTauriRuntime(): boolean {
@@ -106,6 +119,8 @@ export type DeviceLoginPoll = {
   status: string;
   tokens: DeviceLoginTokens | null;
   message: string | null;
+  /** Present for xAI slow_down responses. */
+  intervalSecs?: number | null;
 };
 
 export type OpenAiLoginComplete = {
@@ -113,6 +128,40 @@ export type OpenAiLoginComplete = {
   modelCount: number;
   modelError: string | null;
 };
+
+/** Browser PKCE start — no secrets. */
+export type BrowserLoginStart = {
+  authUrl: string;
+  redirectUri: string;
+};
+
+/** Event payload from Rust after browser OAuth finishes (no tokens). */
+export type OpenAiOAuthFinishedEvent = {
+  ok: boolean;
+  provider: ProviderSummary | null;
+  modelCount: number;
+  modelError: string | null;
+  message: string | null;
+};
+
+export async function startOpenAiBrowserLogin(name?: string): Promise<BrowserLoginStart> {
+  return invoke<BrowserLoginStart>("start_openai_browser_login", {
+    name: name ?? null,
+  });
+}
+
+export async function cancelOpenAiBrowserLogin(): Promise<void> {
+  return invoke<void>("cancel_openai_browser_login");
+}
+
+/** Manual fallback when localhost redirect is blocked. */
+export async function completeOpenAiOauthCallbackUrl(
+  callbackUrl: string,
+): Promise<OpenAiLoginComplete> {
+  return invoke<OpenAiLoginComplete>("complete_openai_oauth_callback_url", {
+    callbackUrl,
+  });
+}
 
 export async function startOpenAiDeviceLogin(): Promise<DeviceLoginStart> {
   return invoke<DeviceLoginStart>("start_openai_device_login");
@@ -131,6 +180,28 @@ export async function completeOpenAiDeviceLogin(
   name?: string,
 ): Promise<OpenAiLoginComplete> {
   return invoke<OpenAiLoginComplete>("complete_openai_device_login", {
+    tokens,
+    name: name ?? null,
+  });
+}
+
+export async function startXaiDeviceLogin(): Promise<DeviceLoginStart> {
+  return invoke<DeviceLoginStart>("start_xai_device_login");
+}
+
+export async function pollXaiDeviceLogin(deviceCode: string): Promise<DeviceLoginPoll> {
+  return invoke<DeviceLoginPoll>("poll_xai_device_login", { deviceCode });
+}
+
+export async function cancelXaiDeviceLogin(deviceCode: string): Promise<void> {
+  return invoke<void>("cancel_xai_device_login", { deviceCode });
+}
+
+export async function completeXaiDeviceLogin(
+  tokens: DeviceLoginTokens,
+  name?: string,
+): Promise<OpenAiLoginComplete> {
+  return invoke<OpenAiLoginComplete>("complete_xai_device_login", {
     tokens,
     name: name ?? null,
   });

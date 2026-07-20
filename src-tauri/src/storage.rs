@@ -16,8 +16,9 @@ use crate::{
     },
     providers::RouteCatalogPayload,
     scheduler::{
-        select_account, BindingKind, CandidateAccount, PoolSchedulerConfig, RoutingMode,
-        ScheduleState, SelectOutcome, SelectRequest, SelectionLayer,
+        select_account, sticky_concurrency_full, BindingKind, CandidateAccount,
+        PoolSchedulerConfig, RoutingMode, ScheduleState, SelectOutcome, SelectRequest,
+        SelectionLayer,
     },
     vault::EncryptedSecret,
 };
@@ -26,6 +27,8 @@ use crate::{
 pub struct StoredRoute {
     pub id: String,
     pub provider_id: String,
+    /// User-facing provider instance name from `providers.name`.
+    pub provider_name: String,
     pub kind: String,
     pub upstream_model: String,
     pub display_name: String,
@@ -33,6 +36,8 @@ pub struct StoredRoute {
     pub catalog_json: String,
     pub protocol: String,
     pub base_url: String,
+    /// Provider entry channel (`official` / `api` / `json`); used for xAI base resolution.
+    pub entry_category: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +92,8 @@ impl Storage {
         sqlx::migrate!("./migrations").run(&pool).await?;
         let storage = Self { pool, path };
         storage.normalize_provider_kinds().await?;
+        storage.normalize_credential_kinds().await?;
+        storage.normalize_entry_categories().await?;
         storage.cleanup_empty_seed_providers().await?;
         Ok(storage)
     }
@@ -97,6 +104,102 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Fix serde snake_case mangling: `OAuth` → `o_auth`, `ChatGptWebSession` → `chat_gpt_web_session`.
+    /// Counts for entry-category badges filter on `oauth` / `chatgpt_web_session`.
+    async fn normalize_credential_kinds(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE credentials SET kind = 'oauth' WHERE kind = 'o_auth'")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "UPDATE credentials SET kind = 'chatgpt_web_session' WHERE kind = 'chat_gpt_web_session'",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Repair entry_category stamps after credential-kind / import path bugs.
+    /// Multi-account oauth rows stamped `official` are JSON file imports (browser login is single-account).
+    async fn normalize_entry_categories(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE providers SET entry_category = 'json'
+             WHERE entry_category IN ('pool', 'config')",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE providers SET entry_category = 'json'
+             WHERE entry_category = 'official'
+               AND (
+                 SELECT COUNT(*) FROM credentials c
+                 WHERE c.provider_id = providers.id
+                   AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')
+               ) >= 2",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Browser official login with a single oauth row and null stamp → official.
+        sqlx::query(
+            "UPDATE providers SET entry_category = 'official'
+             WHERE (entry_category IS NULL OR entry_category = '')
+               AND kind IN ('openai', 'xai')
+               AND (
+                 SELECT COUNT(*) FROM credentials c
+                 WHERE c.provider_id = providers.id
+                   AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')
+               ) = 1
+               AND (
+                 SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id
+               ) = 1
+               AND (
+                 SELECT COUNT(*) FROM credentials c
+                 WHERE c.provider_id = providers.id AND c.kind = 'api_key'
+               ) = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Grok OAuth subscription must hit the CLI chat proxy, not api.x.ai.
+        // Rewrite official/legacy official-host rows so live routes pick up the fix.
+        self.migrate_xai_subscription_bases().await?;
+        Ok(())
+    }
+
+    /// Move Grok official/OAuth instances from `api.x.ai` onto the CLI subscription base.
+    /// Custom hosts are left alone. Returns how many providers were updated.
+    pub async fn migrate_xai_subscription_bases(&self) -> Result<u64, sqlx::Error> {
+        let cli = crate::providers::XAI_CLI_SUBSCRIPTION_BASE;
+        let result = sqlx::query(
+            "UPDATE providers SET base_url = ?
+             WHERE kind = 'xai'
+               AND (
+                 entry_category = 'official'
+                 OR entry_category = 'subscription'
+                 OR entry_category = 'oauth'
+                 OR (
+                   (entry_category IS NULL OR entry_category = '')
+                   AND EXISTS (
+                     SELECT 1 FROM credentials c
+                     WHERE c.provider_id = providers.id
+                       AND c.kind IN ('oauth', 'o_auth')
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM credentials c
+                     WHERE c.provider_id = providers.id AND c.kind = 'api_key'
+                   )
+                 )
+               )
+               AND (
+                 base_url IS NULL
+                 OR base_url = ''
+                 OR base_url LIKE '%api.x.ai%'
+               )",
+        )
+        .bind(cli)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Remove legacy empty seed rows (id == kind, never configured, no credentials/routes).
@@ -121,6 +224,38 @@ impl Storage {
         } else {
             kind
         };
+        let base_url: Option<String> = row.get("base_url");
+        let credential_count = row.get::<i64, _>("credential_count") as u32;
+        let stored_category: Option<String> = row
+            .try_get::<Option<String>, _>("entry_category")
+            .unwrap_or(None)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| match value.as_str() {
+                // Legacy stamps: account-pool import / provider-config import → JSON.
+                "pool" | "config" => "json".to_string(),
+                other => other.to_string(),
+            });
+        let api_key_count = row
+            .try_get::<i64, _>("api_key_count")
+            .unwrap_or(0) as u32;
+        let oauth_count = row
+            .try_get::<i64, _>("oauth_count")
+            .unwrap_or(0) as u32;
+        // Browser official login only ever writes one account. Multi-account rows
+        // stamped "official" are almost always a prior JSON import mis-classified
+        // when discover rewrote the channel after an empty base_url fetch.
+        let stored_category = match stored_category.as_deref() {
+            Some("official")
+                if oauth_count >= 2
+                    || (oauth_count >= 1 && credential_count >= 2 && api_key_count == 0) =>
+            {
+                Some("json".to_string())
+            }
+            _ => stored_category,
+        };
+        let entry_category = stored_category.or_else(|| {
+            infer_entry_category(&kind, base_url.as_deref(), credential_count, api_key_count, oauth_count)
+        });
         ProviderSummary {
             id: row.get("id"),
             kind: kind.clone(),
@@ -131,10 +266,10 @@ impl Storage {
             selected_models: row.get::<i64, _>("selected_models") as u32,
             discovered_models: row.get::<i64, _>("discovered_models") as u32,
             last_fetched_at: row.get("last_fetched_at"),
-            base_url: row.get("base_url"),
+            base_url,
             default_base_url: crate::providers::default_base_url_for_kind(&kind),
-            supports_official_account: kind == "openai",
-            credential_count: row.get::<i64, _>("credential_count") as u32,
+            supports_official_account: kind == "openai" || kind == "xai",
+            credential_count,
             healthy_credential_count: row.get::<i64, _>("healthy_credential_count") as u32,
             pool_count: row.get::<i64, _>("pool_count") as u32,
             active_pool_id: row.get("active_pool_id"),
@@ -144,17 +279,20 @@ impl Storage {
             fixed_credential_id: row
                 .try_get::<Option<String>, _>("fixed_credential_id")
                 .unwrap_or(None),
+            entry_category,
         }
     }
 
     pub async fn list_providers(&self) -> Result<Vec<ProviderSummary>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id,
+            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id, entry_category,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id) AS credential_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
-                (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count
+                (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count,
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind = 'api_key') AS api_key_count,
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')) AS oauth_count
              FROM providers
-             ORDER BY CASE kind WHEN 'openai' THEN 0 WHEN 'kimi' THEN 1 WHEN 'deepseek' THEN 2 WHEN 'minimax' THEN 3 ELSE 4 END, name, id",
+             ORDER BY CASE kind WHEN 'openai' THEN 0 WHEN 'xai' THEN 1 WHEN 'kimi' THEN 2 WHEN 'deepseek' THEN 3 WHEN 'minimax' THEN 4 ELSE 5 END, name, id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -163,16 +301,31 @@ impl Storage {
 
     pub async fn get_provider(&self, provider_id: &str) -> Result<Option<ProviderSummary>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id,
+            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id, entry_category,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id) AS credential_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
-                (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count
+                (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count,
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind = 'api_key') AS api_key_count,
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')) AS oauth_count
              FROM providers WHERE id = ?",
         )
         .bind(provider_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(Self::map_provider_row))
+    }
+
+    pub async fn set_provider_entry_category(
+        &self,
+        provider_id: &str,
+        category: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE providers SET entry_category = ? WHERE id = ?")
+            .bind(category)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn create_provider_instance(
@@ -294,9 +447,9 @@ impl Storage {
 
     pub async fn list_routes(&self, enabled_only: bool) -> Result<Vec<StoredRoute>, sqlx::Error> {
         let query = if enabled_only {
-            "SELECT mr.id, mr.provider_id, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
         } else {
-            "SELECT mr.id, mr.provider_id, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
         };
         let rows = sqlx::query(query).fetch_all(&self.pool).await?;
         Ok(rows
@@ -304,6 +457,7 @@ impl Storage {
             .map(|row| StoredRoute {
                 id: row.get("id"),
                 provider_id: row.get("provider_id"),
+                provider_name: row.get("provider_name"),
                 kind: row.get("kind"),
                 upstream_model: row.get("upstream_model"),
                 display_name: row.get("display_name"),
@@ -311,6 +465,7 @@ impl Storage {
                 catalog_json: row.get("catalog_json"),
                 protocol: row.get("protocol"),
                 base_url: row.get("base_url"),
+                entry_category: row.try_get("entry_category").ok().flatten(),
             })
             .collect())
     }
@@ -456,7 +611,7 @@ impl Storage {
         )
         .bind(id)
         .bind(&credential.provider_id)
-        .bind(serde_json::to_string(&credential.kind).unwrap_or_else(|_| "\"api_key\"".into()).trim_matches('"'))
+        .bind(credential.kind.as_db_str())
         .bind(serde_json::to_string(&credential.state).unwrap_or_else(|_| "\"unknown\"".into()).trim_matches('"'))
         .bind(&credential.label)
         .bind(&credential.email)
@@ -485,31 +640,56 @@ impl Storage {
         let rows = request.fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
-            .map(|row| CredentialSummary {
-                id: row.get("id"),
-                provider_id: row.get("provider_id"),
-                kind: row.get("kind"),
-                state: row.get("state"),
-                label: row.get("label"),
-                masked_email: row
-                    .get::<Option<String>, _>("email")
-                    .as_deref()
-                    .map(mask_identity),
-                masked_account_id: row
-                    .get::<Option<String>, _>("account_id")
-                    .as_deref()
-                    .map(mask_identity),
-                expires_at: row.get("expires_at"),
-                fingerprint_prefix: row
-                    .get::<String, _>("fingerprint")
-                    .chars()
-                    .take(12)
-                    .collect(),
-                refreshable: row.get::<i64, _>("refreshable") != 0,
-                healthy: row.get::<i64, _>("healthy") != 0,
-                last_error: row.get("last_error"),
-            })
+            .map(|row| Self::map_credential_summary(row))
             .collect())
+    }
+
+    /// Credentials whose parent provider instance has the given `providers.kind` (e.g. `"openai"`).
+    pub async fn list_credentials_for_kind(
+        &self,
+        kind: &str,
+    ) -> Result<Vec<CredentialSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.provider_id, c.kind, c.state, c.label, c.email, c.account_id, c.expires_at, c.fingerprint, c.refreshable, c.healthy, c.last_error
+             FROM credentials c
+             INNER JOIN providers p ON p.id = c.provider_id
+             WHERE p.kind = ?
+             ORDER BY c.created_at DESC",
+        )
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| Self::map_credential_summary(row))
+            .collect())
+    }
+
+    fn map_credential_summary(row: sqlx::sqlite::SqliteRow) -> CredentialSummary {
+        CredentialSummary {
+            id: row.get("id"),
+            provider_id: row.get("provider_id"),
+            kind: row.get("kind"),
+            state: row.get("state"),
+            label: row.get("label"),
+            masked_email: row
+                .get::<Option<String>, _>("email")
+                .as_deref()
+                .map(mask_identity),
+            masked_account_id: row
+                .get::<Option<String>, _>("account_id")
+                .as_deref()
+                .map(mask_identity),
+            expires_at: row.get("expires_at"),
+            fingerprint_prefix: row
+                .get::<String, _>("fingerprint")
+                .chars()
+                .take(12)
+                .collect(),
+            refreshable: row.get::<i64, _>("refreshable") != 0,
+            healthy: row.get::<i64, _>("healthy") != 0,
+            last_error: row.get("last_error"),
+        }
     }
 
     pub async fn first_healthy_credential(
@@ -548,6 +728,27 @@ impl Storage {
             })
         })
         .transpose()
+    }
+
+    /// Replace encrypted secret payload and optional expiry after OAuth refresh.
+    pub async fn update_credential_secret(
+        &self,
+        id: &str,
+        envelope_json: &str,
+        expires_at: Option<i64>,
+        account_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE credentials SET secret_envelope_json = ?, expires_at = COALESCE(?, expires_at),
+             account_id = COALESCE(?, account_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(envelope_json)
+        .bind(expires_at)
+        .bind(account_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn ensure_default_pool(&self, provider_id: &str) -> Result<String, sqlx::Error> {
@@ -1013,7 +1214,7 @@ impl Storage {
             return Ok(None);
         }
 
-        let request = SelectRequest {
+        let mut request = SelectRequest {
             routing: routing_mode,
             fixed_credential_id: fixed_id,
             previous_response_id: previous_response_id.map(str::to_string),
@@ -1026,12 +1227,141 @@ impl Storage {
 
         let seed = uuid::Uuid::new_v4();
         let seed_u64 = u64::from_le_bytes(seed.as_bytes()[..8].try_into().unwrap_or([0; 8]));
-        let Some(outcome) = select_account(&candidates, &config, &request, seed_u64) else {
+        let Some(mut outcome) = select_account(&candidates, &config, &request, seed_u64) else {
             return Ok(None);
         };
 
-        self.finalize_selection(&pool_id, &config, previous_response_id, session_key, &outcome, now_unix)
+        // Sticky concurrency wait: prefer waiting for the same account (cache hit) over switching.
+        if matches!(
+            outcome.layer,
+            SelectionLayer::PreviousResponse | SelectionLayer::Session
+        ) && config.sticky_wait_enabled
+            && config.sticky_wait_timeout_secs > 0
+        {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|c| c.credential_id == outcome.credential_id)
+            {
+                if sticky_concurrency_full(candidate) {
+                    let waited = self
+                        .wait_for_credential_slot(
+                            &outcome.credential_id,
+                            config.sticky_wait_timeout_secs,
+                        )
+                        .await?;
+                    // Refresh lease counts after wait.
+                    candidates = self.load_pool_candidates(&pool_id).await?;
+                    self.hydrate_quota_fields(&mut candidates).await?;
+                    request.now_unix = Self::now_unix();
+                    if !waited {
+                        // Timed out: exclude sticky account from load-balance reselect.
+                        if !request
+                            .exclude_credential_ids
+                            .iter()
+                            .any(|id| id == &outcome.credential_id)
+                        {
+                            request
+                                .exclude_credential_ids
+                                .push(outcome.credential_id.clone());
+                        }
+                        // Clear sticky bindings so we do not re-pick the full account.
+                        request.previous_response_binding = None;
+                        request.session_binding = None;
+                        let reseed = uuid::Uuid::new_v4();
+                        let reseed_u64 =
+                            u64::from_le_bytes(reseed.as_bytes()[..8].try_into().unwrap_or([0; 8]));
+                        let Some(next) =
+                            select_account(&candidates, &config, &request, reseed_u64)
+                        else {
+                            return Ok(None);
+                        };
+                        outcome = next;
+                    } else if let Some(refreshed) = candidates
+                        .iter()
+                        .find(|c| c.credential_id == outcome.credential_id)
+                    {
+                        if sticky_concurrency_full(refreshed) {
+                            // Slot still full (race); fall through to reselect without sticky.
+                            request.previous_response_binding = None;
+                            request.session_binding = None;
+                            if !request
+                                .exclude_credential_ids
+                                .iter()
+                                .any(|id| id == &outcome.credential_id)
+                            {
+                                request
+                                    .exclude_credential_ids
+                                    .push(outcome.credential_id.clone());
+                            }
+                            let reseed = uuid::Uuid::new_v4();
+                            let reseed_u64 = u64::from_le_bytes(
+                                reseed.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+                            );
+                            let Some(next) =
+                                select_account(&candidates, &config, &request, reseed_u64)
+                            else {
+                                return Ok(None);
+                            };
+                            outcome = next;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.finalize_selection(
+            &pool_id,
+            &config,
+            previous_response_id,
+            session_key,
+            &outcome,
+            Self::now_unix(),
+        )
+        .await
+    }
+
+    /// Wait until `credential_id` has a free concurrency slot, or timeout.
+    /// Returns true if a slot appeared before timeout.
+    async fn wait_for_credential_slot(
+        &self,
+        credential_id: &str,
+        timeout_secs: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(timeout_secs.max(0) as u64);
+        loop {
+            // Expire stale leases so crashes don't block sticky wait forever.
+            sqlx::query(
+                "UPDATE account_leases SET released_at = CURRENT_TIMESTAMP
+                 WHERE released_at IS NULL AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP",
+            )
+            .execute(&self.pool)
+            .await?;
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM account_leases
+                 WHERE credential_id = ?
+                   AND released_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)",
+            )
+            .bind(credential_id)
+            .fetch_one(&self.pool)
+            .await?;
+            let limit: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(concurrency_limit), 1) FROM pool_members WHERE credential_id = ? AND enabled = 1",
+            )
+            .bind(credential_id)
+            .fetch_one(&self.pool)
             .await
+            .unwrap_or(1)
+            .max(1);
+            if active < limit {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     async fn acquire_direct_lease(
@@ -1223,11 +1553,28 @@ impl Storage {
     ) -> Result<(), sqlx::Error> {
         let secs = retry_after_secs.unwrap_or(cooldown_secs).max(1);
         let until = Self::now_unix() + secs;
+        self.apply_rate_limit_until(credential_id, until, "上游限流 (429)")
+            .await
+    }
+
+    /// Persist an absolute cooldown deadline (unix seconds).
+    pub async fn apply_rate_limit_until(
+        &self,
+        credential_id: &str,
+        cooldown_until: i64,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        let until = cooldown_until.max(Self::now_unix() + 1);
+        let summary = if reason.chars().count() > 120 {
+            format!("{}…", reason.chars().take(119).collect::<String>())
+        } else {
+            reason.to_string()
+        };
         self.mark_schedule_state(
             credential_id,
             ScheduleState::RateLimited,
             true,
-            Some("上游限流 (429)"),
+            Some(&summary),
             Some(until),
         )
         .await
@@ -1618,6 +1965,7 @@ impl Storage {
                 Ok(ModelRouteSummary {
                     id: route.id,
                     provider_id: route.provider_id,
+                    provider_name: route.provider_name,
                     upstream_model: route.upstream_model,
                     display_name: route.display_name,
                     enabled: route.enabled,
@@ -1668,4 +2016,140 @@ fn chrono_like_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs() as i64)
         .unwrap_or_default()
+}
+
+/// Best-effort entry channel when `providers.entry_category` is unset (legacy rows).
+/// Does not write back — only used for Overview badges.
+///
+/// Three user-facing categories:
+/// - `official` — browser OAuth login
+/// - `json` — imported credentials/config JSON file
+/// - `api` — form-filled API key
+pub(crate) fn infer_entry_category(
+    kind: &str,
+    base_url: Option<&str>,
+    credential_count: u32,
+    api_key_count: u32,
+    oauth_count: u32,
+) -> Option<String> {
+    let base = base_url.unwrap_or("");
+    let has_chatgpt = base.contains("chatgpt.com");
+    let has_api_openai = base.contains("api.openai.com");
+    let has_api_xai = base.contains("api.x.ai");
+    let has_cli_xai = base.contains("cli-chat-proxy.grok.com");
+
+    // Pure API-key credentials → API (form key path; cannot distinguish JSON config
+    // without a stored stamp — writers set `json` for file imports).
+    if credential_count > 0 && api_key_count > 0 && oauth_count == 0 {
+        return Some("api".into());
+    }
+    if has_api_openai
+        || (kind == "xai" && has_api_xai && !has_cli_xai && oauth_count == 0 && api_key_count > 0)
+    {
+        return Some("api".into());
+    }
+    // Multi-account oauth/session without stored stamp → almost always a JSON import.
+    if oauth_count >= 2 || (oauth_count >= 1 && credential_count >= 2 && api_key_count == 0) {
+        return Some("json".into());
+    }
+    // Single oauth + ChatGPT backend is the common browser-login footprint.
+    // Single oauth without chatgpt base is treated as JSON (file import of tokens).
+    if has_chatgpt && oauth_count == 1 && credential_count <= 1 && api_key_count == 0 {
+        return Some("official".into());
+    }
+    if kind == "xai"
+        && oauth_count == 1
+        && credential_count <= 1
+        && api_key_count == 0
+        && (has_api_xai || has_cli_xai || base.is_empty())
+    {
+        return Some("official".into());
+    }
+    if oauth_count >= 1 && api_key_count == 0 {
+        return Some("json".into());
+    }
+    // Configured API-style base without chatgpt.
+    if !base.is_empty() && !has_chatgpt && (api_key_count > 0 || credential_count > 0) {
+        return Some("api".into());
+    }
+    // Non-OpenAI/xAI with any credentials → API by default.
+    if kind != "openai" && kind != "xai" && credential_count > 0 {
+        return Some("api".into());
+    }
+    None
+}
+
+#[cfg(test)]
+mod entry_category_tests {
+    use super::infer_entry_category;
+
+    #[test]
+    fn kimi_api_key_is_api() {
+        assert_eq!(
+            infer_entry_category("kimi", Some("https://api.kimi.com"), 1, 1, 0).as_deref(),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn api_key_only_is_api() {
+        assert_eq!(
+            infer_entry_category("openai", Some("https://api.openai.com/v1"), 1, 1, 0).as_deref(),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn single_oauth_chatgpt_is_official() {
+        assert_eq!(
+            infer_entry_category(
+                "openai",
+                Some("https://chatgpt.com/backend-api/codex"),
+                1,
+                0,
+                1
+            )
+            .as_deref(),
+            Some("official")
+        );
+    }
+
+    #[test]
+    fn multi_oauth_is_json() {
+        assert_eq!(
+            infer_entry_category(
+                "openai",
+                Some("https://chatgpt.com/backend-api/codex"),
+                3,
+                0,
+                3
+            )
+            .as_deref(),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn xai_oauth_is_official() {
+        assert_eq!(
+            infer_entry_category("xai", Some("https://api.x.ai/v1"), 1, 0, 1).as_deref(),
+            Some("official")
+        );
+        assert_eq!(
+            infer_entry_category(
+                "xai",
+                Some("https://cli-chat-proxy.grok.com/v1"),
+                1,
+                0,
+                1
+            )
+            .as_deref(),
+            Some("official")
+        );
+    }
+
+    #[test]
+    fn empty_unconfigured_is_none() {
+        assert_eq!(infer_entry_category("openai", None, 0, 0, 0), None);
+    }
 }

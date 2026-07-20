@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use toml_edit::{value, DocumentMut, Item, Table};
 
-use crate::domain::{ApplyPreview, ModelsResponse, ReasoningEffort};
+use crate::domain::{
+    ApplyPreview, DesktopVisibility, DesktopVisibilityCheck, ModelsResponse, ReasoningEffort,
+};
 
 /// Env-aware Codex home (may be hijacked by Orca/Herdr via `CODEX_HOME`).
 /// Prefer [`publish_codex_home`] for ChatGPT GUI integration.
@@ -56,44 +58,314 @@ pub struct LiveBinding {
     pub attention: Vec<String>,
 }
 
+/// Error text when Apply would publish custom models the Desktop GUI will hide.
+pub const DESKTOP_AUTH_REQUIRED_MSG: &str = "未检测到有效的 ChatGPT 官方登录（~/.codex/auth.json）。Desktop 会隐藏 Kimi/DeepSeek 等自定义模型，只显示官方 GPT-5.6。请先在 ChatGPT.app 登录官方账号（不是 Codex Spur 的 API Key / 浏览器 OAuth），再 Cmd+Q 完全退出后重开，然后重新 Review & Apply。Spur 不会改写 auth.json。";
+
+/// Top-level Codex config key that gates Desktop's hosted web_search tool.
+/// Aligns with CC Switch: some native `/responses` gateways hard-400 on that tool.
+pub const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
+/// Sentinel value we own. Only remove `web_search` when its value equals this string.
+pub const CODEX_WEB_SEARCH_DISABLED: &str = "disabled";
+
+/// Model-label / slug brand markers for gateways that reject hosted `web_search`.
+/// Blacklist (default-on): unknown brands keep Codex default. Matched against
+/// catalog display_name / description / slug (proxy base is always localhost).
+const CODEX_WEB_SEARCH_REJECT_MARKERS: &[&str] = &[
+    "minimax",
+    "mimo",
+    "longcat",
+    "qwen3-coder",
+    "xiaomimimo",
+    "minimaxi",
+];
+
+/// True when any published catalog row looks like a gateway that rejects web_search.
+pub fn catalog_rejects_web_search(catalog: &ModelsResponse) -> bool {
+    catalog.models.iter().any(|model| {
+        let hay = format!(
+            "{} {} {}",
+            model.slug,
+            model.display_name,
+            model.description.as_deref().unwrap_or("")
+        )
+        .to_ascii_lowercase();
+        CODEX_WEB_SEARCH_REJECT_MARKERS
+            .iter()
+            .any(|marker| hay.contains(marker))
+    })
+}
+
+/// Set or clear the Spur-owned `web_search = "disabled"` sentinel on a TOML document.
+fn apply_web_search_sentinel(document: &mut DocumentMut, disable: bool) {
+    if disable {
+        document[CODEX_WEB_SEARCH_FIELD] = value(CODEX_WEB_SEARCH_DISABLED);
+        return;
+    }
+    let is_our_sentinel = document
+        .get(CODEX_WEB_SEARCH_FIELD)
+        .and_then(|item| item.as_str())
+        == Some(CODEX_WEB_SEARCH_DISABLED);
+    if is_our_sentinel {
+        document.as_table_mut().remove(CODEX_WEB_SEARCH_FIELD);
+    }
+}
+
+/// True when any catalog row is a non-native Desktop slug (Kimi/DeepSeek/spur-route-…).
+/// Official-only gpt-5.6-* catalogs may still publish without ChatGPT login.
+pub fn catalog_requires_chatgpt_auth(catalog: &ModelsResponse) -> bool {
+    catalog
+        .models
+        .iter()
+        .any(|model| !crate::providers::is_desktop_native_model_slug(&model.slug))
+}
+
 pub fn inspect_live_binding() -> LiveBinding {
+    inspect_live_binding_with_proxy(None, None)
+}
+
+pub fn inspect_live_binding_with_proxy(
+    proxy_running: Option<bool>,
+    proxy_base_url: Option<&str>,
+) -> LiveBinding {
+    let visibility = inspect_desktop_visibility(proxy_running, proxy_base_url);
+    let home = PathBuf::from(&visibility.codex_home);
+    let catalog_path = catalog_path_for(&home);
+    let state = binding_state_from_visibility(&visibility);
+    let attention = attention_from_desktop_visibility(&visibility);
+
+    // CODEX_HOME isolation (Orca/Herdr) is informational only when we already publish
+    // to the real ~/.codex path ChatGPT reads.
+    let _ = env_codex_home_diverges(&home);
+
+    LiveBinding {
+        state,
+        codex_home: home,
+        provider_id: "codex_select".into(),
+        catalog_path,
+        attention,
+    }
+}
+
+/// Structured Desktop model-picker readiness (Nice Switch “preserve official login” gate).
+///
+/// `proxy_running` / `proxy_base_url` come from the Spur runtime; pass `None` when unknown.
+pub fn inspect_desktop_visibility(
+    proxy_running: Option<bool>,
+    proxy_base_url: Option<&str>,
+) -> DesktopVisibility {
     let home = publish_codex_home();
     let catalog_path = catalog_path_for(&home);
     let config_path = config_path_for(&home);
-    let mut attention = Vec::new();
+    let mut checks = Vec::new();
 
-    // CODEX_HOME isolation (Orca/Herdr) is informational only when we already publish
-    // to the real ~/.codex path ChatGPT reads. Do not put it in "需要处理" — it does
-    // not block routing and confuses users after a successful apply.
-    let _ = env_codex_home_diverges(&home);
+    // 1) ChatGPT Desktop identity (auth.json) — required for custom catalog rows in GUI.
+    let auth_status = chatgpt_auth_status(&home);
+    let auth_ok = auth_status == AuthStatus::Ok;
+    checks.push(DesktopVisibilityCheck {
+        id: "chatgpt_auth".into(),
+        label: "ChatGPT 官方登录".into(),
+        ok: auth_ok,
+        detail: match auth_status {
+            AuthStatus::Ok => "~/.codex/auth.json 有效（Desktop 身份门控）".into(),
+            AuthStatus::Missing => {
+                "缺少 auth.json。请在 ChatGPT.app 登录官方账号，不是 Spur 的 API Key / OAuth".into()
+            }
+            AuthStatus::Unreadable => "auth.json 无法解析或缺少 tokens".into(),
+        },
+    });
 
-    if !chatgpt_auth_present(&home) {
-        attention.push(
-            "未检测到有效的 ChatGPT 官方登录（~/.codex/auth.json）。Desktop 会隐藏 Kimi/DeepSeek 等自定义模型，只显示官方 GPT-5.6。请在 ChatGPT 中登录一次官方账号，再 Cmd+Q 完全退出后重开。"
-                .into(),
-        );
+    // 2–3) Parse config for provider gate + binding.
+    let config_raw = fs::read_to_string(&config_path).ok();
+    let document = config_raw
+        .as_deref()
+        .and_then(|raw| raw.parse::<DocumentMut>().ok());
+
+    let provider = document
+        .as_ref()
+        .and_then(|doc| doc.get("model_provider"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    let catalog_ref = document
+        .as_ref()
+        .and_then(|doc| doc.get("model_catalog_json"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+
+    let select_table = document
+        .as_ref()
+        .and_then(|doc| doc.get("model_providers"))
+        .and_then(|item| item.get("codex_select"));
+    let gate_name_ok = select_table
+        .and_then(|item| item.get("name"))
+        .and_then(|item| item.as_str())
+        == Some("OpenAI");
+    let gate_auth_ok = select_table
+        .and_then(|item| item.get("requires_openai_auth"))
+        .and_then(|item| item.as_bool())
+        == Some(true);
+    let catalog_path_ok = {
+        let expected = catalog_path.display().to_string();
+        catalog_ref == expected
+            || (Path::new(catalog_ref)
+                .file_name()
+                .is_some_and(|name| name == "model-catalog.json")
+                && catalog_ref.contains("codex-select"))
+    };
+    let applied = provider == "codex_select" && catalog_path_ok && catalog_path.exists();
+    let provider_gate_ok = applied && gate_name_ok && gate_auth_ok;
+
+    let gate_detail = if !applied {
+        if provider == "custom" || catalog_ref.contains("cc-switch") {
+            "仍绑定 CC Switch（custom）；请 Review & Apply 到 codex_select".into()
+        } else if provider.is_empty() {
+            "尚未应用 codex_select provider".into()
+        } else {
+            format!("当前 model_provider = \"{provider}\"，尚未切换到 codex_select")
+        }
+    } else if !gate_name_ok || !gate_auth_ok {
+        "门控被改坏：需要 name = \"OpenAI\" 且 requires_openai_auth = true；请重新 Apply".into()
+    } else {
+        "name = OpenAI + requires_openai_auth = true".into()
+    };
+    checks.push(DesktopVisibilityCheck {
+        id: "provider_gate".into(),
+        label: "Provider 门控".into(),
+        ok: provider_gate_ok,
+        detail: gate_detail,
+    });
+
+    // 4) Catalog on disk shape.
+    let (catalog_ok, catalog_detail) = match fs::read_to_string(&catalog_path) {
+        Err(_) if !applied => (false, "尚未写入 model-catalog.json".into()),
+        Err(_) => (false, format!("无法读取 {}", catalog_path.display())),
+        Ok(raw) => {
+            if raw.contains("\"displayName\"")
+                || raw.contains("\"supportedReasoningLevels\"")
+                || raw.contains("\"experimentalSupportedTools\"")
+            {
+                (
+                    false,
+                    "catalog 含 camelCase 字段，Desktop 会 Invalid configuration".into(),
+                )
+            } else if !raw.contains("\"experimental_supported_tools\"") {
+                (
+                    false,
+                    "catalog 缺少 experimental_supported_tools（Codex 硬依赖）".into(),
+                )
+            } else {
+                match serde_json::from_str::<ModelsResponse>(&raw) {
+                    Ok(parsed) => match crate::catalog::validate_catalog(&parsed) {
+                        Ok(()) => (
+                            true,
+                            format!("{} 个模型，形状合法", parsed.models.len()),
+                        ),
+                        Err(error) => (false, format!("catalog 校验失败：{error}")),
+                    },
+                    Err(error) => (false, format!("catalog JSON 无法解析：{error}")),
+                }
+            }
+        }
+    };
+    checks.push(DesktopVisibilityCheck {
+        id: "catalog".into(),
+        label: "Catalog 形状".into(),
+        ok: catalog_ok,
+        detail: catalog_detail,
+    });
+
+    // 5) Local proxy.
+    let config_base = select_table
+        .and_then(|item| item.get("base_url"))
+        .and_then(|item| item.as_str());
+    let proxy_ok = match proxy_running {
+        Some(true) => {
+            if let (Some(expected), Some(actual)) = (config_base, proxy_base_url) {
+                expected == actual || actual.starts_with("http://127.0.0.1:")
+            } else {
+                true
+            }
+        }
+        Some(false) => false,
+        None => config_base.is_some_and(|url| url.contains("127.0.0.1")),
+    };
+    let proxy_detail = match (proxy_running, config_base, proxy_base_url) {
+        (Some(false), _, _) => "本地代理未运行".into(),
+        (Some(true), Some(expected), Some(actual)) if expected != actual => {
+            format!("代理 {actual} 与 config base_url {expected} 不一致")
+        }
+        (Some(true), _, Some(actual)) => format!("代理运行中 {actual}"),
+        (_, Some(url), _) => format!("config base_url = {url}"),
+        _ => "尚未配置本地代理 base_url".into(),
+    };
+    checks.push(DesktopVisibilityCheck {
+        id: "proxy".into(),
+        label: "本地代理".into(),
+        ok: proxy_ok,
+        detail: proxy_detail,
+    });
+
+    // 6) ChatGPT process (informational for cold start; does not alone define ready).
+    let chatgpt_running = chatgpt_desktop_running();
+    checks.push(DesktopVisibilityCheck {
+        id: "chatgpt_process".into(),
+        label: "冷启动状态".into(),
+        ok: !chatgpt_running,
+        detail: if chatgpt_running {
+            "ChatGPT 仍在运行：catalog 仅冷启动加载，改配置后需 Cmd+Q 完全退出再开".into()
+        } else {
+            "ChatGPT 未在运行；下次打开将加载当前 catalog".into()
+        },
+    });
+
+    // 7) CC Switch conflict.
+    let hooks = hooks_mention_cc_switch(&home);
+    let bound_cc = provider == "custom" || catalog_ref.contains("cc-switch");
+    let cc_ok = !bound_cc;
+    let cc_detail = if bound_cc {
+        "Codex 仍绑定 CC Switch；请 Review & Apply".into()
+    } else if hooks {
+        "SessionStart 仍有 CC Switch 同步脚本；勿再将其设为 current".into()
+    } else {
+        "未检测到 CC Switch 抢占".into()
+    };
+    checks.push(DesktopVisibilityCheck {
+        id: "cc_switch".into(),
+        label: "CC Switch 冲突".into(),
+        ok: cc_ok && !hooks,
+        detail: cc_detail,
+    });
+    // Hooks alone: soft — ok flag already false when hooks; keep ready tolerant if still applied.
+    let cc_blocks_ready = bound_cc;
+
+    let ready = auth_ok && applied && provider_gate_ok && catalog_ok && !cc_blocks_ready;
+    let status_label = if ready {
+        "就绪".into()
+    } else if !auth_ok {
+        "缺登录".into()
+    } else if !applied {
+        "待应用".into()
+    } else {
+        "异常".into()
+    };
+
+    DesktopVisibility {
+        ready,
+        status_label,
+        codex_home: home.display().to_string(),
+        checks,
     }
+}
 
-    let Ok(raw) = fs::read_to_string(&config_path) else {
-        return LiveBinding {
-            state: "not_applied".into(),
-            codex_home: home,
-            provider_id: "codex_select".into(),
-            catalog_path,
-            attention,
-        };
+fn binding_state_from_visibility(visibility: &DesktopVisibility) -> String {
+    let home = PathBuf::from(&visibility.codex_home);
+    let config_path = config_path_for(&home);
+    let catalog_path = catalog_path_for(&home);
+    let Ok(raw) = fs::read_to_string(config_path) else {
+        return "not_applied".into();
     };
     let Ok(document) = raw.parse::<DocumentMut>() else {
-        attention.push("Codex config.toml 无法解析，请先修复配置。".into());
-        return LiveBinding {
-            state: "invalid".into(),
-            codex_home: home,
-            provider_id: "codex_select".into(),
-            catalog_path,
-            attention,
-        };
+        return "invalid".into();
     };
-
     let provider = document
         .get("model_provider")
         .and_then(|item| item.as_str())
@@ -102,64 +374,43 @@ pub fn inspect_live_binding() -> LiveBinding {
         .get("model_catalog_json")
         .and_then(|item| item.as_str())
         .unwrap_or("");
-
     if provider == "codex_select" {
         let expected = catalog_path.display().to_string();
         let catalog_ok = catalog_ref == expected
-            || Path::new(catalog_ref)
+            || (Path::new(catalog_ref)
                 .file_name()
                 .is_some_and(|name| name == "model-catalog.json")
-                && catalog_ref.contains("codex-select");
+                && catalog_ref.contains("codex-select"));
         if catalog_ok && catalog_path.exists() {
-            if hooks_mention_cc_switch(&home) {
-                attention.push(
-                    "SessionStart 仍注册了 CC Switch 同步脚本；若 CC Switch 再次设为 current，可能覆盖 model_provider。"
-                        .into(),
-                );
-            }
-            return LiveBinding {
-                state: "applied".into(),
-                codex_home: home,
-                provider_id: "codex_select".into(),
-                catalog_path,
-                attention,
-            };
+            // Applied even if gate fields were hand-edited wrong (visibility shows 异常).
+            return "applied".into();
         }
-        attention.push("model_provider 已是 codex_select，但 catalog 路径异常。".into());
-        return LiveBinding {
-            state: "invalid".into(),
-            codex_home: home,
-            provider_id: "codex_select".into(),
-            catalog_path,
-            attention,
-        };
+        return "invalid".into();
     }
+    "not_applied".into()
+}
 
-    if provider == "custom" || catalog_ref.contains("cc-switch") {
-        attention.push(
-            "Codex 仍绑定 CC Switch（custom / cc-switch-model-catalog）。模型列表不会显示 Spur/Kimi，请点击 Review & Apply。"
-                .into(),
-        );
-    } else if !provider.is_empty() && provider != "codex_select" {
-        attention.push(format!(
-            "Codex 当前 model_provider = \"{provider}\"，尚未切换到 codex_select。"
-        ));
+/// Free-text attention lines for Overview, derived from structured readiness.
+pub fn attention_from_desktop_visibility(visibility: &DesktopVisibility) -> Vec<String> {
+    let mut attention = Vec::new();
+    for check in &visibility.checks {
+        if check.ok {
+            continue;
+        }
+        // Cold-start is shown in the checklist only; Apply path already toasts Cmd+Q
+        // when ChatGPT is still running. Do not spam 需要处理 while the user is in Codex.
+        if check.id == "chatgpt_process" {
+            continue;
+        }
+        match check.id.as_str() {
+            "chatgpt_auth" => attention.push(DESKTOP_AUTH_REQUIRED_MSG.into()),
+            "provider_gate" | "catalog" | "proxy" | "cc_switch" => {
+                attention.push(format!("{}：{}", check.label, check.detail));
+            }
+            _ => attention.push(check.detail.clone()),
+        }
     }
-
-    if hooks_mention_cc_switch(&home) {
-        attention.push(
-            "SessionStart 仍注册了 CC Switch 同步脚本；应用后若被 CC Switch 抢回，请勿再切换其 current 供应商。"
-                .into(),
-        );
-    }
-
-    LiveBinding {
-        state: "not_applied".into(),
-        codex_home: home,
-        provider_id: "codex_select".into(),
-        catalog_path,
-        attention,
-    }
+    attention
 }
 
 fn env_codex_home_diverges(publish_home: &Path) -> bool {
@@ -169,30 +420,52 @@ fn env_codex_home_diverges(publish_home: &Path) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthStatus {
+    Ok,
+    Missing,
+    Unreadable,
+}
+
 /// True when ~/.codex/auth.json looks like a ChatGPT/Codex OAuth login (not API-key only).
 /// Used for Desktop custom-model visibility diagnostics — never reads token bodies into logs.
 fn chatgpt_auth_present(home: &Path) -> bool {
+    chatgpt_auth_status(home) == AuthStatus::Ok
+}
+
+fn chatgpt_auth_status(home: &Path) -> AuthStatus {
     let path = home.join("auth.json");
     let Ok(raw) = fs::read_to_string(path) else {
-        return false;
+        return AuthStatus::Missing;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
+        return AuthStatus::Unreadable;
     };
     let mode = value
         .get("auth_mode")
         .and_then(|item| item.as_str())
         .unwrap_or("");
     if mode == "chatgpt" || mode == "codex" {
-        return value.get("tokens").is_some();
+        return if value.get("tokens").is_some() {
+            AuthStatus::Ok
+        } else {
+            AuthStatus::Unreadable
+        };
     }
     // Legacy shapes: tokens object with refresh/access is enough for Desktop gating.
-    value
+    let ok = value
         .get("tokens")
         .and_then(|tokens| tokens.as_object())
         .is_some_and(|tokens| {
             tokens.contains_key("access_token") || tokens.contains_key("refresh_token")
-        })
+        });
+    if ok {
+        AuthStatus::Ok
+    } else if value.get("tokens").is_some() {
+        AuthStatus::Unreadable
+    } else {
+        AuthStatus::Missing
+    }
 }
 
 fn hooks_mention_cc_switch(home: &Path) -> bool {
@@ -202,10 +475,11 @@ fn hooks_mention_cc_switch(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn preview(base_url: &str, model_count: u32) -> ApplyPreview {
+pub fn preview(base_url: &str, catalog: &ModelsResponse) -> ApplyPreview {
     let home = publish_codex_home();
     let catalog_path = catalog_path_for(&home);
     let config_path = config_path_for(&home);
+    let model_count = catalog.models.len() as u32;
     let toml_preview = format!(
         r#"model_provider = "codex_select"
 model_catalog_json = "{}"
@@ -223,6 +497,9 @@ supports_websockets = false"#,
     if model_count == 0 {
         warnings.push("当前没有已选择模型，应用会被阻止。".into());
     }
+    if catalog_requires_chatgpt_auth(catalog) && !chatgpt_auth_present(&home) {
+        warnings.push(DESKTOP_AUTH_REQUIRED_MSG.into());
+    }
     if !config_path.exists() {
         warnings.push(format!("尚未找到 Codex 配置：{}", config_path.display()));
     }
@@ -234,7 +511,11 @@ supports_websockets = false"#,
         ));
     }
     let live = inspect_live_binding();
-    warnings.extend(live.attention);
+    for item in live.attention {
+        if !warnings.iter().any(|existing| existing == &item) {
+            warnings.push(item);
+        }
+    }
     ApplyPreview {
         provider_id: "codex_select".into(),
         base_url: base_url.into(),
@@ -267,6 +548,10 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
     let catalog_json = serde_json::to_vec_pretty(catalog)?;
 
     let home = publish_codex_home();
+    // Hard-block: custom catalog rows need ChatGPT Desktop identity or GUI hides them.
+    if catalog_requires_chatgpt_auth(catalog) && !chatgpt_auth_present(&home) {
+        anyhow::bail!("{DESKTOP_AUTH_REQUIRED_MSG}");
+    }
     let mut warnings = Vec::new();
 
     let select_dir = home.join("codex-select");
@@ -361,6 +646,10 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
     select_provider["supports_websockets"] = value(false);
     select_provider["experimental_bearer_token"] = value(bearer_token);
     providers["codex_select"] = Item::Table(select_provider);
+
+    // CC Switch pattern: disable Desktop hosted web_search when any published
+    // model targets a gateway known to 400 on that tool. Only clear our own sentinel.
+    apply_web_search_sentinel(&mut document, catalog_rejects_web_search(catalog));
 
     let config_bytes = document.to_string().into_bytes();
     let write_result = (|| -> Result<()> {
@@ -599,6 +888,15 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Minimal valid ChatGPT Desktop identity for apply hard-block tests (no real secrets).
+    fn write_test_chatgpt_auth(home: &Path) {
+        fs::write(
+            home.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","refresh_token":"test-refresh"}}"#,
+        )
+        .expect("write test auth.json");
+    }
+
     fn sample_model(slug: &str, name: &str) -> CatalogModel {
         CatalogModel {
             slug: slug.into(),
@@ -671,6 +969,7 @@ mod tests {
         ));
         fs::create_dir_all(&publish_dir).expect("publish dir");
         fs::create_dir_all(&orca_dir).expect("orca dir");
+        write_test_chatgpt_auth(&publish_dir);
         // Simulate Orca hijack + test override for publish target.
         std::env::set_var("CODEX_HOME", &orca_dir);
         std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &publish_dir);
@@ -716,6 +1015,53 @@ mod tests {
     }
 
     #[test]
+    fn catalog_rejects_web_search_matches_minimax_labels() {
+        assert!(catalog_rejects_web_search(&ModelsResponse {
+            models: vec![sample_model("spur-route-mm", "MiniMax · abab6.5")],
+        }));
+        assert!(!catalog_rejects_web_search(&ModelsResponse {
+            models: vec![sample_model("spur-route-k3", "Kimi · K3")],
+        }));
+    }
+
+    #[test]
+    fn apply_writes_web_search_disabled_for_minimax_catalog() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-websearch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp home");
+        write_test_chatgpt_auth(&dir);
+        std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
+        let catalog = ModelsResponse {
+            models: vec![sample_model("spur-route-minimax001", "MiniMax · M2")],
+        };
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        let config_raw = fs::read_to_string(dir.join("config.toml")).expect("config");
+        assert!(
+            config_raw.contains("web_search = \"disabled\""),
+            "expected web_search sentinel, got:\n{config_raw}"
+        );
+        // Re-apply with only Kimi: clear our sentinel.
+        let catalog = ModelsResponse {
+            models: vec![sample_model("spur-route-kimi001", "Kimi · K3")],
+        };
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply2");
+        let config_raw = fs::read_to_string(dir.join("config.toml")).expect("config2");
+        assert!(
+            !config_raw.contains("web_search = \"disabled\""),
+            "sentinel should clear when no reject models remain"
+        );
+        std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_writes_snake_case_catalog_and_codex_select_provider() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
@@ -727,6 +1073,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).expect("temp home");
+        write_test_chatgpt_auth(&dir);
         std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
 
         let catalog = ModelsResponse {
@@ -809,6 +1156,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(dir.join("config.toml")).expect("config directory");
+        write_test_chatgpt_auth(&dir);
         std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
         let catalog = ModelsResponse {
             models: vec![sample_model("spur-route-valid", "Kimi · K3")],
@@ -819,6 +1167,110 @@ mod tests {
         assert!(dir.join("config.toml").is_dir());
         assert!(!dir.join("codex-select/model-catalog.json").exists());
 
+        std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_blocks_custom_catalog_without_chatgpt_auth() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-auth-block-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp home");
+        // Intentionally no auth.json
+        std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
+        let catalog = ModelsResponse {
+            models: vec![sample_model("spur-route-kimi001", "Kimi · K2.7")],
+        };
+        let error = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("auth.json") || message.contains("官方登录"),
+            "unexpected: {message}"
+        );
+        assert!(!dir.join("codex-select/model-catalog.json").exists());
+        std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_allows_official_only_catalog_without_auth() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-official-only-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp home");
+        std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
+        let catalog = ModelsResponse {
+            models: vec![sample_model("gpt-5.6-terra", "GPT-5.6-Terra")],
+        };
+        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        assert_eq!(result.model_count, 1);
+        std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_desktop_visibility_reports_missing_auth() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-vis-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp home");
+        std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
+        let visibility = inspect_desktop_visibility(Some(true), Some("http://127.0.0.1:17861/v1"));
+        assert!(!visibility.ready);
+        assert_eq!(visibility.status_label, "缺登录");
+        assert!(visibility
+            .checks
+            .iter()
+            .any(|check| check.id == "chatgpt_auth" && !check.ok));
+        std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_desktop_visibility_ready_after_apply_with_auth() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-vis-ready-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp home");
+        write_test_chatgpt_auth(&dir);
+        std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
+        let catalog = ModelsResponse {
+            models: vec![sample_model("spur-route-kimi001", "Kimi · K2.7")],
+        };
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        let visibility = inspect_desktop_visibility(Some(true), Some("http://127.0.0.1:17861/v1"));
+        assert!(visibility.ready, "{visibility:?}");
+        assert_eq!(visibility.status_label, "就绪");
+        assert!(visibility
+            .checks
+            .iter()
+            .find(|check| check.id == "provider_gate")
+            .is_some_and(|check| check.ok));
         std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
         let _ = fs::remove_dir_all(&dir);
     }

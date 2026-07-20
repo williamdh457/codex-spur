@@ -31,6 +31,7 @@ axum = "0.8"
 brotli = "7"
 directories = "6"
 flate2 = "1"
+futures-util = "0.3"
 hex = "0.4"
 getrandom = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }

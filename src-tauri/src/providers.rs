@@ -61,6 +61,12 @@ pub fn kind_meta(kind: &str) -> Option<(&'static str, &'static str, &'static str
             "Responses preferred",
             Some("https://api.minimaxi.com/v1"),
         )),
+        "xai" => Some((
+            "Grok",
+            "Global",
+            "Responses",
+            Some("https://api.x.ai/v1"),
+        )),
         "custom" => Some(("自定义供应商", "Custom", "OpenAI-compatible", None)),
         _ => None,
     }
@@ -79,6 +85,61 @@ pub fn kind_display_name(kind: &str) -> &'static str {
 /// Codex official catalog requires client_version; keep aligned with gated model min versions.
 pub const CODEX_CLIENT_VERSION: &str = "0.144.1";
 pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
+/// xAI API-key traffic (and kind_meta default for form API setup).
+pub const XAI_API_BASE: &str = "https://api.x.ai/v1";
+/// Grok OAuth / SuperGrok subscription traffic must use the CLI chat proxy.
+/// Tokens from device-code login are rejected or 4xx on `api.x.ai` without CLI identity.
+pub const XAI_CLI_SUBSCRIPTION_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
+/// Stable client version string for CLI-proxy identity headers.
+pub const XAI_CLI_CLIENT_VERSION: &str = "0.2.93";
+pub const XAI_CLI_USER_AGENT: &str = "Codex-Spur-Grok/0.1";
+
+/// True when `base_url` points at an official xAI host that is **not** a user custom gateway.
+/// Empty, `api.x.ai`, and the CLI subscription host all count as "not customized".
+pub fn is_xai_official_host(base_url: &str) -> bool {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        let lower = trimmed.to_ascii_lowercase();
+        return lower.contains("api.x.ai") || lower.contains("cli-chat-proxy.grok.com");
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    host == "api.x.ai" || host == "cli-chat-proxy.grok.com"
+}
+
+/// Resolve the upstream base for an xAI instance.
+///
+/// - **Subscription / OAuth (`official` or `subscription_oauth`)**: CLI proxy when the
+///   stored base is empty or an official host; keep true custom hosts.
+/// - **API key / other**: `api.x.ai` default, or the stored base when set.
+pub fn resolve_xai_upstream_base(entry_category: Option<&str>, stored_base: Option<&str>) -> String {
+    let stored = stored_base.map(str::trim).filter(|s| !s.is_empty());
+    let is_subscription = matches!(
+        entry_category.map(str::to_ascii_lowercase).as_deref(),
+        Some("official") | Some("subscription") | Some("oauth")
+    );
+    if is_subscription {
+        match stored {
+            Some(url) if !is_xai_official_host(url) => url.trim_end_matches('/').to_string(),
+            _ => XAI_CLI_SUBSCRIPTION_BASE.to_string(),
+        }
+    } else {
+        match stored {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => XAI_API_BASE.to_string(),
+        }
+    }
+}
+
+/// True when outbound requests to this base need Grok CLI identity headers.
+pub fn xai_base_needs_cli_headers(base_url: &str) -> bool {
+    base_url
+        .to_ascii_lowercase()
+        .contains("cli-chat-proxy.grok.com")
+}
 
 /// Strict provider-config JSON (user chose this import path — no credential sniffing).
 #[derive(Debug, Clone)]
@@ -276,7 +337,7 @@ pub fn parse_provider_config_json_with_fallback(
         .map_err(|_| anyhow!("不是有效的供应商配置 JSON（需要 JSON 对象或数组）"))?;
     if looks_like_account_json(&value) {
         return Err(anyhow!(
-            "这是账号/auth JSON，不是供应商配置。请改用「OpenAI · 导入账号」或「OpenAI · 官方订阅」登录。"
+            "这是账号/auth JSON，不是供应商配置。请改用「OpenAI · 导入账号 JSON（账号池）」或「OpenAI · 官方订阅（浏览器登录）」。"
         ));
     }
     match &value {
@@ -401,6 +462,55 @@ fn kimi_coding_models() -> Vec<DiscoveredProviderModel> {
     .collect()
 }
 
+/// Curated Grok subscription models when `/v1/models` is empty or incomplete.
+pub fn xai_subscription_models() -> Vec<DiscoveredProviderModel> {
+    [
+        ("grok-build-0.1", "Grok Build 0.1"),
+        ("grok-4.5", "Grok 4.5"),
+        ("grok-4.3", "Grok 4.3"),
+        ("grok-4.20-0309-reasoning", "Grok 4.20 (Reasoning)"),
+    ]
+    .into_iter()
+    .map(|(id, display_name)| DiscoveredProviderModel {
+        id: id.into(),
+        display_name: display_name.into(),
+        owned_by: Some("xAI".into()),
+        created_at: None,
+    })
+    .collect()
+}
+
+/// Prefer live discovery; fall back to the subscription catalog when the list
+/// is empty, unauthorized-for-list, or missing coding models.
+pub async fn discover_xai_models(
+    base_url: &str,
+    access_token: Option<&str>,
+) -> anyhow::Result<Vec<DiscoveredProviderModel>> {
+    match discover_models("xai", base_url, access_token).await {
+        Ok(models) if !models.is_empty() => {
+            let has_coding = models.iter().any(|m| {
+                let id = m.id.to_ascii_lowercase();
+                id.contains("grok-build") || id.contains("grok-4")
+            });
+            if has_coding {
+                Ok(models)
+            } else {
+                // Keep API models and append curated coding models not already present.
+                let mut merged = models;
+                let existing: std::collections::HashSet<String> =
+                    merged.iter().map(|m| m.id.clone()).collect();
+                for extra in xai_subscription_models() {
+                    if !existing.contains(&extra.id) {
+                        merged.push(extra);
+                    }
+                }
+                Ok(merged)
+            }
+        }
+        _ => Ok(xai_subscription_models()),
+    }
+}
+
 pub async fn discover_models(
     provider_id: &str,
     base_url: &str,
@@ -522,6 +632,12 @@ pub fn reasoning_profile(kind: &str, model_id: &str) -> ReasoningProfile {
                 "default", "default", "default", "default", "default", "default", "default",
                 "default",
             ],
+        ),
+        "xai" => (
+            // Grok 4.x exposes low/medium/high; higher Codex rungs clamp to high.
+            // none/minimal still map to low rather than inventing a disable switch.
+            "xAI Grok 三档推理映射",
+            ["low", "low", "low", "medium", "high", "high", "high", "high"],
         ),
         _ => (
             "OpenAI 兼容推理映射",
@@ -748,6 +864,14 @@ pub fn catalog_model(
     } else if kind == "kimi" {
         // Match working Nice Switch Kimi surface windows.
         (Some(262_144), Some(262_144))
+    } else if kind == "xai" {
+        // Grok Build ~256k; Grok 4.5 ~500k — use the larger window so catalog
+        // does not under-advertise; proxy does not enforce this client-side.
+        if model.id.contains("build") {
+            (Some(256_000), Some(256_000))
+        } else {
+            (Some(500_000), Some(500_000))
+        }
     } else {
         (Some(128_000), Some(128_000))
     };
@@ -794,7 +918,7 @@ pub fn catalog_model(
         comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
-        input_modalities: if is_openai_family || kind == "kimi" {
+        input_modalities: if is_openai_family || kind == "kimi" || kind == "xai" {
             vec!["text".into(), "image".into()]
         } else {
             vec!["text".into()]
@@ -914,9 +1038,71 @@ mod tests {
 
     #[test]
     fn every_codex_level_has_a_mapping() {
-        for provider in ["kimi", "deepseek", "minimax", "custom"] {
+        for provider in ["kimi", "deepseek", "minimax", "custom", "xai"] {
             assert_eq!(reasoning_profile(provider, "model").mappings.len(), 8);
         }
+    }
+
+    #[test]
+    fn xai_kind_meta_and_subscription_catalog() {
+        let meta = kind_meta("xai").expect("xai kind");
+        assert_eq!(meta.0, "Grok");
+        assert_eq!(meta.3, Some(XAI_API_BASE));
+        let models = xai_subscription_models();
+        assert!(models.iter().any(|m| m.id == "grok-build-0.1"));
+        assert!(models.iter().any(|m| m.id == "grok-4.5"));
+        let profile = reasoning_profile("xai", "grok-4.5");
+        assert_eq!(profile.mappings.len(), 8);
+        assert_eq!(profile.mappings[4].upstream_effort, "high");
+    }
+
+    #[test]
+    fn xai_subscription_base_resolves_to_cli_proxy() {
+        assert_eq!(
+            resolve_xai_upstream_base(Some("official"), None),
+            XAI_CLI_SUBSCRIPTION_BASE
+        );
+        assert_eq!(
+            resolve_xai_upstream_base(Some("official"), Some(XAI_API_BASE)),
+            XAI_CLI_SUBSCRIPTION_BASE
+        );
+        assert_eq!(
+            resolve_xai_upstream_base(Some("official"), Some("https://api.x.ai/v1/")),
+            XAI_CLI_SUBSCRIPTION_BASE
+        );
+        // Legacy rows that already stored CLI host stay on CLI.
+        assert_eq!(
+            resolve_xai_upstream_base(Some("official"), Some(XAI_CLI_SUBSCRIPTION_BASE)),
+            XAI_CLI_SUBSCRIPTION_BASE
+        );
+        // Explicit custom host is preserved.
+        assert_eq!(
+            resolve_xai_upstream_base(Some("official"), Some("https://my-relay.example/v1")),
+            "https://my-relay.example/v1"
+        );
+    }
+
+    #[test]
+    fn xai_api_key_base_stays_on_api_x_ai() {
+        assert_eq!(
+            resolve_xai_upstream_base(Some("api"), None),
+            XAI_API_BASE
+        );
+        assert_eq!(
+            resolve_xai_upstream_base(Some("api"), Some(XAI_API_BASE)),
+            XAI_API_BASE
+        );
+        assert_eq!(
+            resolve_xai_upstream_base(None, Some("https://custom.x.example/v1")),
+            "https://custom.x.example/v1"
+        );
+    }
+
+    #[test]
+    fn xai_cli_headers_only_for_subscription_host() {
+        assert!(xai_base_needs_cli_headers(XAI_CLI_SUBSCRIPTION_BASE));
+        assert!(!xai_base_needs_cli_headers(XAI_API_BASE));
+        assert!(!xai_base_needs_cli_headers("https://example.com/v1"));
     }
 
     #[test]
@@ -1020,6 +1206,7 @@ mod tests {
             },
         );
         assert_eq!(model.slug, "gpt-5.6-terra");
+        assert_eq!(model.display_name, "OpenAI 2 · GPT-5.6-Terra");
         assert!(model.experimental_supported_tools.is_empty());
         assert!(model.apply_patch_tool_type.is_none());
         assert!(!model.supports_parallel_tool_calls);

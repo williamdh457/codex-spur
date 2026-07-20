@@ -19,6 +19,29 @@ pub struct CodexBindingStatus {
     pub catalog_path: String,
 }
 
+/// One Desktop model-picker readiness check (Overview checklist).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopVisibilityCheck {
+    pub id: String,
+    pub label: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Whether ChatGPT Desktop can show custom catalog rows (Kimi/DeepSeek).
+/// Distinct from Spur vault OAuth — identity lives in `~/.codex/auth.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopVisibility {
+    /// True when auth + applied gate + catalog are healthy (list can show custom after cold start).
+    pub ready: bool,
+    /// Short metric label: 就绪 / 缺登录 / 待应用 / 异常
+    pub status_label: String,
+    pub codex_home: String,
+    pub checks: Vec<DesktopVisibilityCheck>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSummary {
@@ -41,6 +64,9 @@ pub struct ProviderSummary {
     /// `pool` or `fixed` — multi-account routing mode.
     pub routing_mode: String,
     pub fixed_credential_id: Option<String>,
+    /// Primary entry channel for list badges: `official` | `json` | `api`.
+    /// Legacy values `pool` / `config` are normalized to `json` when read.
+    pub entry_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +89,8 @@ pub struct ReasoningProfile {
 pub struct ModelRouteSummary {
     pub id: String,
     pub provider_id: String,
+    /// User-facing provider instance name (`providers.name`).
+    pub provider_name: String,
     pub upstream_model: String,
     pub display_name: String,
     pub enabled: bool,
@@ -206,6 +234,7 @@ pub struct AppSnapshot {
     pub published_models: u32,
     pub healthy_accounts: u32,
     pub attention_items: Vec<String>,
+    pub desktop_visibility: DesktopVisibility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

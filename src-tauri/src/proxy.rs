@@ -27,9 +27,14 @@ use crate::{
     content_encoding::{decode_request_body, get_content_encoding},
     credentials::SecretMaterial,
     domain::ProxyRequestEvent,
+    media_sanitizer,
     providers,
     scheduler::{ScheduleState, SelectionLayer},
     storage::{Lease, Storage, UsageDelta},
+    upstream_errors::{
+        body_is_usage_or_rate_limit, content_session_seed, is_failover_status, now_unix,
+        resolve_rate_limit_cooldown, status_category,
+    },
     vault::SecretVault,
 };
 
@@ -263,9 +268,18 @@ async fn responses(
     if target.protocol.to_ascii_lowercase().contains("chat") {
         // Chat Completions conversion maps reasoning itself; do not pre-mutate
         // reasoning.effort into provider-internal tokens like "disabled"/"enabled".
+        if media_sanitizer::should_strip_images(&target.kind, &target.upstream_model) {
+            media_sanitizer::replace_images_with_marker(&mut parsed);
+        }
         forward_chat_compatible(&state, &target, parsed, &affinity).await
     } else {
         map_reasoning(&target, &mut parsed);
+        // OpenAI kind (官方订阅 / JSON 多账号 / API Key) keeps Codex-native tools.
+        // All other kinds (xAI, MiniMax, custom Responses, …) must be ported.
+        sanitize_responses_request_for_upstream(&target.kind, &mut parsed);
+        if media_sanitizer::should_strip_images(&target.kind, &target.upstream_model) {
+            media_sanitizer::replace_images_with_marker(&mut parsed);
+        }
         forward_responses_compatible(&state, &target, parsed, &affinity).await
     }
 }
@@ -273,7 +287,7 @@ async fn responses(
 async fn forward_responses_compatible(
     state: &ProxyState,
     target: &RouteTarget,
-    request_body: Value,
+    mut request_body: Value,
     affinity: &AffinityInputs,
 ) -> Response {
     let endpoint = endpoint(&target.base_url, &target.kind, "responses");
@@ -284,8 +298,10 @@ async fn forward_responses_compatible(
         .unwrap_or(3)
         .max(1) as usize;
     let mut exclude: Vec<String> = Vec::new();
+    let mut media_retry_used = false;
     let started = std::time::Instant::now();
-    for attempt in 0..max_switches {
+    let mut attempt = 0usize;
+    while attempt < max_switches {
         let mut request = state.client.post(&endpoint).json(&request_body);
         let auth = match upstream_auth(state, &target.provider_id, affinity, &exclude).await {
             Ok(Some(auth)) => {
@@ -298,11 +314,11 @@ async fn forward_responses_compatible(
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                if let Some(auth) = &auth {
+                if let Some(auth) = auth {
                     record_diag(
                         state,
                         target,
-                        auth,
+                        &auth,
                         attempt,
                         "transport",
                         false,
@@ -311,6 +327,11 @@ async fn forward_responses_compatible(
                     )
                     .await;
                     let _ = state.storage.release_lease(&auth.lease_id).await;
+                    attempt += 1;
+                    if attempt < max_switches {
+                        exclude.push(auth.credential_id);
+                        continue;
+                    }
                 }
                 return error_response(
                     StatusCode::BAD_GATEWAY,
@@ -320,33 +341,79 @@ async fn forward_responses_compatible(
             }
         };
         let status = response.status();
-        if is_failover_status(status) && attempt + 1 < max_switches {
-            if let Some(auth) = auth {
-                let category = status_category(status);
-                let cooldown = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-                handle_upstream_failure(
-                    state,
+        let headers = response.headers().clone();
+        if is_failover_status(status) {
+            let Some(auth) = auth else {
+                return passthrough(
+                    response,
+                    &state.metrics,
+                    &state.storage,
                     &target.provider_id,
-                    &auth,
-                    status,
-                    response.headers(),
+                    &target.upstream_model,
                 )
                 .await;
-                record_diag(
-                    state,
-                    target,
-                    &auth,
-                    attempt,
-                    category,
-                    cooldown,
-                    Some(category),
-                    started.elapsed().as_millis() as i64,
-                )
-                .await;
+            };
+            let body_bytes = response.bytes().await.unwrap_or_default();
+            // Text-only gateways often 400 on images; strip once and retry same account.
+            if !media_retry_used
+                && matches!(status.as_u16(), 400 | 415 | 422)
+                && media_sanitizer::is_unsupported_image_error_body(&body_bytes)
+                && media_sanitizer::contains_image_blocks(&request_body)
+            {
+                let stripped = media_sanitizer::replace_images_with_marker(&mut request_body);
+                if stripped > 0 {
+                    media_retry_used = true;
+                    let _ = state.storage.release_lease(&auth.lease_id).await;
+                    continue;
+                }
+            }
+            let category = status_category(status);
+            let cooldown_applied = handle_upstream_failure(
+                state,
+                &target.provider_id,
+                &auth,
+                status,
+                &headers,
+                Some(body_bytes.as_ref()),
+            )
+            .await;
+            let summary = summarize_upstream_error_body(&body_bytes)
+                .unwrap_or_else(|| category.to_string());
+            record_diag(
+                state,
+                target,
+                &auth,
+                attempt,
+                category,
+                cooldown_applied,
+                Some(&summary),
+                started.elapsed().as_millis() as i64,
+            )
+            .await;
+            let _ = state.storage.release_lease(&auth.lease_id).await;
+            attempt += 1;
+            if attempt < max_switches {
                 exclude.push(auth.credential_id);
-                let _ = state.storage.release_lease(&auth.lease_id).await;
                 continue;
             }
+            // Last attempt: surface upstream error body.
+            let mut builder = Response::builder()
+                .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+            if let Some(ct) = headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+            {
+                builder = builder.header(header::CONTENT_TYPE, ct);
+            }
+            return builder
+                .body(Body::from(body_bytes))
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "proxy_response_error",
+                        "Failed to build proxy response",
+                    )
+                });
         }
         if let Some(auth) = &auth {
             let category = if status.is_success() {
@@ -354,6 +421,66 @@ async fn forward_responses_compatible(
             } else {
                 status_category(status)
             };
+            // Non-failover error may still carry usage_limit in body on odd statuses.
+            if !status.is_success() {
+                let headers = response.headers().clone();
+                let body_bytes = response.bytes().await.unwrap_or_default();
+                if !media_retry_used
+                    && matches!(status.as_u16(), 400 | 415 | 422)
+                    && media_sanitizer::is_unsupported_image_error_body(&body_bytes)
+                    && media_sanitizer::contains_image_blocks(&request_body)
+                {
+                    let stripped = media_sanitizer::replace_images_with_marker(&mut request_body);
+                    if stripped > 0 {
+                        media_retry_used = true;
+                        let _ = state.storage.release_lease(&auth.lease_id).await;
+                        continue;
+                    }
+                }
+                let cooldown_applied = if body_is_usage_or_rate_limit(&body_bytes) {
+                    handle_upstream_failure(
+                        state,
+                        &target.provider_id,
+                        auth,
+                        reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        &headers,
+                        Some(body_bytes.as_ref()),
+                    )
+                    .await
+                } else {
+                    false
+                };
+                let summary = summarize_upstream_error_body(&body_bytes)
+                    .unwrap_or_else(|| category.to_string());
+                record_diag(
+                    state,
+                    target,
+                    auth,
+                    attempt,
+                    category,
+                    cooldown_applied,
+                    Some(&summary),
+                    started.elapsed().as_millis() as i64,
+                )
+                .await;
+                let _ = state.storage.release_lease(&auth.lease_id).await;
+                let mut builder = Response::builder().status(
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                );
+                if let Some(ct) = headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    builder = builder.header(header::CONTENT_TYPE, ct);
+                }
+                return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "proxy_response_error",
+                        "Failed to build proxy response",
+                    )
+                });
+            }
             record_diag(
                 state,
                 target,
@@ -361,11 +488,7 @@ async fn forward_responses_compatible(
                 attempt,
                 category,
                 false,
-                if status.is_success() {
-                    None
-                } else {
-                    Some(category)
-                },
+                None,
                 started.elapsed().as_millis() as i64,
             )
             .await;
@@ -423,11 +546,11 @@ async fn forward_chat_compatible(
         let upstream = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                if let Some(auth) = &auth {
+                if let Some(auth) = auth {
                     record_diag(
                         state,
                         target,
-                        auth,
+                        &auth,
                         attempt,
                         "transport",
                         false,
@@ -436,6 +559,10 @@ async fn forward_chat_compatible(
                     )
                     .await;
                     let _ = state.storage.release_lease(&auth.lease_id).await;
+                    if attempt + 1 < max_switches {
+                        exclude.push(auth.credential_id);
+                        continue;
+                    }
                 }
                 return error_response(
                     StatusCode::BAD_GATEWAY,
@@ -445,33 +572,68 @@ async fn forward_chat_compatible(
             }
         };
         let status = upstream.status();
-        if is_failover_status(status) && attempt + 1 < max_switches {
-            if let Some(auth) = auth {
-                let category = status_category(status);
-                let cooldown = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-                handle_upstream_failure(
-                    state,
-                    &target.provider_id,
-                    &auth,
-                    status,
-                    upstream.headers(),
+        let headers = upstream.headers().clone();
+        if is_failover_status(status) {
+            let Some(auth) = auth else {
+                // No account context — surface upstream response as-is.
+                if wants_stream {
+                    return adapt_chat_stream(
+                        upstream,
+                        &state.metrics,
+                        &state.storage,
+                        &target.provider_id,
+                        &target.upstream_model,
+                    )
+                    .await;
+                }
+                let payload = upstream.json::<Value>().await.unwrap_or_else(|_| {
+                    json!({"error":{"type":"upstream_error","message":"Upstream request failed"}})
+                });
+                return (
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(payload),
                 )
-                .await;
-                record_diag(
-                    state,
-                    target,
-                    &auth,
-                    attempt,
-                    category,
-                    cooldown,
-                    Some(category),
-                    started.elapsed().as_millis() as i64,
-                )
-                .await;
+                    .into_response();
+            };
+            let body_bytes = upstream.bytes().await.unwrap_or_default();
+            let category = status_category(status);
+            let cooldown_applied = handle_upstream_failure(
+                state,
+                &target.provider_id,
+                &auth,
+                status,
+                &headers,
+                Some(body_bytes.as_ref()),
+            )
+            .await;
+            record_diag(
+                state,
+                target,
+                &auth,
+                attempt,
+                category,
+                cooldown_applied,
+                Some(category),
+                started.elapsed().as_millis() as i64,
+            )
+            .await;
+            let _ = state.storage.release_lease(&auth.lease_id).await;
+            if attempt + 1 < max_switches {
                 exclude.push(auth.credential_id);
-                let _ = state.storage.release_lease(&auth.lease_id).await;
                 continue;
             }
+            return (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(
+                    header::CONTENT_TYPE,
+                    headers
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("application/json"),
+                )],
+                body_bytes,
+            )
+                .into_response();
         }
         if let Some(auth) = &auth {
             let category = if status.is_success() {
@@ -985,12 +1147,6 @@ struct UpstreamAuth {
     sticky_escaped: bool,
 }
 
-fn is_failover_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::UNAUTHORIZED
-        || status == reqwest::StatusCode::FORBIDDEN
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-}
-
 fn apply_upstream_headers(
     mut request: reqwest::RequestBuilder,
     auth: &UpstreamAuth,
@@ -1011,16 +1167,28 @@ fn apply_upstream_headers(
             "claude-cli/1.0.0 (Codex Spur)",
         );
     }
+    // Grok OAuth subscription CLI proxy rejects otherwise-valid tokens without
+    // a supported client identity (observable Grok CLI / Sub2API contract).
+    if target.kind == "xai" && providers::xai_base_needs_cli_headers(&target.base_url) {
+        request = request
+            .header(reqwest::header::USER_AGENT, providers::XAI_CLI_USER_AGENT)
+            .header("x-grok-client-version", providers::XAI_CLI_CLIENT_VERSION)
+            .header("X-Grok-Client-Version", providers::XAI_CLI_CLIENT_VERSION)
+            .header("X-XAI-Token-Auth", "xai-grok-cli");
+    }
     request
 }
 
+/// Mark account schedule state after an upstream failure.
+/// Returns whether a rate-limit cooldown was applied.
 async fn handle_upstream_failure(
     state: &ProxyState,
     provider_id: &str,
     auth: &UpstreamAuth,
     status: reqwest::StatusCode,
     headers: &HeaderMap,
-) {
+    body: Option<&[u8]>,
+) -> bool {
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let _ = state
             .storage
@@ -1032,7 +1200,7 @@ async fn handle_upstream_failure(
                 None,
             )
             .await;
-        return;
+        return false;
     }
     if status == reqwest::StatusCode::FORBIDDEN {
         let _ = state
@@ -1045,23 +1213,39 @@ async fn handle_upstream_failure(
                 None,
             )
             .await;
-        return;
+        return false;
     }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = headers
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<i64>().ok());
+    if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+        let _ = state
+            .storage
+            .mark_schedule_state(
+                &auth.credential_id,
+                ScheduleState::Entitlement,
+                false,
+                Some("上游支付/余额失败 (402)"),
+                None,
+            )
+            .await;
+        return false;
+    }
+    let is_rate =
+        status == reqwest::StatusCode::TOO_MANY_REQUESTS || body.is_some_and(body_is_usage_or_rate_limit);
+    if is_rate {
         let default_secs = state
             .storage
             .default_429_cooldown_secs(provider_id)
             .await
             .unwrap_or(30);
+        let decision =
+            resolve_rate_limit_cooldown(headers, body, default_secs, now_unix());
+        let reason = format!("上游限流 ({})", decision.reason);
         let _ = state
             .storage
-            .apply_rate_limit_cooldown(&auth.credential_id, default_secs, retry_after)
+            .apply_rate_limit_until(&auth.credential_id, decision.cooldown_until, &reason)
             .await;
+        return true;
     }
+    false
 }
 
 async fn upstream_auth(
@@ -1112,7 +1296,8 @@ async fn upstream_auth(
                 sticky_escaped: false,
             },
             credential,
-        );
+        )
+        .await;
     };
 
     let credential = state
@@ -1130,14 +1315,14 @@ async fn upstream_auth(
         let _ = state.storage.release_lease(&lease.id).await;
         return Ok(None);
     };
-    decrypt_auth(state, &lease, credential)
+    decrypt_auth(state, &lease, credential).await
 }
 
 #[allow(clippy::result_large_err)]
-fn decrypt_auth(
+async fn decrypt_auth(
     state: &ProxyState,
     lease: &Lease,
-    credential: crate::storage::StoredCredential,
+    mut credential: crate::storage::StoredCredential,
 ) -> Result<Option<UpstreamAuth>, Response> {
     let plaintext = state
         .vault
@@ -1149,13 +1334,117 @@ fn decrypt_auth(
                 &error.to_string(),
             )
         })?;
-    let secret = SecretMaterial::from_json_bytes(plaintext.as_slice()).map_err(|error| {
+    let mut secret = SecretMaterial::from_json_bytes(plaintext.as_slice()).map_err(|error| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "credential_decode_error",
             &error.to_string(),
         )
     })?;
+    let mut expires_at_for_store: Option<i64> = None;
+    let mut secret_dirty = false;
+
+    // Refresh ChatGPT OAuth access tokens before they expire (official subscription).
+    if secret.api_key.is_none() {
+        if let (Some(access), Some(refresh)) = (
+            secret.access_token.as_deref(),
+            secret.refresh_token.as_deref(),
+        ) {
+            if crate::openai_oauth::access_token_needs_refresh(access, None) {
+                match crate::openai_oauth::refresh_chatgpt_tokens(
+                    refresh,
+                    secret.id_token.as_deref(),
+                )
+                .await
+                {
+                    Ok(refreshed) => {
+                        secret.access_token = Some(refreshed.access_token.clone());
+                        if let Some(id_token) = refreshed.id_token {
+                            secret.id_token = Some(id_token);
+                        }
+                        if let Some(new_refresh) = refreshed.refresh_token {
+                            secret.refresh_token = Some(new_refresh);
+                        }
+                        if !refreshed.account_id.trim().is_empty() {
+                            credential.account_id = Some(refreshed.account_id);
+                        }
+                        expires_at_for_store = refreshed.expires_at;
+                        secret_dirty = true;
+                    }
+                    Err(error) => {
+                        let lower = error.to_lowercase();
+                        if lower.contains("invalid_grant")
+                            || lower.contains("invalid_token")
+                            || lower.contains("expired")
+                        {
+                            let _ = state
+                                .storage
+                                .mark_schedule_state(
+                                    &credential.id,
+                                    ScheduleState::AuthInvalid,
+                                    false,
+                                    Some("OAuth refresh 失败，请重新登录官方订阅"),
+                                    None,
+                                )
+                                .await;
+                        }
+                        // Fall through with existing access token; upstream may still 401.
+                    }
+                }
+            }
+        }
+    }
+
+    // Recover missing ChatGPT account_id (partial JSON imports) for upstream headers.
+    if credential
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        if let Some(access) = secret.access_token.as_deref() {
+            if let Ok(id) = crate::openai_oauth::ensure_chatgpt_account_id(
+                access,
+                secret.id_token.as_deref(),
+                None,
+            )
+            .await
+            {
+                credential.account_id = Some(id);
+                secret_dirty = true;
+            }
+        }
+    }
+
+    if secret_dirty {
+        if let Ok(json) = serde_json::to_vec(&serde_json::json!({
+            "access_token": secret.access_token,
+            "refresh_token": secret.refresh_token,
+            "id_token": secret.id_token,
+            "session_token": secret.session_token,
+        })) {
+            if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
+                if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                    let account_id_for_store = credential
+                        .account_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let _ = state
+                        .storage
+                        .update_credential_secret(
+                            &credential.id,
+                            &envelope_json,
+                            expires_at_for_store,
+                            account_id_for_store,
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
     let token = secret
         .api_key
         .or(secret.access_token)
@@ -1168,22 +1457,6 @@ fn decrypt_auth(
         layer: lease.layer,
         sticky_escaped: lease.sticky_escaped,
     }))
-}
-
-fn status_category(status: reqwest::StatusCode) -> &'static str {
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        "auth_invalid"
-    } else if status == reqwest::StatusCode::FORBIDDEN {
-        "entitlement"
-    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        "rate_limited"
-    } else if status.is_client_error() {
-        "upstream_4xx"
-    } else if status.is_server_error() {
-        "upstream_5xx"
-    } else {
-        "ok"
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1240,10 +1513,12 @@ fn affinity_inputs(headers: &HeaderMap, request: &Value) -> AffinityInputs {
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    // Explicit session signals (Sub2API-like order).
     let session_raw = headers
         .get("x-codex-session-id")
         .or_else(|| headers.get("x-session-id"))
         .or_else(|| headers.get("session_id"))
+        .or_else(|| headers.get("conversation_id"))
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
         .or_else(|| {
@@ -1259,12 +1534,20 @@ fn affinity_inputs(headers: &HeaderMap, request: &Value) -> AffinityInputs {
                 .map(str::to_string)
         });
 
-    let session_key = session_raw.map(|raw| {
+    let session_key = if let Some(raw) = session_raw {
         let mut hasher = Sha256::new();
         hasher.update(b"codex-select-session-v1\0");
         hasher.update(raw.as_bytes());
-        hex::encode(hasher.finalize())
-    });
+        Some(hex::encode(hasher.finalize()))
+    } else if let Some(seed) = content_session_seed(request) {
+        // Content-derived fallback keeps multi-turn sticky when clients omit session headers.
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex-select-content-seed-v1\0");
+        hasher.update(seed.as_bytes());
+        Some(hex::encode(hasher.finalize()))
+    } else {
+        None
+    };
 
     AffinityInputs {
         previous_response_id,
@@ -1288,6 +1571,345 @@ fn map_reasoning(target: &RouteTarget, request: &mut Value) {
             reasoning.insert("effort".into(), Value::String(upstream));
         }
     }
+}
+
+/// Tool `type` values accepted by xAI's Responses API (from upstream 422 enum).
+const XAI_RESPONSES_TOOL_TYPES: &[&str] = &[
+    "function",
+    "web_search",
+    "x_search",
+    "image_generation",
+    "collections_search",
+    "file_search",
+    "code_execution",
+    "code_interpreter",
+    "mcp",
+    "shell",
+];
+
+/// Conservative portable set for non-OpenAI Responses hosts (MiniMax, custom, …).
+const GENERIC_RESPONSES_TOOL_TYPES: &[&str] = &[
+    "function",
+    "web_search",
+    "file_search",
+    "code_interpreter",
+    "code_execution",
+    "mcp",
+    "shell",
+];
+
+/// Chat Completions only understands function tools (DeepSeek / Kimi / most gateways).
+const CHAT_COMPLETIONS_TOOL_TYPES: &[&str] = &["function"];
+
+/// OpenAI kind covers 官方订阅 / JSON 多账号导入 / API Key — keep Codex-native shapes.
+fn keeps_codex_native_tools(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case("openai")
+}
+
+/// Allowed Responses tool types for a non-OpenAI kind.
+fn responses_tool_types_for_kind(kind: &str) -> &'static [&'static str] {
+    match kind.to_ascii_lowercase().as_str() {
+        "xai" => XAI_RESPONSES_TOOL_TYPES,
+        // kimi / deepseek use Chat Completions (handled elsewhere); if a route
+        // is mis-stamped as Responses, still use the conservative set.
+        _ => GENERIC_RESPONSES_TOOL_TYPES,
+    }
+}
+
+/// Port Codex Desktop `tools[]` rows into an allow-list for a third-party host.
+///
+/// - keeps rows whose `type` is in `allowed`
+/// - remaps `local_shell` → `shell` when `shell` is allowed
+/// - flattens nested tools under Codex `namespace` groups
+/// - drops `custom` / empty namespaces / other Codex-only kinds
+fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
+    let mut kept = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if tool_type == "local_shell" && allowed.contains(&"shell") {
+            let mut remapped = tool.clone();
+            if let Some(object) = remapped.as_object_mut() {
+                object.insert("type".into(), Value::String("shell".into()));
+            }
+            kept.push(remapped);
+            continue;
+        }
+
+        if !tool_type.is_empty() && allowed.contains(&tool_type) {
+            kept.push(tool.clone());
+            continue;
+        }
+
+        // Already Chat Completions shaped `{type:function, function:{name,…}}`.
+        if tool.get("function").is_some() && allowed.contains(&"function") {
+            let mut row = tool.clone();
+            if tool_type.is_empty() {
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("type".into(), Value::String("function".into()));
+                }
+            }
+            kept.push(row);
+            continue;
+        }
+
+        // Flatten Codex namespace groups: keep portable nested tools only.
+        if tool_type == "namespace" {
+            if let Some(nested) = tool.get("tools").and_then(Value::as_array) {
+                kept.extend(port_codex_tools(nested, allowed));
+            }
+            continue;
+        }
+
+        // Freeform Responses function without explicit type, but never treat
+        // named non-function kinds (namespace/custom/…) as functions.
+        if tool_type.is_empty()
+            && tool.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())
+            && allowed.contains(&"function")
+        {
+            let mut row = tool.clone();
+            if let Some(object) = row.as_object_mut() {
+                object.insert("type".into(), Value::String("function".into()));
+            }
+            kept.push(row);
+        }
+        // Drop: custom, apply_patch, empty namespace, unknown kinds.
+    }
+    kept
+}
+
+/// Responses-path port for every non-OpenAI kind (xAI / MiniMax / custom / …).
+///
+/// OpenAI kind (官方订阅 / JSON 多账号 / API Key) keeps Codex-native shapes.
+/// All other kinds share this expandable pipeline so future subscriptions do not
+/// re-introduce namespace/tool_choice/input 422s.
+fn sanitize_responses_request_for_upstream(kind: &str, request: &mut Value) {
+    if keeps_codex_native_tools(kind) {
+        return;
+    }
+    sanitize_responses_tools_for_upstream(kind, request);
+    sanitize_responses_tool_choice_for_upstream(kind, request);
+    sanitize_responses_input_for_upstream(request);
+    strip_unsupported_responses_fields(request);
+    clamp_responses_fields_for_kind(kind, request);
+}
+
+/// Drop or remap Codex-only tool rows so third-party Responses APIs do not 422.
+///
+/// Observed failure (xAI): `unknown variant namespace, expected one of function,
+/// web_search, x_search, image_generation, collections_search, file_search,
+/// code_execution, code_interpreter, mcp, shell`.
+fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
+    if keeps_codex_native_tools(kind) {
+        return;
+    }
+    let allowed = responses_tool_types_for_kind(kind);
+    let Some(items) = request
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+    else {
+        return;
+    };
+    let kept = port_codex_tools(&items, allowed);
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    if kept.is_empty() {
+        object.remove("tools");
+    } else {
+        object.insert("tools".into(), Value::Array(kept));
+    }
+}
+
+/// Align or drop `tool_choice` after tools were filtered.
+///
+/// Codex may send `{"type":"namespace",…}` or a function name that no longer
+/// exists after namespace/custom rows were dropped — upstream then 422s.
+fn sanitize_responses_tool_choice_for_upstream(kind: &str, request: &mut Value) {
+    if keeps_codex_native_tools(kind) {
+        return;
+    }
+    let Some(choice) = request.get("tool_choice").cloned() else {
+        return;
+    };
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if should_drop_tool_choice(&choice, &tools, responses_tool_types_for_kind(kind)) {
+        if let Some(object) = request.as_object_mut() {
+            object.remove("tool_choice");
+        }
+    }
+}
+
+fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) -> bool {
+    if tools.is_empty() {
+        return true;
+    }
+    match choice {
+        Value::String(s) => {
+            // auto/none/required are fine when tools remain.
+            matches!(s.as_str(), "auto" | "none" | "required") == false
+                && !tools.iter().any(|t| {
+                    t.get("name").and_then(Value::as_str) == Some(s.as_str())
+                        || t.pointer("/function/name").and_then(Value::as_str) == Some(s.as_str())
+                })
+        }
+        Value::Object(map) => {
+            let choice_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+            if choice_type.is_empty() {
+                return false;
+            }
+            if !allowed.contains(&choice_type) {
+                return true;
+            }
+            if choice_type == "function" {
+                let name = map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        map.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("");
+                if name.is_empty() {
+                    return false;
+                }
+                return !tools.iter().any(|tool| {
+                    tool.get("type").and_then(Value::as_str).unwrap_or("function") == "function"
+                        && (tool.get("name").and_then(Value::as_str) == Some(name)
+                            || tool.pointer("/function/name").and_then(Value::as_str) == Some(name))
+                });
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Drop Codex-only input carriers that third-party Responses hosts reject.
+///
+/// - `additional_tools`: Responses Lite private carrier (xAI ModelInput fails)
+/// - `reasoning` items with `"content": null` (xAI untagged enum → 422)
+fn sanitize_responses_input_for_upstream(request: &mut Value) {
+    let Some(items) = request
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut next = Vec::with_capacity(items.len());
+    for mut item in items.drain(..) {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if item_type == "additional_tools" {
+            continue;
+        }
+        if item_type == "reasoning" {
+            if item.get("content").is_some_and(Value::is_null) {
+                if let Some(object) = item.as_object_mut() {
+                    object.remove("content");
+                }
+            }
+        }
+        next.push(item);
+    }
+    if let Some(object) = request.as_object_mut() {
+        object.insert("input".into(), Value::Array(next));
+    }
+}
+
+/// Fields known to 422 on non-OpenAI Responses hosts (xAI and peers).
+const UNSUPPORTED_RESPONSES_TOP_LEVEL: &[&str] = &[
+    "prompt_cache_retention",
+    "safety_identifier",
+];
+
+fn strip_unsupported_responses_fields(request: &mut Value) {
+    if let Some(object) = request.as_object_mut() {
+        for key in UNSUPPORTED_RESPONSES_TOP_LEVEL {
+            object.remove(*key);
+        }
+    }
+    strip_json_key_recursive(request, "external_web_access");
+}
+
+fn strip_json_key_recursive(value: &mut Value, key: &str) {
+    match value {
+        Value::Object(map) => {
+            map.remove(key);
+            for child in map.values_mut() {
+                strip_json_key_recursive(child, key);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_json_key_recursive(item, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Kind/model-specific clamps. Defaults are conservative; table is easy to extend.
+fn clamp_responses_fields_for_kind(kind: &str, request: &mut Value) {
+    if !kind.eq_ignore_ascii_case("xai") {
+        return;
+    }
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    // Composer models reject reasoning effort knobs.
+    if model.contains("composer") {
+        object.remove("reasoning");
+        object.remove("reasoning_effort");
+        object.remove("reasoningEffort");
+    }
+    // grok-4.5 has been observed to reject classic chat penalty/stop fields.
+    if model.contains("grok-4.5") || model == "grok-4.5" {
+        for key in [
+            "presence_penalty",
+            "presencePenalty",
+            "frequency_penalty",
+            "frequencyPenalty",
+            "stop",
+        ] {
+            object.remove(key);
+        }
+    }
+}
+
+/// Extract a short, secret-free upstream error message for diagnostics.
+fn summarize_upstream_error_body(body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(body).ok()?;
+    let message = parsed
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| parsed.get("error").and_then(Value::as_str))
+        .or_else(|| parsed.get("message").and_then(Value::as_str))
+        .unwrap_or("");
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        // Fall back to a tiny raw snippet (no headers/tokens in JSON error bodies).
+        let raw = String::from_utf8_lossy(body);
+        let snippet: String = raw.chars().take(200).collect();
+        if snippet.trim().is_empty() {
+            return None;
+        }
+        return Some(snippet);
+    }
+    Some(trimmed.chars().take(200).collect())
 }
 
 /// Parse Codex → proxy request bodies. Desktop occasionally double-encodes JSON as a
@@ -1468,11 +2090,14 @@ fn responses_to_chat_completions(request_body: &Value, upstream_model: &str) -> 
     if !tools.is_empty() {
         chat.as_object_mut()
             .expect("chat object")
-            .insert("tools".into(), Value::Array(tools));
+            .insert("tools".into(), Value::Array(tools.clone()));
         if let Some(tool_choice) = request_body.get("tool_choice") {
-            chat.as_object_mut()
-                .expect("chat object")
-                .insert("tool_choice".into(), tool_choice.clone());
+            // Drop choice that points at namespace / removed tools (same rules as Responses port).
+            if !should_drop_tool_choice(tool_choice, &tools, CHAT_COMPLETIONS_TOOL_TYPES) {
+                chat.as_object_mut()
+                    .expect("chat object")
+                    .insert("tool_choice".into(), tool_choice.clone());
+            }
         }
     }
 
@@ -1629,47 +2254,54 @@ fn content_text(content: &Value) -> String {
 }
 
 /// Map Codex Responses tools → Chat Completions `tools[].function` shape.
-/// Drops unsupported kinds (local_shell, web_search, …) instead of forwarding raw rows.
+///
+/// Used for Kimi / DeepSeek / other Chat Completions routes. Applies the same
+/// Codex porting rules as non-OpenAI Responses (flatten `namespace`, drop
+/// `local_shell` / `custom` / …) then rewrites freeform function rows into the
+/// nested `function` object Chat Completions expects.
 fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Vec<Value> {
     let Some(Value::Array(items)) = tools else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for tool in items {
-        let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+    // Chat Completions only accepts function tools; shell/web_search are not portable.
+    let portable = port_codex_tools(items, CHAT_COMPLETIONS_TOOL_TYPES);
+    let mut out = Vec::with_capacity(portable.len());
+    for tool in portable {
         // Already Chat Completions shaped.
-        if tool.get("function").is_some() && (tool_type.is_empty() || tool_type == "function") {
-            out.push(tool.clone());
-            continue;
-        }
-        // Responses freeform function tool: {type:function, name, description, parameters}
-        if tool_type == "function" || tool.get("name").is_some() {
-            let Some(name) = tool.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            if name.is_empty() {
-                continue;
-            }
-            let description = tool
-                .get("description")
-                .cloned()
-                .unwrap_or_else(|| Value::String(String::new()));
-            let parameters = tool
-                .get("parameters")
-                .or_else(|| tool.get("input_schema"))
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            out.push(json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters
+        if tool.get("function").is_some() {
+            let mut row = tool;
+            if row.get("type").and_then(Value::as_str).unwrap_or("").is_empty() {
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("type".into(), Value::String("function".into()));
                 }
-            }));
+            }
+            out.push(row);
             continue;
         }
-        // local_shell / web_search / custom / namespace — not portable to DeepSeek/Kimi.
+        // Responses freeform function: {type:function, name, description, parameters}
+        let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let description = tool
+            .get("description")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new()));
+        let parameters = tool
+            .get("parameters")
+            .or_else(|| tool.get("input_schema"))
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        out.push(json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters
+            }
+        }));
     }
     out
 }
@@ -1700,11 +2332,104 @@ async fn passthrough(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
+    let is_sse = content_type
+        .as_deref()
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+
+    // True streaming for Responses SSE: forward chunks as they arrive so Desktop
+    // sees first token promptly (avoid buffering the whole upstream stream).
+    if is_sse && status.is_success() {
+        // Usage is approximate for live streams (full JSON parse only on buffered paths).
+        metrics.output_tokens.fetch_add(1, Ordering::Relaxed);
+        let _ = storage
+            .record_usage(
+                provider_id,
+                model_id,
+                &UsageDelta {
+                    request_count: 0,
+                    input_tokens: 0,
+                    output_tokens: 1,
+                    cache_observations: 0,
+                    cache_hits: 0,
+                    failed_requests: 0,
+                },
+            )
+            .await;
+        let stream = response.bytes_stream();
+        let mapped = futures_util::StreamExt::map(stream, |chunk| {
+            chunk.map_err(|error| std::io::Error::other(error.to_string()))
+        });
+        let mut builder = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        builder = builder.header(header::CACHE_CONTROL, "no-cache");
+        return builder
+            .body(Body::from_stream(mapped))
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "proxy_response_error",
+                    "Failed to build streaming proxy response",
+                )
+            });
+    }
+
     match response.bytes().await {
         Ok(bytes) => {
-            if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+            // Non-SSE success that is still a JSON error envelope (some gateways).
+            if status.is_success() {
+                if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                    if body.get("error").is_some() && body.get("output").is_none() {
+                        let message = body
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .or_else(|| body.get("error").and_then(Value::as_str))
+                            .unwrap_or("Upstream returned an error object");
+                        return error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "upstream_error_envelope",
+                            message,
+                        );
+                    }
+                    metrics.record_response(&body);
+                    let (output_tokens, cache_observations, cache_hits) = response_usage(&body);
+                    let _ = storage
+                        .record_usage(
+                            provider_id,
+                            model_id,
+                            &UsageDelta {
+                                request_count: 0,
+                                input_tokens: 0,
+                                output_tokens,
+                                cache_observations,
+                                cache_hits,
+                                failed_requests: 0,
+                            },
+                        )
+                        .await;
+                } else {
+                    let output_tokens = bytes.len() as i64 / 4;
+                    metrics
+                        .output_tokens
+                        .fetch_add(output_tokens as u64, Ordering::Relaxed);
+                    let _ = storage
+                        .record_usage(
+                            provider_id,
+                            model_id,
+                            &UsageDelta {
+                                request_count: 0,
+                                input_tokens: 0,
+                                output_tokens,
+                                cache_observations: 0,
+                                cache_hits: 0,
+                                failed_requests: 0,
+                            },
+                        )
+                        .await;
+                }
+            } else if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
                 metrics.record_response(&body);
-                let (output_tokens, cache_observations, cache_hits) = response_usage(&body);
                 let _ = storage
                     .record_usage(
                         provider_id,
@@ -1712,29 +2437,10 @@ async fn passthrough(
                         &UsageDelta {
                             request_count: 0,
                             input_tokens: 0,
-                            output_tokens,
-                            cache_observations,
-                            cache_hits,
-                            failed_requests: i64::from(!status.is_success()),
-                        },
-                    )
-                    .await;
-            } else {
-                let output_tokens = bytes.len() as i64 / 4;
-                metrics
-                    .output_tokens
-                    .fetch_add(output_tokens as u64, Ordering::Relaxed);
-                let _ = storage
-                    .record_usage(
-                        provider_id,
-                        model_id,
-                        &UsageDelta {
-                            request_count: 0,
-                            input_tokens: 0,
-                            output_tokens,
+                            output_tokens: 0,
                             cache_observations: 0,
                             cache_hits: 0,
-                            failed_requests: i64::from(!status.is_success()),
+                            failed_requests: 1,
                         },
                     )
                     .await;
@@ -2106,6 +2812,17 @@ data: [DONE]
             },
             {"type": "local_shell"},
             {
+                "type": "namespace",
+                "name": "browser",
+                "tools": [{
+                    "type": "function",
+                    "name": "open_url",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            },
+            // Named namespace must NOT become a fake function tool.
+            {"type": "namespace", "name": "codex"},
+            {
                 "type": "function",
                 "function": {
                     "name": "already_chat",
@@ -2113,9 +2830,208 @@ data: [DONE]
                 }
             }
         ])));
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
-        assert_eq!(tools[1]["function"]["name"], "already_chat");
+        assert_eq!(tools[1]["function"]["name"], "open_url");
+        assert_eq!(tools[2]["function"]["name"], "already_chat");
+        assert!(tools.iter().all(|t| t["type"] == "function"));
+        assert!(tools.iter().all(|t| t["function"]["name"] != "codex"));
+    }
+
+    fn sample_codex_tools() -> Value {
+        json!([
+            {"type": "namespace", "name": "codex"},
+            {
+                "type": "namespace",
+                "name": "browser",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "open_url",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                ]
+            },
+            {"type": "local_shell"},
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {"type": "custom", "name": "apply_patch"}
+        ])
+    }
+
+    #[test]
+    fn xai_responses_tools_drop_namespace_and_remap_local_shell() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": sample_codex_tools()
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+        let tools = body["tools"].as_array().expect("tools kept");
+        let types: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["function", "shell", "function"]);
+        assert_eq!(tools[0]["name"], "open_url");
+        assert_eq!(tools[2]["name"], "get_weather");
+        assert!(!types.contains(&"namespace"));
+        assert!(!types.contains(&"local_shell"));
+        assert!(!types.contains(&"custom"));
+    }
+
+    #[test]
+    fn non_openai_responses_kinds_all_sanitize_codex_tools() {
+        for kind in ["xai", "minimax", "custom", "kimi", "deepseek"] {
+            let mut body = json!({"tools": sample_codex_tools()});
+            sanitize_responses_request_for_upstream(kind, &mut body);
+            let tools = body.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
+            assert!(
+                tools.iter().all(|t| {
+                    let ty = t["type"].as_str().unwrap_or("");
+                    ty != "namespace" && ty != "local_shell" && ty != "custom"
+                }),
+                "{kind} must not forward Codex-only tool types"
+            );
+            assert!(
+                tools.iter().any(|t| t["name"] == "open_url" || t["function"]["name"] == "open_url"),
+                "{kind} should flatten nested function tools from namespace"
+            );
+            assert!(
+                tools.iter().any(|t| t["name"] == "get_weather" || t["function"]["name"] == "get_weather"),
+                "{kind} should keep freeform function tools"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_entry_methods_passthrough_namespace() {
+        // kind=openai covers 官方订阅 / JSON 多账号 / API Key — no stripping.
+        let mut body = json!({
+            "tools": [
+                {"type": "namespace", "name": "codex"},
+                {"type": "local_shell"}
+            ]
+        });
+        sanitize_responses_request_for_upstream("openai", &mut body);
+        let tools = body["tools"].as_array().expect("unchanged");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[1]["type"], "local_shell");
+    }
+
+    #[test]
+    fn xai_responses_tools_omit_key_when_all_unsupported() {
+        let mut body = json!({
+            "tools": [
+                {"type": "namespace", "name": "codex"},
+                {"type": "custom"}
+            ]
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn xai_drops_namespace_tool_choice_and_additional_tools_input() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [
+                {"type": "namespace", "name": "client_tools"},
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "namespace", "name": "client_tools"},
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "additional_tools", "tools": []},
+                {"type": "reasoning", "content": null, "summary": []}
+            ],
+            "prompt_cache_retention": "24h",
+            "safety_identifier": "user-1",
+            "presence_penalty": 0.5,
+            "external_web_access": true
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+        assert!(body.get("tool_choice").is_none(), "namespace tool_choice must be dropped");
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert!(body.get("safety_identifier").is_none());
+        assert!(body.get("presence_penalty").is_none());
+        assert!(body.get("external_web_access").is_none());
+        let input = body["input"].as_array().expect("input");
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools")),
+            "additional_tools input rows must be dropped"
+        );
+        let reasoning = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("reasoning kept");
+        assert!(
+            reasoning.get("content").is_none(),
+            "reasoning content:null must be removed"
+        );
+        let tools = body["tools"].as_array().expect("function tool kept");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "lookup");
+    }
+
+    #[test]
+    fn openai_responses_keeps_codex_input_and_tool_choice() {
+        let mut body = json!({
+            "tools": [{"type": "namespace", "name": "codex"}],
+            "tool_choice": {"type": "namespace", "name": "codex"},
+            "input": [{"type": "additional_tools", "tools": []}],
+            "prompt_cache_retention": "24h"
+        });
+        sanitize_responses_request_for_upstream("openai", &mut body);
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tool_choice"]["type"], "namespace");
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn summarize_upstream_error_body_reads_message() {
+        let body = br#"{"error":{"message":"unknown variant `namespace`","type":"invalid_request_error"}}"#;
+        let summary = summarize_upstream_error_body(body).expect("summary");
+        assert!(summary.contains("namespace"));
+        assert!(summary.len() <= 200);
+    }
+
+    #[test]
+    fn chat_path_drops_invalid_tool_choice() {
+        let chat = responses_to_chat_completions(
+            &json!({
+                "model": "ignored",
+                "input": "hi",
+                "tools": [{"type": "namespace", "name": "codex"}],
+                "tool_choice": {"type": "namespace", "name": "codex"}
+            }),
+            "deepseek-chat",
+        );
+        assert!(chat.get("tools").is_none() || chat["tools"].as_array().unwrap().is_empty());
+        assert!(chat.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn chat_path_flattens_namespace_and_drops_shell() {
+        let chat = responses_to_chat_completions(
+            &json!({
+                "model": "ignored",
+                "input": "hi",
+                "tools": sample_codex_tools()
+            }),
+            "kimi-for-coding",
+        );
+        let tools = chat["tools"].as_array().expect("function tools kept");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "open_url");
+        assert_eq!(tools[1]["function"]["name"], "get_weather");
+        assert!(tools.iter().all(|t| t["type"] == "function"));
     }
 
     #[test]

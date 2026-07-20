@@ -531,6 +531,7 @@ dependencies = [
  "brotli 7.0.0",
  "directories",
  "flate2",
+ "futures-util",
  "getrandom 0.4.3",
  "hex",
  "reqwest",

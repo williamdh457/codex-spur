@@ -301,6 +301,7 @@ List rows show:
 - vendor icon or monogram;
 - instance name (e.g. OpenAI, OpenAI 2);
 - kind · region · protocol;
+- for OpenAI / xAI: entry-channel badge (`官方订阅` / `账号池` / `API`) left of the configured badge;
 - configured badge;
 - selected/discovered model count and healthy/total accounts;
 - chevron into edit sheet.

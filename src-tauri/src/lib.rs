@@ -5,14 +5,19 @@ pub mod codex_config;
 mod content_encoding;
 mod credentials;
 mod domain;
+mod media_sanitizer;
 mod openai_oauth;
 pub mod providers;
+mod xai_oauth;
 mod proxy;
 mod quota;
 mod scheduler;
 pub mod storage;
+mod upstream_errors;
 pub mod vault;
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::Arc;
 
 use credentials::{CredentialImportSummary, SecretMaterial};
@@ -25,9 +30,9 @@ use scheduler::PoolSchedulerConfig;
 use tauri::{
     menu::{MenuBuilder, MenuItem},
     tray::TrayIconBuilder,
-    Manager, RunEvent, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, Mutex, RwLock};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -39,6 +44,9 @@ pub struct AppState {
     proxy: RwLock<proxy::ProxyRuntime>,
     vault: Arc<vault::SecretVault>,
     openai_oauth: openai_oauth::OpenAiOAuthManager,
+    xai_oauth: xai_oauth::XaiOAuthManager,
+    /// Shutdown sender for the active browser OAuth callback listener.
+    openai_oauth_listener: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl AppState {
@@ -70,7 +78,12 @@ impl AppState {
         let providers = storage.list_providers().await?;
         let credentials = storage.list_credentials(None).await?;
         let published_models = catalog.read().await.models.len() as u32;
-        let live = codex_config::inspect_live_binding();
+        let desktop_visibility = codex_config::inspect_desktop_visibility(
+            Some(true),
+            Some(base_url.as_str()),
+        );
+        let live =
+            codex_config::inspect_live_binding_with_proxy(Some(true), Some(base_url.as_str()));
         let mut attention_items = live.attention;
         if published_models == 0 {
             attention_items.push("添加供应商并拉取模型后，才能应用到 Codex。".into());
@@ -93,6 +106,7 @@ impl AppState {
             published_models,
             healthy_accounts: credentials.iter().filter(|item| item.healthy).count() as u32,
             attention_items,
+            desktop_visibility,
         };
         Ok(Self {
             snapshot: RwLock::new(snapshot),
@@ -102,6 +116,8 @@ impl AppState {
             proxy: RwLock::new(proxy),
             vault,
             openai_oauth: openai_oauth::OpenAiOAuthManager::new(),
+            xai_oauth: xai_oauth::XaiOAuthManager::new(),
+            openai_oauth_listener: Mutex::new(None),
         })
     }
 
@@ -124,12 +140,20 @@ impl AppState {
             .list_providers()
             .await
             .map_err(|error| error.to_string())?;
-        // Refresh binding + attention from live ~/.codex (not isolated CODEX_HOME).
-        let live = codex_config::inspect_live_binding();
+        // Refresh binding + Desktop visibility from live ~/.codex (not isolated CODEX_HOME).
+        let proxy_running = snapshot.proxy.running;
+        let proxy_base = snapshot.proxy.base_url.clone();
+        let desktop_visibility = codex_config::inspect_desktop_visibility(
+            Some(proxy_running),
+            proxy_base.as_deref(),
+        );
+        let live =
+            codex_config::inspect_live_binding_with_proxy(Some(proxy_running), proxy_base.as_deref());
         snapshot.binding.state = live.state;
         snapshot.binding.codex_home = live.codex_home.display().to_string();
         snapshot.binding.provider_id = live.provider_id;
         snapshot.binding.catalog_path = live.catalog_path.display().to_string();
+        snapshot.desktop_visibility = desktop_visibility;
         snapshot.attention_items = live.attention;
         if published_models == 0 {
             snapshot
@@ -180,21 +204,153 @@ async fn quota_access(state: &AppState, credential_id: &str) -> Result<(String, 
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "账号不存在".to_string())?;
-    if credential.provider_id != "openai" {
+    // provider_id is the instance UUID, not the kind string "openai".
+    let provider = state
+        .storage
+        .get_provider(&credential.provider_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "账号所属供应商实例不存在".to_string())?;
+    if provider.kind != "openai" {
         return Err("额度接口仅适用于 OpenAI 官方订阅账号".into());
     }
-    let account_id = credential
-        .account_id
-        .ok_or_else(|| "账号 JSON 缺少 account_id，无法查询官方订阅额度".to_string())?;
     let plaintext = state
         .vault
         .decrypt(&credential.id, &credential.secret_envelope)
         .map_err(|error| error.to_string())?;
-    let secret = SecretMaterial::from_json_bytes(plaintext.as_slice())
+    let mut secret = SecretMaterial::from_json_bytes(plaintext.as_slice())
         .map_err(|error| format!("凭据数据损坏：{error}"))?;
+
+    let mut account_id = credential
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            secret
+                .access_token
+                .as_deref()
+                .and_then(openai_oauth::chatgpt_account_id_from_token)
+        })
+        .or_else(|| {
+            secret
+                .id_token
+                .as_deref()
+                .and_then(openai_oauth::chatgpt_account_id_from_token)
+        });
+
+    // Refresh when access token is near expiry — or when account_id is still
+    // missing (common for partial JSON imports). Sub2API recovers account_id
+    // from a fresh OAuth response; we do the same without copying its code.
+    let needs_refresh = secret
+        .access_token
+        .as_deref()
+        .map(|access| {
+            openai_oauth::access_token_needs_refresh(access, None) || account_id.is_none()
+        })
+        .unwrap_or(account_id.is_none());
+
+    if needs_refresh {
+        if let Some(refresh) = secret
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            match openai_oauth::refresh_chatgpt_tokens(refresh, secret.id_token.as_deref()).await {
+                Ok(refreshed) => {
+                    secret.access_token = Some(refreshed.access_token.clone());
+                    if let Some(id_token) = refreshed.id_token {
+                        secret.id_token = Some(id_token);
+                    }
+                    if let Some(new_refresh) = refreshed.refresh_token {
+                        secret.refresh_token = Some(new_refresh);
+                    }
+                    if !refreshed.account_id.trim().is_empty() {
+                        account_id = Some(refreshed.account_id.clone());
+                    } else {
+                        account_id = account_id.or_else(|| {
+                            openai_oauth::chatgpt_account_id_from_token(&refreshed.access_token)
+                        });
+                    }
+                    if let Ok(json) = serde_json::to_vec(&serde_json::json!({
+                        "access_token": secret.access_token,
+                        "refresh_token": secret.refresh_token,
+                        "id_token": secret.id_token,
+                        "session_token": secret.session_token,
+                    })) {
+                        if let Ok(envelope) =
+                            state.vault.encrypt(&credential.id, 1, json.as_slice())
+                        {
+                            if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                                let _ = state
+                                    .storage
+                                    .update_credential_secret(
+                                        &credential.id,
+                                        &envelope_json,
+                                        refreshed.expires_at,
+                                        account_id.as_deref(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        credential_id = %credential.id,
+                        "quota token refresh failed; trying existing access token: {error}"
+                    );
+                }
+            }
+        }
+    }
+
     let access_token = secret
         .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| "账号没有 access_token，无法查询官方订阅额度".to_string())?;
+    // JWT first, then network recover (accounts/check / whoami) — Sub2API-style
+    // so partial JSON imports can still pull 5h/7d usage without re-login.
+    let account_id = openai_oauth::ensure_chatgpt_account_id(
+        &access_token,
+        secret.id_token.as_deref(),
+        account_id.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "账号缺少 ChatGPT account_id（JSON 未写入且 refresh/token 无法解析，网络补拉也失败）：{error}。可重新导入带 account_id 的账号 JSON，或重新官方登录。"
+        )
+    })?;
+
+    // Persist recovered account_id so later refreshes and pool routing see it.
+    if credential.account_id.as_deref() != Some(account_id.as_str()) {
+        if let Ok(json) = serde_json::to_vec(&serde_json::json!({
+            "access_token": secret.access_token,
+            "refresh_token": secret.refresh_token,
+            "id_token": secret.id_token,
+            "session_token": secret.session_token,
+        })) {
+            if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
+                if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                    let _ = state
+                        .storage
+                        .update_credential_secret(
+                            &credential.id,
+                            &envelope_json,
+                            None,
+                            Some(account_id.as_str()),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
     Ok((access_token, account_id))
 }
 
@@ -235,22 +391,44 @@ async fn get_app_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, Str
         .list_credentials(None)
         .await
         .map_err(|error| error.to_string())?;
+    let published_models = state.catalog.read().await.models.len() as u32;
     let mut snapshot = state.snapshot.write().await;
     snapshot.providers = providers;
     snapshot.healthy_accounts = credentials.iter().filter(|item| item.healthy).count() as u32;
+    // Drift re-check: auth expiry, gate edits, CC Switch steal-back.
+    let proxy_running = snapshot.proxy.running;
+    let proxy_base = snapshot.proxy.base_url.clone();
+    let desktop_visibility = codex_config::inspect_desktop_visibility(
+        Some(proxy_running),
+        proxy_base.as_deref(),
+    );
+    let live =
+        codex_config::inspect_live_binding_with_proxy(Some(proxy_running), proxy_base.as_deref());
+    snapshot.binding.state = live.state;
+    snapshot.binding.codex_home = live.codex_home.display().to_string();
+    snapshot.binding.provider_id = live.provider_id;
+    snapshot.binding.catalog_path = live.catalog_path.display().to_string();
+    snapshot.desktop_visibility = desktop_visibility;
+    snapshot.published_models = published_models;
+    snapshot.attention_items = live.attention;
+    if published_models == 0 {
+        snapshot
+            .attention_items
+            .push("添加供应商并拉取模型后，才能应用到 Codex。".into());
+    }
     Ok(snapshot.clone())
 }
 
 #[tauri::command]
 async fn preview_codex_apply(state: State<'_, AppState>) -> Result<ApplyPreview, String> {
     let snapshot = state.snapshot.read().await;
-    let catalog_count = state.catalog.read().await.models.len() as u32;
+    let catalog = state.catalog.read().await.clone();
     let base_url = snapshot
         .proxy
         .base_url
         .clone()
         .ok_or_else(|| "本地代理尚未启动".to_string())?;
-    Ok(codex_config::preview(&base_url, catalog_count))
+    Ok(codex_config::preview(&base_url, &catalog))
 }
 
 #[tauri::command]
@@ -292,12 +470,21 @@ async fn apply_codex_config(state: State<'_, AppState>) -> Result<CodexApplyOutc
         .await;
     {
         let mut snapshot = state.snapshot.write().await;
-        snapshot.binding.state = live.state;
-        snapshot.binding.codex_home = live.codex_home.display().to_string();
-        snapshot.binding.provider_id = live.provider_id.clone();
-        snapshot.binding.catalog_path = live.catalog_path.display().to_string();
+        let proxy_running = snapshot.proxy.running;
+        let proxy_base = snapshot.proxy.base_url.clone();
+        let desktop_visibility = codex_config::inspect_desktop_visibility(
+            Some(proxy_running),
+            proxy_base.as_deref(),
+        );
+        let live_proxy =
+            codex_config::inspect_live_binding_with_proxy(Some(proxy_running), proxy_base.as_deref());
+        snapshot.binding.state = live_proxy.state;
+        snapshot.binding.codex_home = live_proxy.codex_home.display().to_string();
+        snapshot.binding.provider_id = live_proxy.provider_id.clone();
+        snapshot.binding.catalog_path = live_proxy.catalog_path.display().to_string();
         snapshot.published_models = result.model_count;
-        snapshot.attention_items = live.attention;
+        snapshot.desktop_visibility = desktop_visibility;
+        snapshot.attention_items = live_proxy.attention;
         for warning in &result.warnings {
             if !snapshot.attention_items.iter().any(|item| item == warning) {
                 snapshot.attention_items.push(warning.clone());
@@ -410,6 +597,11 @@ async fn store_api_key_credential(
             .set_active_pool(provider_id, &pool_id)
             .await;
     }
+    // API Key form / config import path — mark channel for Overview badge.
+    let _ = state
+        .storage
+        .set_provider_entry_category(provider_id, "api")
+        .await;
     Ok(())
 }
 
@@ -459,6 +651,58 @@ async fn discover_provider_models(
         .filter(|key| !key.is_empty())
         .map(ToOwned::to_owned);
     let official_openai = provider.kind == "openai" && base_url.trim().is_empty();
+    let official_xai = provider.kind == "xai"
+        && form_key.is_none()
+        && (base_url.trim().is_empty()
+            || providers::is_xai_official_host(&base_url)
+            || provider
+                .base_url
+                .as_deref()
+                .is_some_and(providers::is_xai_official_host)
+            || matches!(
+                provider.entry_category.as_deref(),
+                Some("official") | Some("subscription") | Some("oauth")
+            ));
+    // Stamp entry channel before/alongside discovery so Overview badges stay accurate.
+    // Do not overwrite an explicit JSON import (file) with "official" when re-fetching
+    // via empty base_url (same path as official model discovery).
+    if official_openai {
+        let existing = provider.entry_category.as_deref();
+        let is_json_import = existing == Some("json")
+            || existing == Some("pool")
+            || existing == Some("config");
+        if !is_json_import {
+            let _ = state
+                .storage
+                .set_provider_entry_category(&provider_id, "official")
+                .await;
+        }
+    } else if official_xai {
+        let existing = provider.entry_category.as_deref();
+        let is_json_import = existing == Some("json")
+            || existing == Some("pool")
+            || existing == Some("config");
+        if !is_json_import {
+            let _ = state
+                .storage
+                .set_provider_entry_category(&provider_id, "official")
+                .await;
+        }
+    } else if form_key.is_some()
+        && (provider.kind != "openai" || !base_url.trim().is_empty())
+    {
+        // Form API key only — do not clobber a prior JSON import stamp.
+        let existing = provider.entry_category.as_deref();
+        let is_json_import = existing == Some("json")
+            || existing == Some("pool")
+            || existing == Some("config");
+        if !is_json_import {
+            let _ = state
+                .storage
+                .set_provider_entry_category(&provider_id, "api")
+                .await;
+        }
+    }
     let (models, normalized_base) = if official_openai {
         let credential = state
             .storage
@@ -466,7 +710,8 @@ async fn discover_provider_models(
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
-                "请先通过「OpenAI · 导入账号池」导入官方订阅账号，再拉取模型".to_string()
+                "请先通过「OpenAI · 导入账号 JSON」或「OpenAI · 官方订阅」添加账号，再拉取模型"
+                    .to_string()
             })?;
         let plaintext = state
             .vault
@@ -476,16 +721,56 @@ async fn discover_provider_models(
             .map_err(|error| format!("凭据数据损坏：{error}"))?;
         let access_token = secret
             .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| "OpenAI 官方账号缺少 access_token".to_string())?;
-        let account_id = credential
-            .account_id
-            .ok_or_else(|| "OpenAI 官方账号缺少 account_id".to_string())?;
+        let account_id = openai_oauth::ensure_chatgpt_account_id(
+            access_token,
+            secret.id_token.as_deref(),
+            credential.account_id.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("OpenAI 官方账号缺少 account_id：{error}"))?;
+        if credential.account_id.as_deref() != Some(account_id.as_str()) {
+            if let Ok(json) = serde_json::to_vec(&serde_json::json!({
+                "access_token": secret.access_token,
+                "refresh_token": secret.refresh_token,
+                "id_token": secret.id_token,
+                "session_token": secret.session_token,
+            })) {
+                if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
+                    if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                        let _ = state
+                            .storage
+                            .update_credential_secret(
+                                &credential.id,
+                                &envelope_json,
+                                None,
+                                Some(account_id.as_str()),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
         (
-            providers::discover_official_models(&access_token, &account_id)
+            providers::discover_official_models(access_token, &account_id)
                 .await
                 .map_err(|error| error.to_string())?,
             "https://chatgpt.com/backend-api/codex".to_string(),
         )
+    } else if official_xai {
+        // Subscription OAuth: CLI chat proxy (not api.x.ai).
+        let subscription_base = providers::resolve_xai_upstream_base(
+            Some("official"),
+            provider.base_url.as_deref().or(Some(base_url.as_str())),
+        );
+        let bearer = resolve_bearer_for_discover(&state, &provider_id, None).await?;
+        let models = providers::discover_xai_models(&subscription_base, bearer.as_deref())
+            .await
+            .map_err(|error| error.to_string())?;
+        (models, subscription_base)
     } else {
         let effective_base = if base_url.trim().is_empty() {
             provider
@@ -506,13 +791,19 @@ async fn discover_provider_models(
                     .into(),
             );
         }
-        let models = providers::discover_models(
-            &provider.kind,
-            &effective_base,
-            bearer.as_deref(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let models = if provider.kind == "xai" {
+            providers::discover_xai_models(&effective_base, bearer.as_deref())
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            providers::discover_models(
+                &provider.kind,
+                &effective_base,
+                bearer.as_deref(),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        };
         let normalized_base =
             providers::normalize_base_url(&effective_base).map_err(|error| error.to_string())?;
         (models, normalized_base)
@@ -546,6 +837,13 @@ async fn import_provider_config_json(
     if let Some(api_key) = config.api_key.as_deref() {
         store_api_key_credential(&state, &provider_id, api_key).await?;
     }
+    // Provider config file import is always "json" (not form-filled API).
+    // store_api_key_credential stamps "api"; override after import.
+    state
+        .storage
+        .set_provider_entry_category(&provider_id, "json")
+        .await
+        .map_err(|error| error.to_string())?;
     let models = if config.models.is_empty() {
         let bearer = resolve_bearer_for_discover(&state, &provider_id, config.api_key.as_deref())
             .await?
@@ -604,9 +902,311 @@ async fn cancel_openai_device_login(
     Ok(())
 }
 
+/// Start browser PKCE login (primary official-subscription path).
+/// Returns only the authorize URL — tokens never cross IPC.
+#[tauri::command]
+async fn start_openai_browser_login(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: Option<String>,
+) -> Result<openai_oauth::BrowserLoginStart, String> {
+    stop_openai_oauth_listener(&state).await;
+    state.openai_oauth.clear_browser_login().await;
+
+    let (listener, port) = bind_oauth_callback_listener(openai_oauth::DEFAULT_OAUTH_REDIRECT_PORT)?;
+    let (prepared, pending) = state
+        .openai_oauth
+        .prepare_browser_login(port, name)
+        .await?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    {
+        let mut guard = state.openai_oauth_listener.lock().await;
+        *guard = Some(shutdown_tx);
+    }
+
+    let app_handle = app.clone();
+    let pending_for_thread = pending.clone();
+    std::thread::Builder::new()
+        .name("openai-oauth-callback".into())
+        .spawn(move || {
+            run_openai_oauth_callback_listener(app_handle, listener, pending_for_thread, shutdown_rx);
+        })
+        .map_err(|e| format!("无法启动登录回调监听：{e}"))?;
+
+    Ok(prepared)
+}
+
+#[tauri::command]
+async fn cancel_openai_browser_login(state: State<'_, AppState>) -> Result<(), String> {
+    stop_openai_oauth_listener(&state).await;
+    state.openai_oauth.clear_browser_login().await;
+    Ok(())
+}
+
+/// Manual fallback: paste callback URL if localhost redirect is blocked.
+#[tauri::command]
+async fn complete_openai_oauth_callback_url(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    callback_url: String,
+) -> Result<OpenAiLoginComplete, String> {
+    let pending = state
+        .openai_oauth
+        .peek_pending_browser()
+        .await
+        .ok_or_else(|| "请先打开授权页面".to_string())?;
+    let tokens = state
+        .openai_oauth
+        .complete_browser_callback(&callback_url)
+        .await?;
+    let display_name = pending.display_name.clone();
+    stop_openai_oauth_listener(&state).await;
+    let result = complete_official_login(&state, display_name, tokens).await?;
+    let _ = app.emit(
+        "openai-oauth-finished",
+        OpenAiOAuthFinishedEvent::from_complete(&result),
+    );
+    Ok(result)
+}
+
 #[tauri::command]
 async fn open_external_url(url: String) -> Result<(), String> {
     open_url_in_browser(&url)
+}
+
+async fn stop_openai_oauth_listener(state: &AppState) {
+    let sender = {
+        let mut guard = state.openai_oauth_listener.lock().await;
+        guard.take()
+    };
+    if let Some(tx) = sender {
+        let _ = tx.send(());
+    }
+    // Best-effort wake any listener stuck in accept().
+    let _ = std::net::TcpStream::connect(("127.0.0.1", openai_oauth::DEFAULT_OAUTH_REDIRECT_PORT));
+}
+
+fn bind_oauth_callback_listener(preferred_port: u16) -> Result<(TcpListener, u16), String> {
+    match TcpListener::bind(("127.0.0.1", preferred_port)) {
+        Ok(listener) => {
+            listener
+                .set_nonblocking(false)
+                .map_err(|e| format!("配置登录回调端口失败：{e}"))?;
+            Ok((listener, preferred_port))
+        }
+        Err(_) => {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .map_err(|e| format!("无法绑定登录回调端口：{e}"))?;
+            listener
+                .set_nonblocking(false)
+                .map_err(|e| format!("配置登录回调端口失败：{e}"))?;
+            let port = listener
+                .local_addr()
+                .map_err(|e| format!("读取回调端口失败：{e}"))?
+                .port();
+            Ok((listener, port))
+        }
+    }
+}
+
+fn run_openai_oauth_callback_listener(
+    app: AppHandle,
+    listener: TcpListener,
+    pending: openai_oauth::PendingBrowserLogin,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    // Small accept timeout loop so cancel can stop us.
+    let _ = listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+    loop {
+        if shutdown_rx.try_recv().is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = app.emit(
+                "openai-oauth-finished",
+                OpenAiOAuthFinishedEvent::error("登录已超时，请重新开始"),
+            );
+            break;
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let path = match read_http_request_path(&mut stream) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        let _ = write_http_html(
+                            &mut stream,
+                            "400 Bad Request",
+                            &openai_oauth::oauth_error_html(&error),
+                        );
+                        continue;
+                    }
+                };
+                if path.starts_with("/__codex_spur_oauth_cancel") {
+                    break;
+                }
+                if !path.starts_with("/auth/callback") {
+                    let _ = write_http_html(
+                        &mut stream,
+                        "404 Not Found",
+                        &openai_oauth::oauth_error_html("未知回调路径"),
+                    );
+                    continue;
+                }
+                let callback_url = match build_callback_url(&pending.redirect_uri, &path) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        let _ = write_http_html(
+                            &mut stream,
+                            "400 Bad Request",
+                            &openai_oauth::oauth_error_html(&error),
+                        );
+                        let _ = app.emit(
+                            "openai-oauth-finished",
+                            OpenAiOAuthFinishedEvent::error(&error),
+                        );
+                        break;
+                    }
+                };
+
+                let app_for_async = app.clone();
+                let display_name = pending.display_name.clone();
+                let pending_state = pending.state.clone();
+                let result = tauri::async_runtime::block_on(async {
+                    let state = app_for_async.state::<AppState>();
+                    let tokens = state
+                        .openai_oauth
+                        .complete_browser_callback(&callback_url)
+                        .await?;
+                    let complete =
+                        complete_official_login(state.inner(), display_name, tokens).await?;
+                    state
+                        .openai_oauth
+                        .clear_browser_if_state_matches(&pending_state)
+                        .await;
+                    Ok::<OpenAiLoginComplete, String>(complete)
+                });
+
+                match result {
+                    Ok(complete) => {
+                        let _ = write_http_html(
+                            &mut stream,
+                            "200 OK",
+                            &openai_oauth::oauth_success_html(),
+                        );
+                        let _ = app.emit(
+                            "openai-oauth-finished",
+                            OpenAiOAuthFinishedEvent::from_complete(&complete),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = write_http_html(
+                            &mut stream,
+                            "400 Bad Request",
+                            &openai_oauth::oauth_error_html(&error),
+                        );
+                        let _ = app.emit(
+                            "openai-oauth-finished",
+                            OpenAiOAuthFinishedEvent::error(&error),
+                        );
+                    }
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+        }
+    }
+    // Drop listener; clear manager pending if still ours.
+    let app2 = app.clone();
+    let state_token = pending.state.clone();
+    tauri::async_runtime::block_on(async move {
+        let state = app2.state::<AppState>();
+        state
+            .openai_oauth
+            .clear_browser_if_state_matches(&state_token)
+            .await;
+        let mut guard = state.openai_oauth_listener.lock().await;
+        *guard = None;
+    });
+}
+
+fn read_http_request_path(stream: &mut impl Read) -> Result<String, String> {
+    let mut buf = [0u8; 8192];
+    let n = stream
+        .read(&mut buf)
+        .map_err(|e| format!("读取回调请求失败：{e}"))?;
+    if n == 0 {
+        return Err("空回调请求".into());
+    }
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let first_line = text.lines().next().unwrap_or_default();
+    // GET /auth/callback?code=... HTTP/1.1
+    let mut parts = first_line.split_whitespace();
+    let _method = parts.next();
+    let path = parts
+        .next()
+        .ok_or_else(|| "无法解析回调请求路径".to_string())?;
+    Ok(path.to_string())
+}
+
+fn build_callback_url(redirect_uri: &str, request_path: &str) -> Result<String, String> {
+    let base = url::Url::parse(redirect_uri).map_err(|e| format!("redirect_uri 无效：{e}"))?;
+    let request = url::Url::parse(&format!("http://localhost{request_path}"))
+        .map_err(|e| format!("回调路径无效：{e}"))?;
+    let mut out = base;
+    out.set_path(request.path());
+    out.set_query(request.query());
+    Ok(out.to_string())
+}
+
+fn write_http_html(stream: &mut impl Write, status: &str, body: &str) -> Result<(), String> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|e| format!("写入回调响应失败：{e}"))?;
+    let _ = stream.flush();
+    Ok(())
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenAiOAuthFinishedEvent {
+    ok: bool,
+    provider: Option<ProviderSummary>,
+    model_count: u32,
+    model_error: Option<String>,
+    message: Option<String>,
+}
+
+impl OpenAiOAuthFinishedEvent {
+    fn from_complete(complete: &OpenAiLoginComplete) -> Self {
+        Self {
+            ok: true,
+            provider: Some(complete.provider.clone()),
+            model_count: complete.model_count,
+            model_error: complete.model_error.clone(),
+            message: None,
+        }
+    }
+
+    fn error(message: &str) -> Self {
+        Self {
+            ok: false,
+            provider: None,
+            model_count: 0,
+            model_error: None,
+            message: Some(message.to_string()),
+        }
+    }
 }
 
 fn open_url_in_browser(url: &str) -> Result<(), String> {
@@ -636,23 +1236,32 @@ fn open_url_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
+struct OAuthTokenStoreInput<'a> {
+    access_token: &'a str,
+    refresh_token: Option<&'a str>,
+    id_token: Option<&'a str>,
+    account_id: &'a str,
+    email: Option<&'a str>,
+    expires_at: Option<i64>,
+}
+
 async fn store_oauth_tokens_credential(
     state: &AppState,
     provider_id: &str,
-    tokens: &openai_oauth::DeviceLoginTokens,
+    tokens: OAuthTokenStoreInput<'_>,
 ) -> Result<(), String> {
     let mut import = serde_json::json!({
         "provider": provider_id,
         "access_token": tokens.access_token,
         "account_id": tokens.account_id,
     });
-    if let Some(refresh) = tokens.refresh_token.as_deref() {
+    if let Some(refresh) = tokens.refresh_token {
         import["refresh_token"] = serde_json::Value::String(refresh.to_string());
     }
-    if let Some(id_token) = tokens.id_token.as_deref() {
+    if let Some(id_token) = tokens.id_token {
         import["id_token"] = serde_json::Value::String(id_token.to_string());
     }
-    if let Some(email) = tokens.email.as_deref() {
+    if let Some(email) = tokens.email {
         import["email"] = serde_json::Value::String(email.to_string());
     }
     if let Some(expires_at) = tokens.expires_at {
@@ -700,10 +1309,9 @@ struct OpenAiLoginComplete {
     model_error: Option<String>,
 }
 
-/// Create an OpenAI instance from completed device-login tokens and fetch models.
-#[tauri::command]
-async fn complete_openai_device_login(
-    state: State<'_, AppState>,
+/// Create an OpenAI instance from completed OAuth tokens and fetch models.
+async fn complete_official_login(
+    state: &AppState,
     name: Option<String>,
     tokens: openai_oauth::DeviceLoginTokens,
 ) -> Result<OpenAiLoginComplete, String> {
@@ -712,7 +1320,24 @@ async fn complete_openai_device_login(
         .create_provider_instance("openai", name.as_deref())
         .await
         .map_err(|error| error.to_string())?;
-    store_oauth_tokens_credential(&state, &id, &tokens).await?;
+    store_oauth_tokens_credential(
+        state,
+        &id,
+        OAuthTokenStoreInput {
+            access_token: &tokens.access_token,
+            refresh_token: tokens.refresh_token.as_deref(),
+            id_token: tokens.id_token.as_deref(),
+            account_id: &tokens.account_id,
+            email: tokens.email.as_deref(),
+            expires_at: tokens.expires_at,
+        },
+    )
+    .await?;
+    state
+        .storage
+        .set_provider_entry_category(&id, "official")
+        .await
+        .map_err(|error| error.to_string())?;
     let official_base = "https://chatgpt.com/backend-api/codex";
     let provider = state
         .storage
@@ -725,7 +1350,7 @@ async fn complete_openai_device_login(
     match model_result {
         Ok(models) => {
             let routes =
-                publish_discovered_models(&state, &provider, &models, official_base).await?;
+                publish_discovered_models(state, &provider, &models, official_base).await?;
             let provider = state
                 .storage
                 .get_provider(&id)
@@ -759,6 +1384,149 @@ async fn complete_openai_device_login(
                     "账号已登录并保存，模型拉取失败：{error}。可稍后在编辑页重试。"
                 )),
             })
+        }
+    }
+}
+
+/// Create an OpenAI instance from completed device-login tokens and fetch models.
+#[tauri::command]
+async fn complete_openai_device_login(
+    state: State<'_, AppState>,
+    name: Option<String>,
+    tokens: openai_oauth::DeviceLoginTokens,
+) -> Result<OpenAiLoginComplete, String> {
+    complete_official_login(&state, name, tokens).await
+}
+
+#[tauri::command]
+async fn start_xai_device_login(
+    state: State<'_, AppState>,
+) -> Result<xai_oauth::DeviceLoginStart, String> {
+    state.xai_oauth.start_device_login().await
+}
+
+#[tauri::command]
+async fn poll_xai_device_login(
+    state: State<'_, AppState>,
+    device_code: String,
+) -> Result<xai_oauth::DeviceLoginPoll, String> {
+    state.xai_oauth.poll_device_login(&device_code).await
+}
+
+#[tauri::command]
+async fn cancel_xai_device_login(
+    state: State<'_, AppState>,
+    device_code: String,
+) -> Result<(), String> {
+    state.xai_oauth.cancel_device_login(&device_code).await;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct XaiLoginComplete {
+    provider: ProviderSummary,
+    model_count: u32,
+    model_error: Option<String>,
+}
+
+/// Create a Grok / xAI instance from completed device-login tokens and fetch models.
+#[tauri::command]
+async fn complete_xai_device_login(
+    state: State<'_, AppState>,
+    name: Option<String>,
+    tokens: xai_oauth::DeviceLoginTokens,
+) -> Result<XaiLoginComplete, String> {
+    let id = state
+        .storage
+        .create_provider_instance("xai", name.as_deref())
+        .await
+        .map_err(|error| error.to_string())?;
+    store_oauth_tokens_credential(
+        &state,
+        &id,
+        OAuthTokenStoreInput {
+            access_token: &tokens.access_token,
+            refresh_token: tokens.refresh_token.as_deref(),
+            id_token: tokens.id_token.as_deref(),
+            account_id: &tokens.account_id,
+            email: tokens.email.as_deref(),
+            expires_at: tokens.expires_at,
+        },
+    )
+    .await?;
+    state
+        .storage
+        .set_provider_entry_category(&id, "official")
+        .await
+        .map_err(|error| error.to_string())?;
+    // OAuth SuperGrok / Grok CLI subscription traffic uses the CLI chat proxy.
+    let official_base = providers::XAI_CLI_SUBSCRIPTION_BASE;
+    let provider = state
+        .storage
+        .get_provider(&id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "创建供应商后读取失败".to_string())?;
+    let model_result =
+        providers::discover_xai_models(official_base, Some(tokens.access_token.as_str())).await;
+    match model_result {
+        Ok(models) => {
+            let routes =
+                publish_discovered_models(&state, &provider, &models, official_base).await?;
+            let provider = state
+                .storage
+                .get_provider(&id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "供应商不存在".to_string())?;
+            Ok(XaiLoginComplete {
+                provider,
+                model_count: routes
+                    .iter()
+                    .filter(|route| route.provider_id == id)
+                    .count() as u32,
+                model_error: None,
+            })
+        }
+        Err(error) => {
+            // Still publish curated fallback so the instance is usable offline.
+            let fallback = providers::xai_subscription_models();
+            match publish_discovered_models(&state, &provider, &fallback, official_base).await {
+                Ok(routes) => {
+                    let provider = state
+                        .storage
+                        .get_provider(&id)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "供应商不存在".to_string())?;
+                    Ok(XaiLoginComplete {
+                        provider,
+                        model_count: routes
+                            .iter()
+                            .filter(|route| route.provider_id == id)
+                            .count() as u32,
+                        model_error: Some(format!(
+                            "已用内置 Grok 目录；在线模型列表失败：{error}"
+                        )),
+                    })
+                }
+                Err(publish_err) => {
+                    let provider = state
+                        .storage
+                        .get_provider(&id)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "供应商不存在".to_string())?;
+                    Ok(XaiLoginComplete {
+                        provider,
+                        model_count: 0,
+                        model_error: Some(format!(
+                            "账号已登录并保存，模型写入失败：{publish_err}（发现错误：{error}）"
+                        )),
+                    })
+                }
+            }
         }
     }
 }
@@ -851,6 +1619,7 @@ async fn import_credentials_json(
     input: String,
 ) -> Result<Vec<CredentialSummary>, String> {
     let credentials = credentials::parse_json_import(&input).map_err(|error| error.to_string())?;
+    let mut any_inserted = false;
     for credential in credentials {
         let credential = credential.assign_provider(&provider_id);
         let id = Uuid::new_v4().to_string();
@@ -868,6 +1637,7 @@ async fn import_credentials_json(
             .await
             .map_err(|error| error.to_string())?;
         if inserted {
+            any_inserted = true;
             let pool_id = state
                 .storage
                 .ensure_default_pool(&provider_id)
@@ -879,6 +1649,14 @@ async fn import_credentials_json(
                 .await
                 .map_err(|error| error.to_string())?;
         }
+    }
+    if any_inserted {
+        // Account credentials file import → JSON badge (not browser 官方订阅).
+        state
+            .storage
+            .set_provider_entry_category(&provider_id, "json")
+            .await
+            .map_err(|error| error.to_string())?;
     }
     list_credentials(state, Some(provider_id)).await
 }
@@ -1289,11 +2067,18 @@ fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppState>();
-                    match state.storage.list_credentials(Some("openai")).await {
+                    // Credentials attach to UUID provider instances; filter by provider.kind.
+                    match state.storage.list_credentials_for_kind("openai").await {
                         Ok(accounts) => {
                             for account in accounts {
-                                if let Err(error) = refresh_quota_for_state(&state, &account.id).await {
-                                    tracing::warn!(account = %account.fingerprint_prefix, %error, "failed to refresh OpenAI quota");
+                                if let Err(error) =
+                                    refresh_quota_for_state(&state, &account.id).await
+                                {
+                                    tracing::warn!(
+                                        account = %account.fingerprint_prefix,
+                                        %error,
+                                        "failed to refresh OpenAI quota"
+                                    );
                                 }
                             }
                         }
@@ -1356,6 +2141,13 @@ pub fn run() {
             poll_openai_device_login,
             cancel_openai_device_login,
             complete_openai_device_login,
+            start_openai_browser_login,
+            cancel_openai_browser_login,
+            complete_openai_oauth_callback_url,
+            start_xai_device_login,
+            poll_xai_device_login,
+            cancel_xai_device_login,
+            complete_xai_device_login,
             open_external_url,
             set_active_pool,
             set_model_enabled,

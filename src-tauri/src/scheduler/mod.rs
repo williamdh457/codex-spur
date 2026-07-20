@@ -11,5 +11,5 @@ mod types;
 pub use scoring::{lottery_weights, score_among_peers, score_candidate, QUOTA_SNAPSHOT_STALE_SECS};
 pub use select::select_account;
 #[allow(unused_imports)]
-pub use select::sticky_eligible;
+pub use select::{quota_blocks, sticky_concurrency_full, sticky_eligible};
 pub use types::*;
