@@ -2692,18 +2692,62 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
         Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
         Some(Value::Array(items)) => {
             let mut messages = Vec::new();
-            // Batch consecutive function_call items into one assistant tool_calls msg.
+            // Batch consecutive function_call items, and hold assistant text so we can
+            // emit a single Chat Completions assistant turn:
+            //   { role: assistant, content, tool_calls? }
+            //
+            // Desktop / chat-bridge history may order items either as
+            //   message → function_call → function_call_output  (Grok-native)
+            // or
+            //   function_call → message → function_call_output  (chat SSE: tools then text)
+            // Splitting those into two assistant messages breaks Kimi/DeepSeek:
+            //   "tool_calls must be followed by tool messages" (e.g. exec_command:N).
             let mut pending_tool_calls: Vec<Value> = Vec::new();
+            let mut pending_assistant_text: Option<String> = None;
 
-            let flush_pending_tools = |messages: &mut Vec<Value>, pending: &mut Vec<Value>| {
-                if pending.is_empty() {
+            let flush_assistant_turn =
+                |messages: &mut Vec<Value>,
+                 pending_tools: &mut Vec<Value>,
+                 pending_text: &mut Option<String>| {
+                    let has_tools = !pending_tools.is_empty();
+                    let text = pending_text.take().unwrap_or_default();
+                    if !has_tools && text.is_empty() {
+                        return;
+                    }
+                    let content = if text.is_empty() {
+                        // OpenAI-compatible tool turns use null content when only tools.
+                        Value::Null
+                    } else {
+                        Value::String(text)
+                    };
+                    let mut msg = json!({
+                        "role": "assistant",
+                        "content": content,
+                    });
+                    if has_tools {
+                        msg.as_object_mut()
+                            .expect("assistant object")
+                            .insert("tool_calls".into(), Value::Array(std::mem::take(pending_tools)));
+                    }
+                    messages.push(msg);
+                };
+
+            let append_pending_text = |pending_text: &mut Option<String>, text: String| {
+                if text.is_empty() {
+                    if pending_text.is_none() {
+                        *pending_text = Some(String::new());
+                    }
                     return;
                 }
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": Value::Null,
-                    "tool_calls": std::mem::take(pending)
-                }));
+                match pending_text {
+                    Some(existing) => {
+                        if !existing.is_empty() {
+                            existing.push('\n');
+                        }
+                        existing.push_str(&text);
+                    }
+                    None => *pending_text = Some(text),
+                }
             };
 
             for item in items {
@@ -2744,7 +2788,12 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         }));
                     }
                     "function_call_output" => {
-                        flush_pending_tools(&mut messages, &mut pending_tool_calls);
+                        // Close the assistant turn (text + tools) before tool results.
+                        flush_assistant_turn(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_assistant_text,
+                        );
                         let call_id = item
                             .get("call_id")
                             .and_then(Value::as_str)
@@ -2765,26 +2814,58 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         }));
                     }
                     _ => {
-                        flush_pending_tools(&mut messages, &mut pending_tool_calls);
                         let raw_role =
                             item.get("role").and_then(Value::as_str).unwrap_or("user");
                         let role = responses_role_to_chat_role(raw_role);
-                        if let Some(content) = item.get("content") {
-                            let text = content_text(content);
-                            if !text.is_empty() || role == "assistant" {
-                                messages.push(json!({"role": role, "content": text}));
+                        let text = if let Some(content) = item.get("content") {
+                            content_text(content)
+                        } else if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            text.to_string()
+                        } else {
+                            String::new()
+                        };
+
+                        if role == "assistant" {
+                            // Merge into the open tool turn when tools are already pending
+                            // (function_call → message → function_call_output).
+                            if !pending_tool_calls.is_empty() {
+                                append_pending_text(&mut pending_assistant_text, text);
+                                continue;
+                            }
+                            // Hold text so a following function_call can share one assistant
+                            // message (message → function_call → function_call_output).
+                            // A second assistant text without tools flushes the previous one.
+                            if pending_assistant_text.is_some() {
+                                flush_assistant_turn(
+                                    &mut messages,
+                                    &mut pending_tool_calls,
+                                    &mut pending_assistant_text,
+                                );
+                            }
+                            if !text.is_empty() || item.get("content").is_some() {
+                                // Preserve empty assistant placeholders when content key existed.
+                                append_pending_text(&mut pending_assistant_text, text);
                             }
                             continue;
                         }
-                        if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                messages.push(json!({"role": role, "content": text}));
-                            }
+
+                        // user / system / tool-as-message: close any open assistant turn first.
+                        flush_assistant_turn(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_assistant_text,
+                        );
+                        if !text.is_empty() || role == "assistant" {
+                            messages.push(json!({"role": role, "content": text}));
                         }
                     }
                 }
             }
-            flush_pending_tools(&mut messages, &mut pending_tool_calls);
+            flush_assistant_turn(
+                &mut messages,
+                &mut pending_tool_calls,
+                &mut pending_assistant_text,
+            );
             if messages.is_empty() {
                 vec![json!({"role": "user", "content": ""})]
             } else {
@@ -3586,6 +3667,8 @@ data: [DONE]
     #[test]
     fn chat_history_preserves_function_call_and_output() {
         // Grok wrote the file via function_call; DeepSeek must see tool trail.
+        // message → function_call → output merges into one assistant turn so
+        // tool_calls are immediately followed by tool results.
         let messages = response_input_to_messages(Some(&json!([
             {
                 "type": "message",
@@ -3625,24 +3708,83 @@ data: [DONE]
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "先写文件");
-        assert_eq!(messages[2]["role"], "assistant");
-        assert!(messages[2]["content"].is_null());
-        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-write-1");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-write-1");
         assert_eq!(
-            messages[2]["tool_calls"][0]["function"]["name"],
+            messages[1]["tool_calls"][0]["function"]["name"],
             "exec_command"
         );
-        assert!(messages[2]["tool_calls"][0]["function"]["arguments"]
+        assert!(messages[1]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap()
             .contains("game.html"));
-        assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["tool_call_id"], "call-write-1");
-        assert_eq!(messages[3]["content"], "done");
-        assert_eq!(messages[4]["role"], "user");
-        assert_eq!(messages[4]["content"], "增加二种卡牌");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-write-1");
+        assert_eq!(messages[2]["content"], "done");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "增加二种卡牌");
         // Foreign reasoning must not become a chat message.
         assert!(messages.iter().all(|m| m["role"] != "reasoning"));
+    }
+
+    #[test]
+    fn chat_history_merges_function_call_before_assistant_text() {
+        // Repro: session 019f8528 Kimi turn — chat-bridge SSE emits tools then
+        // text, Desktop stores function_call → message → function_call_output.
+        // Old converter flushed tool_calls, then a second assistant text, which
+        // Kimi rejected: "tool_call_ids did not have response messages: exec_command:N".
+        let messages = response_input_to_messages(Some(&json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "开始执行"}]
+            },
+            {
+                "type": "function_call",
+                "id": "fc_j2KYL0aT8fnUDkIBpgFCqbx7_0",
+                "call_id": "tool_Y58P6C3PYwSwKzXPpd1gMJ3g",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"lsof -iTCP -sTCP:LISTEN\"}"
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Kimi 正在运行。我先做安全备份，再用两种方法抓它的网络流量：本地代理 + lsof/pfctl。"
+                }]
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "tool_Y58P6C3PYwSwKzXPpd1gMJ3g",
+                "output": "ok"
+            }
+        ])));
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Kimi 正在运行"),
+            "assistant text must ride on the same message as tool_calls"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["id"],
+            "tool_Y58P6C3PYwSwKzXPpd1gMJ3g"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(
+            messages[2]["tool_call_id"],
+            "tool_Y58P6C3PYwSwKzXPpd1gMJ3g"
+        );
+        // No intervening assistant-only message between tool_calls and tool result.
+        assert!(
+            messages
+                .windows(2)
+                .all(|w| !(w[0].get("tool_calls").is_some() && w[1]["role"] == "assistant")),
+            "tool_calls assistant must not be followed by another assistant"
+        );
     }
 
     #[test]
