@@ -16,7 +16,7 @@
       "architecture": "x64",
       "format": "NSIS",
       "assetUrl": "https://github.com/williamdh457/codex-spur/releases/download/v0.1.1/Codex.Spur_0.1.1_x64-setup.exe",
-      "sha256": "pending-windows-build"
+      "sha256": "0cee67ab75aa07f90f8c49392ae8aec2790d86bb59e23411ed35eae2814cb421"
     }
   ]
 }
