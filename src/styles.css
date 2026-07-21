@@ -485,10 +485,21 @@ h2 { font-size: 14px; line-height: 20px; }
 }
 .modal-account-row__head {
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) auto;
+  grid-template-columns: 14px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 8px 10px;
   min-width: 0;
+}
+.button--danger-text {
+  height: 26px;
+  padding: 0 8px;
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 28%, var(--border));
+  font-size: 10px;
+}
+.button--danger-text:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--error) 10%, var(--surface));
+  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
 }
 .modal-account-row__head > .status-dot { margin-top: 0; }
 .modal-account-row__head > .member-knobs {

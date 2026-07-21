@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import type { SiteCopy, SiteLocale } from "./types";
-import { release } from "./release";
+import { macAsset, primaryAsset, release, windowsAsset } from "./release";
 
 const copy: Record<SiteLocale, SiteCopy> = {
   "zh-CN": {
-    nav: { product: "产品", workflow: "工作方式", security: "隐私", faq: "文档", github: "GitHub", download: "下载 macOS 版" },
+    nav: { product: "产品", workflow: "工作方式", security: "隐私", faq: "文档", github: "GitHub", download: "下载" },
     hero: {
       kicker: "LOCAL-FIRST MODEL ROUTER FOR CODEX",
       title: "在 ChatGPT 里，直接选择不同厂商的模型。",
@@ -17,13 +17,13 @@ const copy: Record<SiteLocale, SiteCopy> = {
     ],
     faq: [
       { question: "Codex Spur 会修改 ChatGPT.app 吗？", answer: "不会。Spur 通过本地 Responses 兼容代理、模型目录和专用 codex_select provider 接入，不注入或覆盖 ChatGPT.app。" },
-      { question: "我的凭据会离开这台 Mac 吗？", answer: "不会。凭据仅在本机保存与使用；前端不会接触原始 token，日志也会对账号和认证信息脱敏。" },
-      { question: "需要什么系统？", answer: "v1 面向 Apple Silicon Mac，建议 macOS 13 或更高版本。下载 DMG 后将应用拖入 Applications。" },
-      { question: "为什么 macOS 显示开发者无法验证？", answer: "这是未公证版本的 Gatekeeper 提示。请在系统设置 → 隐私与安全性中允许打开，或右键应用选择打开。" },
+      { question: "我的凭据会离开这台电脑吗？", answer: "不会。凭据仅在本机保存与使用；前端不会接触原始 token，日志也会对账号和认证信息脱敏。" },
+      { question: "需要什么系统？", answer: "支持 macOS Apple Silicon（DMG）与 Windows x64（NSIS 安装包）。Windows 端需要本机已安装可读 %USERPROFILE%\\.codex 的 ChatGPT / Codex Desktop。" },
+      { question: "为什么系统拦截安装？", answer: "macOS 未公证会触发 Gatekeeper；Windows 未签名可能触发 SmartScreen。可在系统安全设置中允许打开，或从 GitHub Release 校验哈希后继续。" },
     ],
   },
   en: {
-    nav: { product: "Product", workflow: "How it works", security: "Privacy", faq: "Docs", github: "GitHub", download: "Download for macOS" },
+    nav: { product: "Product", workflow: "How it works", security: "Privacy", faq: "Docs", github: "GitHub", download: "Download" },
     hero: {
       kicker: "LOCAL-FIRST MODEL ROUTER FOR CODEX",
       title: "Choose models from different providers, right inside ChatGPT.",
@@ -36,9 +36,9 @@ const copy: Record<SiteLocale, SiteCopy> = {
     ],
     faq: [
       { question: "Does Codex Spur modify ChatGPT.app?", answer: "No. Spur integrates through a local Responses-compatible proxy, a model catalog, and the dedicated codex_select provider. It does not inject into or overwrite ChatGPT.app." },
-      { question: "Do my credentials leave this Mac?", answer: "No. Credentials are stored and used locally. The frontend never receives raw tokens, and logs redact account and authentication data." },
-      { question: "What do I need?", answer: "Version 1 targets Apple Silicon Macs running macOS 13 or later. Download the DMG and drag the app to Applications." },
-      { question: "Why does macOS say the developer cannot be verified?", answer: "This is Gatekeeper's warning for an unsigned or non-notarized build. Open System Settings → Privacy & Security to allow it, or right-click the app and choose Open." },
+      { question: "Do my credentials leave this computer?", answer: "No. Credentials are stored and used locally. The frontend never receives raw tokens, and logs redact account and authentication data." },
+      { question: "What do I need?", answer: "macOS Apple Silicon (DMG) and Windows x64 (NSIS installer) are supported. On Windows, ChatGPT / Codex Desktop must already be installed and reading %USERPROFILE%\\.codex." },
+      { question: "Why does the OS block the install?", answer: "macOS Gatekeeper may block non-notarized builds; Windows SmartScreen may warn on unsigned installers. Allow the app in system security settings, or verify the release hash from GitHub first." },
     ],
   },
 };
@@ -94,7 +94,7 @@ export function Site({ locale }: { locale: SiteLocale }) {
           <a href="#faq" onClick={() => setMenuOpen(false)}>{t.nav.faq}</a>
           <a href={release.releaseUrl} target="_blank" rel="noreferrer">{t.nav.github} <Arrow /></a>
           <a className="language-switch" href={langHref}>{isZh ? "中 / EN" : "ZH / EN"}</a>
-          <a className="button button--dark button--small" href={release.assetUrl}>{t.nav.download} <Arrow /></a>
+          <a className="button button--dark button--small" href={primaryAsset?.assetUrl ?? release.releaseUrl}>{t.nav.download} <Arrow /></a>
         </nav>
       </header>
 
@@ -104,8 +104,8 @@ export function Site({ locale }: { locale: SiteLocale }) {
             <p className="eyebrow"><span />{t.hero.kicker}</p>
             <h1>{t.hero.title}</h1>
             <p className="hero__lede">{t.hero.description}</p>
-            <div className="hero__actions"><a className="button button--dark" href={release.assetUrl}>{isZh ? `下载 Codex Spur ${release.version.replace("v", "")}` : `Download Codex Spur ${release.version.replace("v", "")}`} <Arrow /></a><a className="text-link" href={release.releaseUrl} target="_blank" rel="noreferrer">{isZh ? "查看 GitHub" : "View on GitHub"} <Arrow /></a></div>
-            <div className="trust-line"><span>● {isZh ? "密钥留在本机" : "Secrets stay local"}</span><span>● {isZh ? "不注入 ChatGPT.app" : "No ChatGPT.app injection"}</span><span>● Apple Silicon · MIT</span></div>
+            <div className="hero__actions"><a className="button button--dark" href={macAsset?.assetUrl ?? release.releaseUrl}>{isZh ? `下载 macOS 版 ${release.version.replace("v", "")}` : `Download for macOS ${release.version.replace("v", "")}`} <Arrow /></a>{windowsAsset ? <a className="button button--small" href={windowsAsset.assetUrl}>{isZh ? "下载 Windows 版" : "Download for Windows"} <Arrow /></a> : null}<a className="text-link" href={release.releaseUrl} target="_blank" rel="noreferrer">{isZh ? "查看 GitHub" : "View on GitHub"} <Arrow /></a></div>
+            <div className="trust-line"><span>● {isZh ? "密钥留在本机" : "Secrets stay local"}</span><span>● {isZh ? "不注入 ChatGPT.app" : "No ChatGPT.app injection"}</span><span>● macOS · Windows · MIT</span></div>
           </div>
           <HeroVisual locale={locale} />
         </section>
@@ -131,14 +131,14 @@ export function Site({ locale }: { locale: SiteLocale }) {
 
         <section className="compatibility section-pad" data-reveal><div className="section-heading"><p className="eyebrow"><span />{isZh ? "COMPATIBLE BY DESIGN" : "COMPATIBLE BY DESIGN"}</p><h2>{isZh ? "从你已经在用的供应商开始。" : "Start with the providers you already use."}</h2></div><div className="compatibility-list">{providers.map((provider, index) => <div key={provider}><span>{String(index + 1).padStart(2, "0")}</span><strong>{provider}</strong><small>{index === 5 ? "Responses · Chat Completions · Anthropic" : index === 0 ? "Official · Responses" : "Provider instance"}</small><Arrow /></div>)}</div></section>
 
-        <section className="security-band section-pad" id="security" data-reveal><div className="security-band__inner"><div className="security-band__intro"><p className="eyebrow eyebrow--light"><span />{isZh ? "LOCAL BY DEFAULT" : "LOCAL BY DEFAULT"}</p><h2>{isZh ? <>凭证留在本机，<br />选择器保持熟悉。</> : <>Credentials stay local.<br />The picker stays familiar.</>}</h2><p>{isZh ? "凭证、供应商和路由由本地桌面应用管理；ChatGPT / Codex 只看到稳定的模型入口。" : "Credentials, providers, and routes stay in the local desktop app. ChatGPT / Codex sees a stable model surface."}</p></div><div className="security-grid">{[["01 / LOCAL", isZh ? "密钥不离开 Mac" : "Secrets stay on Mac", isZh ? "本地加密保存，前端不接触原始密钥。" : "Encrypted local storage. The frontend never handles raw secrets."], ["02 / NATIVE", isZh ? "原生选择器切换" : "Switch in the native picker", isZh ? "不改客户端，不增加新的工作窗口。" : "No client modification. No new workflow window."], ["03 / READY", isZh ? "菜单栏代理常驻" : "A proxy that stays ready", isZh ? "关闭窗口继续路由，退出应用才释放租约。" : "Closing the window keeps routing alive; quitting releases leases."]].map(([eyebrow, title, body]) => <article className="security-card" key={eyebrow}><span>{eyebrow}</span><h3>{title}</h3><p>{body}</p></article>)}</div></div></section>
+        <section className="security-band section-pad" id="security" data-reveal><div className="security-band__inner"><div className="security-band__intro"><p className="eyebrow eyebrow--light"><span />{isZh ? "LOCAL BY DEFAULT" : "LOCAL BY DEFAULT"}</p><h2>{isZh ? <>凭证留在本机，<br />选择器保持熟悉。</> : <>Credentials stay local.<br />The picker stays familiar.</>}</h2><p>{isZh ? "凭证、供应商和路由由本地桌面应用管理；ChatGPT / Codex 只看到稳定的模型入口。" : "Credentials, providers, and routes stay in the local desktop app. ChatGPT / Codex sees a stable model surface."}</p></div><div className="security-grid">{[["01 / LOCAL", isZh ? "密钥不离开本机" : "Secrets stay on this device", isZh ? "本地加密保存，前端不接触原始密钥。" : "Encrypted local storage. The frontend never handles raw secrets."], ["02 / NATIVE", isZh ? "原生选择器切换" : "Switch in the native picker", isZh ? "不改客户端，不增加新的工作窗口。" : "No client modification. No new workflow window."], ["03 / READY", isZh ? "菜单栏代理常驻" : "A proxy that stays ready", isZh ? "关闭窗口继续路由，退出应用才释放租约。" : "Closing the window keeps routing alive; quitting releases leases."]].map(([eyebrow, title, body]) => <article className="security-card" key={eyebrow}><span>{eyebrow}</span><h3>{title}</h3><p>{body}</p></article>)}</div></div></section>
 
         <section className="faq section-pad" id="faq" data-reveal><div className="section-heading"><p className="eyebrow"><span />{isZh ? "BEFORE YOU DOWNLOAD" : "BEFORE YOU DOWNLOAD"}</p><h2>{isZh ? "开始之前，先知道这些。" : "A few things to know first."}</h2></div><div className="faq-list">{t.faq.map((item, index) => <div className={openFaq === index ? "faq-item faq-item--open" : "faq-item"} key={item.question}><button type="button" aria-expanded={openFaq === index} onClick={() => setOpenFaq(openFaq === index ? null : index)}><span>{item.question}</span><b>+</b></button>{openFaq === index && <p>{item.answer}</p>}</div>)}</div></section>
 
-        <section className="download-cta section-pad"><div className="download-cta__copy"><p className="eyebrow"><span />{isZh ? "START LOCAL" : "START LOCAL"}</p><h2>{isZh ? "把模型选择，交还给你。" : "Put model choice back in your hands."}</h2><p>{isZh ? "Apple Silicon · macOS 13+ · MIT 开源许可" : "Apple Silicon · macOS 13+ · MIT licensed"}</p></div><div className="download-cta__actions"><a className="button button--dark" href={release.assetUrl}>{isZh ? "下载 macOS 版" : "Download for macOS"} <Arrow /></a><small>{isZh ? "仅支持 Apple Silicon · DMG" : "Apple Silicon only · DMG"}</small></div></section>
+        <section className="download-cta section-pad"><div className="download-cta__copy"><p className="eyebrow"><span />{isZh ? "START LOCAL" : "START LOCAL"}</p><h2>{isZh ? "把模型选择，交还给你。" : "Put model choice back in your hands."}</h2><p>{isZh ? "macOS Apple Silicon · Windows x64 · MIT 开源许可" : "macOS Apple Silicon · Windows x64 · MIT licensed"}</p></div><div className="download-cta__actions"><a className="button button--dark" href={macAsset?.assetUrl ?? release.releaseUrl}>{isZh ? "下载 macOS 版" : "Download for macOS"} <Arrow /></a>{windowsAsset ? <a className="button button--small" href={windowsAsset.assetUrl}>{isZh ? "下载 Windows 版" : "Download for Windows"} <Arrow /></a> : null}<small>{isZh ? "macOS DMG · Windows NSIS（未签名）" : "macOS DMG · Windows NSIS (unsigned)"}</small></div></section>
       </main>
 
-      <footer className="site-footer section-pad"><a className="brand" href={isZh ? "/" : "/en/"}><img src="/assets/codex-spur-icon.png" alt="" /><span>Codex Spur</span></a><div><span>v0.1.0</span><a href={release.releaseUrl} target="_blank" rel="noreferrer">GitHub <Arrow /></a><a href={langHref}>{isZh ? "English" : "简体中文"}</a></div><p>Local-first model router for Codex.</p></footer>
+      <footer className="site-footer section-pad"><a className="brand" href={isZh ? "/" : "/en/"}><img src="/assets/codex-spur-icon.png" alt="" /><span>Codex Spur</span></a><div><span>{release.version}</span><a href={release.releaseUrl} target="_blank" rel="noreferrer">GitHub <Arrow /></a><a href={langHref}>{isZh ? "English" : "简体中文"}</a></div><p>Local-first model router for Codex.</p></footer>
     </div>
   );
 }

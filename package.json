@@ -17,7 +17,10 @@
     "site:typecheck": "tsc -p website/tsconfig.json --noEmit --pretty false",
     "site:build": "node website/scripts/validate-release.mjs && npm run site:typecheck && vite --config website/vite.config.ts build",
     "site:preview": "vite preview --config website/vite.config.ts",
-    "site:deploy": "bash website/scripts/deploy.sh"
+    "site:deploy": "bash website/scripts/deploy.sh",
+    "bundle:macos": "tauri build --bundles dmg",
+    "bundle:nsis": "tauri build --bundles nsis",
+    "bundle:windows": "tauri build --bundles nsis"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

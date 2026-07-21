@@ -23,7 +23,7 @@ use std::sync::Arc;
 use credentials::{CredentialImportSummary, SecretMaterial};
 use domain::{
     AccountPoolSummary, AppSnapshot, ApplyPreview, CodexApplyOutcome, CodexBindingStatus,
-    CredentialSummary, ModelRouteSummary, OpenAiQuotaSnapshot, PoolMemberDetail, ProviderRouting,
+    CredentialSummary, DeleteCredentialResult, ModelRouteSummary, OpenAiQuotaSnapshot, PoolMemberDetail, ProviderRouting,
     ProviderSummary, ProxyRequestEvent, ProxyStatus,
 };
 use scheduler::PoolSchedulerConfig;
@@ -1603,7 +1603,7 @@ async fn set_model_enabled(
     {
         let mut snapshot = state.snapshot.write().await;
         if snapshot.binding.state == "applied" {
-            let msg = "模型选择已变更：请再次点击 Review & Apply，然后 Cmd+Q 完全退出 ChatGPT 再打开，右下角才会刷新。";
+            let msg = "模型选择已变更：请再次点击 Review & Apply，然后完全退出 ChatGPT 再打开，右下角才会刷新。";
             if !snapshot.attention_items.iter().any(|item| item == msg) {
                 snapshot.attention_items.push(msg.into());
             }
@@ -1659,6 +1659,21 @@ async fn import_credentials_json(
             .map_err(|error| error.to_string())?;
     }
     list_credentials(state, Some(provider_id)).await
+}
+
+
+#[tauri::command]
+async fn delete_credential(
+    state: State<'_, AppState>,
+    credential_id: String,
+) -> Result<DeleteCredentialResult, String> {
+    let result = state
+        .storage
+        .delete_credential(&credential_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    state.rebuild_runtime().await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2039,8 +2054,12 @@ fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let tray_icon = tauri::image::Image::new(include_bytes!("../icons/tray-icon.rgba"), 44, 44);
     let mut builder = TrayIconBuilder::with_id("codex-select")
         .tooltip("Codex Spur")
-        .icon(tray_icon)
-        .icon_as_template(true)
+        .icon(tray_icon);
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon_as_template(true);
+    }
+    let mut builder = builder
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -2150,6 +2169,7 @@ pub fn run() {
             set_model_enabled,
             import_credentials_json,
             list_credentials,
+            delete_credential,
             test_account,
             refresh_openai_quota,
             get_cached_openai_quota,

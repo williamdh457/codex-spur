@@ -2,6 +2,14 @@
 
 All notable changes to Codex Spur are documented in this file.
 
+## [Unreleased]
+
+### Packaging
+
+- Windows **x64 NSIS** installer path via Tauri 2 (`npm run bundle:nsis` / GitHub Actions `windows-release.yml`).
+- Windows runtime fixes for Codex home (`USERPROFILE\.codex`), tray template icons (macOS-only), and publish CLI data-dir fallbacks.
+- Website release manifest supports dual assets (macOS DMG + Windows NSIS).
+
 ## [0.1.1] - 2026-07-21
 
 ### Fixed

@@ -94,7 +94,7 @@ Closing the main window keeps the menu-bar proxy alive. Quitting the app stops t
 
 | | |
 |---|---|
-| Platform | macOS (Apple Silicon first) |
+| Platform | macOS (Apple Silicon) · Windows x64 |
 | Stack | Tauri 2 · React · TypeScript · Rust |
 | Version | **0.1.1** |
 | License | MIT |
@@ -161,17 +161,31 @@ Typical data directory:
 
 ### Requirements
 
-- macOS **Apple Silicon** (`aarch64` DMG for this release)
-- ChatGPT Desktop / Codex installed (third-party rows in the GUI usually need a valid Desktop login—see Desktop visibility)
+- **macOS Apple Silicon** (`aarch64` DMG) and/or **Windows x64** (NSIS setup `.exe`)
+- ChatGPT Desktop / Codex installed and reading the user Codex home (third-party rows in the GUI usually need a valid Desktop login—see Desktop visibility):
+  - macOS: `~/.codex`
+  - Windows: `%USERPROFILE%\.codex`
 - Network access to the upstream APIs you configure
 
 ### From Release
+
+**macOS**
 
 1. Open the [latest Release](https://github.com/williamdh457/codex-spur/releases/latest) and download  
    `Codex.Spur_0.1.1_aarch64.dmg` (GitHub may normalize spaces in the asset name)
 2. Open the DMG and drag **Codex Spur** into **Applications**
 3. Open the app (see [“app is damaged”](#if-macos-says-app-is-damaged) if macOS blocks the first launch)
 4. Leave the menu-bar process running while you use Spur-backed models
+
+**Windows**
+
+1. Download `Codex.Spur_<version>_x64-setup.exe` from the same Release
+2. Run the NSIS installer (current-user install)
+3. If **SmartScreen** warns about an unknown publisher, choose **More info → Run anyway** (v1 builds are unsigned, same policy as the unsigned mac DMG)
+4. Launch **Codex Spur**, configure providers, then **Review & Apply** so writes land in `%USERPROFILE%\.codex`
+5. Leave the tray process running while you use Spur-backed models
+
+Windows support depends on ChatGPT / Codex Desktop already being installed and reading `%USERPROFILE%\.codex`. Custom `model_providers` behavior may differ from macOS; treat third-party model visibility as best-effort.
 
 ### If macOS says “app is damaged”
 
@@ -279,7 +293,8 @@ Rebuilds catalog from Spur SQLite and publishes into `~/.codex` (for scripts / d
 
 - Node.js 20+ (22 recommended)
 - Rust stable (`rustc` ≥ 1.86 per `Cargo.toml`)
-- Xcode CLT / standard macOS native toolchain
+- Xcode CLT / standard macOS native toolchain (macOS builds)
+- Windows: Visual Studio Build Tools (C++), WebView2 runtime, Rust MSVC target (Windows builds / CI)
 - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 ### Develop
@@ -300,10 +315,11 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-### Bundle DMG
+### Bundle
 
 ```bash
-npm run bundle:dmg
+npm run bundle:dmg      # macOS DMG
+npm run bundle:nsis     # Windows NSIS (Windows host or CI)
 # → src-tauri/target/release/bundle/dmg/Codex Spur_<version>_aarch64.dmg
 ```
 
@@ -334,8 +350,9 @@ Also see:
 
 | Path | Purpose |
 |------|---------|
-| `~/Library/Application Support/com.codexspur.desktop/` | Local DB, master key, proxy bearer |
-| `~/.codex/config.toml` | Codex config (backed up before Apply) |
+| `~/Library/Application Support/com.codexspur.desktop/` (macOS) | Local DB, master key, proxy bearer |
+| `%APPDATA%\com.codexspur.desktop\` (Windows) | Local DB, master key, proxy bearer |
+| `~/.codex/config.toml` / `%USERPROFILE%\.codex\config.toml` | Codex config (backed up before Apply) |
 | `~/.codex/codex-select/model-catalog.json` | Published model catalog |
 | `~/.codex/auth.json` | Native Desktop login (Spur does not rewrite it in normal operation) |
 
@@ -375,3 +392,4 @@ gh release create v0.1.1 \
 1. Enroll in [Apple Developer Program](https://developer.apple.com/programs/) and create a **Developer ID Application** certificate in Keychain.
 2. Export an App Store Connect API key (or use Apple ID + app-specific password) for notarization.
 3. Configure Tauri signing / notarization env vars (see [Tauri macOS code signing](https://v2.tauri.app/distribute/sign/macos/)), then rebuild the DMG and staple the ticket before `gh release create`.
+4. For Windows, run the **Windows NSIS release** workflow (`.github/workflows/windows-release.yml`) on `windows-latest`, or build with `npm run bundle:nsis` on a Windows machine. Attach the `*-setup.exe` next to the macOS DMG on the same GitHub Release. v1 Windows installers are **unsigned** (SmartScreen may warn).

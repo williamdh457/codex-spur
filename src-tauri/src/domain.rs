@@ -140,6 +140,13 @@ pub struct ProviderRouting {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DeleteCredentialResult {
+    pub provider_id: String,
+    pub remaining_accounts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProxyRequestEvent {
     pub id: String,
     pub created_at: String,

@@ -34,10 +34,15 @@ pub fn publish_codex_home() -> PathBuf {
 }
 
 fn user_codex_home() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".codex"))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
+    // Prefer HOME (Unix / Git Bash / some launchers), then USERPROFILE (native Windows).
+    // Codex Desktop/CLI config is expected under <user home>/.codex on both platforms.
+    if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home).join(".codex");
+    }
+    if let Some(profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return PathBuf::from(profile).join(".codex");
+    }
+    PathBuf::from(".codex")
 }
 
 pub fn catalog_path_for(home: &Path) -> PathBuf {
@@ -59,7 +64,7 @@ pub struct LiveBinding {
 }
 
 /// Error text when Apply would publish custom models the Desktop GUI will hide.
-pub const DESKTOP_AUTH_REQUIRED_MSG: &str = "未检测到有效的 ChatGPT 官方登录（~/.codex/auth.json）。Desktop 会隐藏 Kimi/DeepSeek 等自定义模型，只显示官方 GPT-5.6。请先在 ChatGPT.app 登录官方账号（不是 Codex Spur 的 API Key / 浏览器 OAuth），再 Cmd+Q 完全退出后重开，然后重新 Review & Apply。Spur 不会改写 auth.json。";
+pub const DESKTOP_AUTH_REQUIRED_MSG: &str = "未检测到有效的 ChatGPT 官方登录（用户 Codex 目录下的 auth.json）。Desktop 会隐藏 Kimi/DeepSeek 等自定义模型，只显示官方 GPT-5.6。请先在 ChatGPT / Codex Desktop 登录官方账号（不是 Codex Spur 的 API Key / 浏览器 OAuth），再完全退出应用后重开，然后重新 Review & Apply。Spur 不会改写 auth.json。";
 
 /// Top-level Codex config key that gates Desktop's hosted web_search tool.
 /// Aligns with CC Switch: some native `/responses` gateways hard-400 on that tool.
@@ -311,7 +316,7 @@ pub fn inspect_desktop_visibility(
         label: "冷启动状态".into(),
         ok: !chatgpt_running,
         detail: if chatgpt_running {
-            "ChatGPT 仍在运行：catalog 仅冷启动加载，改配置后需 Cmd+Q 完全退出再开".into()
+            "ChatGPT 仍在运行：catalog 仅冷启动加载，改配置后需完全退出应用再开".into()
         } else {
             "ChatGPT 未在运行；下次打开将加载当前 catalog".into()
         },
@@ -764,7 +769,7 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
     }
     if chatgpt_desktop_running() {
         warnings.push(
-            "ChatGPT 仍在运行：模型目录只在启动时加载。请现在 Cmd+Q 完全退出 ChatGPT/Codex，再重新打开，否则菜单不会出现新写入的 Kimi 等模型。"
+            "ChatGPT 仍在运行：模型目录只在启动时加载。请现在完全退出 ChatGPT/Codex，再重新打开，否则菜单不会出现新写入的 Kimi 等模型。"
                 .into(),
         );
     }
@@ -887,6 +892,44 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn user_codex_home_prefers_home_then_userprofile() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let prev_home = env::var_os("HOME");
+        let prev_profile = env::var_os("USERPROFILE");
+        let prev_codex_home = env::var_os("CODEX_HOME");
+        let prev_publish = env::var_os("CODEX_SPUR_PUBLISH_HOME");
+        env::remove_var("CODEX_HOME");
+        env::remove_var("CODEX_SPUR_PUBLISH_HOME");
+
+        env::set_var("HOME", "/tmp/spur-home-a");
+        env::set_var("USERPROFILE", "C:\\Users\\spur");
+        assert_eq!(user_codex_home(), PathBuf::from("/tmp/spur-home-a/.codex"));
+
+        env::remove_var("HOME");
+        assert_eq!(user_codex_home(), PathBuf::from(r"C:\Users\spur").join(".codex"));
+
+        env::remove_var("USERPROFILE");
+        assert_eq!(user_codex_home(), PathBuf::from(".codex"));
+
+        match prev_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
+        match prev_profile {
+            Some(value) => env::set_var("USERPROFILE", value),
+            None => env::remove_var("USERPROFILE"),
+        }
+        match prev_codex_home {
+            Some(value) => env::set_var("CODEX_HOME", value),
+            None => env::remove_var("CODEX_HOME"),
+        }
+        match prev_publish {
+            Some(value) => env::set_var("CODEX_SPUR_PUBLISH_HOME", value),
+            None => env::remove_var("CODEX_SPUR_PUBLISH_HOME"),
+        }
+    }
+
 
     /// Minimal valid ChatGPT Desktop identity for apply hard-block tests (no real secrets).
     fn write_test_chatgpt_auth(home: &Path) {

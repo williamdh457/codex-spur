@@ -11,14 +11,7 @@ use codex_select_lib::storage::Storage;
 async fn main() -> anyhow::Result<()> {
     let data_dir = std::env::var_os("CODEX_SPUR_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            directories::ProjectDirs::from("com", "codexspur", "desktop")
-                .map(|dirs| dirs.data_dir().to_path_buf())
-                .unwrap_or_else(|| {
-                    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                        .join("Library/Application Support/com.codexspur.desktop")
-                })
-        });
+        .unwrap_or_else(default_spur_data_dir);
 
     println!("data_dir={}", data_dir.display());
     let storage = Storage::open(&data_dir).await?;
@@ -123,4 +116,35 @@ fn read_existing_bearer(config_path: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+fn default_spur_data_dir() -> PathBuf {
+    if let Some(dirs) = directories::ProjectDirs::from("com", "codexspur", "desktop") {
+        return dirs.data_dir().to_path_buf();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join("Library/Application Support/com.codexspur.desktop");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("com.codexspur.desktop");
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            return PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join("com.codexspur.desktop");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".local/share/com.codexspur.desktop");
+        }
+    }
+    PathBuf::from("com.codexspur.desktop")
 }

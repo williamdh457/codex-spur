@@ -87,6 +87,11 @@ export type CredentialSummary = {
   lastError: string | null;
 };
 
+export type DeleteCredentialResult = {
+  providerId: string;
+  remainingAccounts: number;
+};
+
 export type AccountPoolSummary = {
   id: string;
   name: string;

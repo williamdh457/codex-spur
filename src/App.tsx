@@ -10,12 +10,14 @@ import {
   completeOpenAiOauthCallbackUrl,
   completeXaiDeviceLogin,
   createProviderInstance,
+  deleteCredential,
   deleteProviderInstance,
   discoverProviderModels,
   getAppSnapshot,
   getCachedOpenAiQuota,
   getDiagnosticsMaxEvents,
   getPoolSchedulerConfig,
+  getProviderRouting,
   importCredentialsJson,
   importProviderConfigJson,
   listCredentials,
@@ -1403,6 +1405,54 @@ function EditProviderSheet({
     }
   };
 
+  const removeAccount = async (account: CredentialSummary) => {
+    const identity =
+      account.label ??
+      account.maskedEmail ??
+      account.maskedAccountId ??
+      account.fingerprintPrefix;
+    if (
+      !window.confirm(
+        `确定删除账号「${identity}」？\n\n此操作不可恢复：本地加密凭据将永久删除，并从调度池移出。`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await deleteCredential(account.id);
+      const routing = await getProviderRouting(provider.id);
+      await applyAccountSnapshot(
+        provider.id,
+        routing?.activePoolId ?? provider.activePoolId,
+        routing?.routingMode ?? "pool",
+        routing?.fixedCredentialId ?? null,
+      );
+      await onChanged();
+
+      if (result.remainingAccounts === 0) {
+        const deleteProvider = window.confirm(
+          `「${provider.name}」已无账号。是否一并删除此供应商实例？\n\n删除后模型候选也会移除。`,
+        );
+        if (deleteProvider) {
+          await deleteProviderInstance(provider.id);
+          await onChanged();
+          onClose();
+          return;
+        }
+        setMessage("账号已删除。此实例暂无账号。");
+      } else {
+        setMessage(`已删除账号「${identity}」。`);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="provider-modal provider-modal--edit" role="dialog" aria-modal="true" aria-labelledby="edit-provider-title">
@@ -1553,6 +1603,17 @@ function EditProviderSheet({
                             </small>
                           </span>
                           <span className={`badge ${account.healthy ? "badge--success" : "badge--error"}`}>{account.healthy ? "可用" : "失效"}</span>
+                          <button
+                            type="button"
+                            className="button button--secondary button--danger-text"
+                            disabled={busy}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void removeAccount(account);
+                            }}
+                          >
+                            删除
+                          </button>
                           {routingMode === "pool" && member ? (
                             <div className="member-knobs" onClick={(event) => event.stopPropagation()}>
                               <label>

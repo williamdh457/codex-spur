@@ -9,6 +9,7 @@ import type {
   ApplyPreview,
   CodexApplyOutcome,
   CredentialSummary,
+  DeleteCredentialResult,
   ModelRouteSummary,
   OpenAiQuotaSnapshot,
   ProviderSummary,
@@ -228,6 +229,11 @@ export async function setActivePool(providerId: string, poolId: string): Promise
 export async function setModelEnabled(routeId: string, enabled: boolean): Promise<ModelRouteSummary[]> {
   if (!isTauriRuntime()) return [];
   return invoke<ModelRouteSummary[]>("set_model_enabled", { routeId, enabled });
+}
+
+
+export async function deleteCredential(credentialId: string): Promise<DeleteCredentialResult> {
+  return invoke<DeleteCredentialResult>("delete_credential", { credentialId });
 }
 
 export async function listCredentials(providerId?: string): Promise<CredentialSummary[]> {

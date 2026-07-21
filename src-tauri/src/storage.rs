@@ -11,9 +11,9 @@ use sqlx::{
 use crate::{
     credentials::CanonicalCredential,
     domain::{
-        AccountPoolSummary, CredentialSummary, ModelRouteSummary, OpenAiQuotaSnapshot,
-        PoolMemberDetail, ProviderRouting, ProviderSummary, ProxyRequestEvent, UsageBreakdown,
-        UsageDashboardSnapshot, UsageRange, UsageTrendPoint,
+        AccountPoolSummary, CredentialSummary, DeleteCredentialResult, ModelRouteSummary,
+        OpenAiQuotaSnapshot, PoolMemberDetail, ProviderRouting, ProviderSummary, ProxyRequestEvent,
+        UsageBreakdown, UsageDashboardSnapshot, UsageRange, UsageTrendPoint,
     },
     providers::RouteCatalogPayload,
     scheduler::{
@@ -632,6 +632,63 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+
+    /// Hard-delete a credential and clear dependent routing/quota state.
+    ///
+    /// FK CASCADE covers pool_members, leases, sticky bindings, usage_snapshots,
+    /// and reset_credit_actions. This also clears fixed routing and cached quota.
+    pub async fn delete_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<DeleteCredentialResult, sqlx::Error> {
+        let row = sqlx::query("SELECT provider_id FROM credentials WHERE id = ?")
+            .bind(credential_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Err(sqlx::Error::Protocol("账号不存在".into()));
+        };
+        let provider_id: String = row.get("provider_id");
+
+        // Clear fixed routing before delete so the provider never points at a missing credential.
+        sqlx::query(
+            "UPDATE providers
+             SET routing_mode = CASE WHEN fixed_credential_id = ? THEN 'pool' ELSE routing_mode END,
+                 fixed_credential_id = CASE WHEN fixed_credential_id = ? THEN NULL ELSE fixed_credential_id END
+             WHERE id = ?",
+        )
+        .bind(credential_id)
+        .bind(credential_id)
+        .bind(&provider_id)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("DELETE FROM app_settings WHERE key = ?")
+            .bind(format!("quota:{credential_id}"))
+            .execute(&self.pool)
+            .await?;
+
+        let deleted = sqlx::query("DELETE FROM credentials WHERE id = ?")
+            .bind(credential_id)
+            .execute(&self.pool)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            return Err(sqlx::Error::Protocol("账号不存在".into()));
+        }
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credentials WHERE provider_id = ?",
+        )
+        .bind(&provider_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(DeleteCredentialResult {
+            provider_id,
+            remaining_accounts: remaining as u32,
+        })
     }
 
     pub async fn list_credentials(
@@ -2637,5 +2694,158 @@ mod usage_dashboard_tests {
             .expect("start");
         let start: String = row.get("start");
         assert_eq!(start.len(), 10);
+    }
+}
+
+#[cfg(test)]
+mod delete_credential_tests {
+    use super::Storage;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    async fn open_temp_storage() -> Storage {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-delete-cred-{}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        Storage::open(&dir).await.expect("open storage")
+    }
+
+    async fn insert_provider(storage: &Storage, id: &str, name: &str) {
+        sqlx::query(
+            "INSERT INTO providers (id, name, region, protocol, base_url, configured, selected_models, discovered_models, kind, routing_mode)
+             VALUES (?, ?, 'global', 'openai-compatible', 'https://example.test', 1, 0, 0, ?, 'pool')",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(id)
+        .execute(&storage.pool)
+        .await
+        .expect("insert provider");
+    }
+
+    async fn insert_credential_row(
+        storage: &Storage,
+        id: &str,
+        provider_id: &str,
+        fingerprint: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO credentials (
+                id, provider_id, kind, state, label, email, account_id, expires_at,
+                fingerprint, refreshable, secret_envelope_json
+             ) VALUES (?, ?, 'api_key', 'ready', 'acct', NULL, NULL, NULL, ?, 0, '{}')",
+        )
+        .bind(id)
+        .bind(provider_id)
+        .bind(fingerprint)
+        .execute(&storage.pool)
+        .await
+        .expect("insert credential");
+    }
+
+    #[tokio::test]
+    async fn delete_last_credential_clears_fixed_routing_and_quota() {
+        let storage = open_temp_storage().await;
+        insert_provider(&storage, "p1", "Provider 1").await;
+        insert_credential_row(&storage, "c1", "p1", "fp-c1").await;
+        let pool_id = storage.ensure_default_pool("p1").await.expect("pool");
+        storage
+            .add_pool_member(&pool_id, "c1")
+            .await
+            .expect("member");
+        storage
+            .set_provider_routing("p1", "fixed", Some("c1"))
+            .await
+            .expect("fixed");
+        sqlx::query(
+            "INSERT INTO app_settings (key, value_json) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        )
+        .bind("quota:c1")
+        .bind("{\"credentialId\":\"c1\"}")
+        .execute(&storage.pool)
+        .await
+        .expect("quota key");
+
+        let result = storage.delete_credential("c1").await.expect("delete");
+        assert_eq!(result.provider_id, "p1");
+        assert_eq!(result.remaining_accounts, 0);
+
+        let creds = storage.list_credentials(Some("p1")).await.expect("list");
+        assert!(creds.is_empty());
+
+        let members = storage
+            .list_pool_member_ids(&pool_id)
+            .await
+            .expect("members");
+        assert!(members.is_empty());
+
+        let routing = storage
+            .get_provider_routing("p1")
+            .await
+            .expect("routing")
+            .expect("present");
+        assert_eq!(routing.routing_mode, "pool");
+        assert!(routing.fixed_credential_id.is_none());
+
+        let quota_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM app_settings WHERE key = 'quota:c1'",
+        )
+        .fetch_one(&storage.pool)
+        .await
+        .expect("quota count");
+        assert_eq!(quota_left, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_one_of_many_keeps_sibling_and_returns_remaining() {
+        let storage = open_temp_storage().await;
+        insert_provider(&storage, "p1", "Provider 1").await;
+        insert_credential_row(&storage, "c1", "p1", "fp-c1").await;
+        insert_credential_row(&storage, "c2", "p1", "fp-c2").await;
+        let pool_id = storage.ensure_default_pool("p1").await.expect("pool");
+        storage.add_pool_member(&pool_id, "c1").await.expect("m1");
+        storage.add_pool_member(&pool_id, "c2").await.expect("m2");
+        storage
+            .set_provider_routing("p1", "fixed", Some("c1"))
+            .await
+            .expect("fixed");
+
+        let result = storage.delete_credential("c1").await.expect("delete");
+        assert_eq!(result.remaining_accounts, 1);
+
+        let creds = storage.list_credentials(Some("p1")).await.expect("list");
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].id, "c2");
+
+        let members = storage
+            .list_pool_member_ids(&pool_id)
+            .await
+            .expect("members");
+        assert_eq!(members, vec!["c2".to_string()]);
+
+        let routing = storage
+            .get_provider_routing("p1")
+            .await
+            .expect("routing")
+            .expect("present");
+        assert_eq!(routing.routing_mode, "pool");
+        assert!(routing.fixed_credential_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_missing_credential_errors() {
+        let storage = open_temp_storage().await;
+        let err = storage
+            .delete_credential("missing")
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("账号不存在"));
     }
 }
