@@ -1,6 +1,6 @@
 [package]
 name = "codex-spur"
-version = "0.1.1"
+version = "0.1.2"
 description = "A local-first model and account router for Codex"
 authors = ["Codex Spur"]
 edition = "2021"
@@ -28,12 +28,17 @@ tauri-build = { version = "2", features = [] }
 aes-gcm = "0.11"
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 brotli = "7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crypto_box = { version = "0.9", features = ["std", "seal"] }
 directories = "6"
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 getrandom = "0.4"
+rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 zstd = "0.13"
 secrecy = "0.10"

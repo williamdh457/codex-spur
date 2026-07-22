@@ -371,6 +371,19 @@ pub async fn discover_official_models(
     access_token: &str,
     account_id: &str,
 ) -> anyhow::Result<Vec<DiscoveredProviderModel>> {
+    discover_official_models_with_authorization(
+        &format!("Bearer {access_token}"),
+        account_id,
+    )
+    .await
+}
+
+/// Discover ChatGPT Codex models with a full Authorization header value
+/// (`Bearer …` or `AgentAssertion …`).
+pub async fn discover_official_models_with_authorization(
+    authorization: &str,
+    account_id: &str,
+) -> anyhow::Result<Vec<DiscoveredProviderModel>> {
     let client = reqwest::Client::builder()
         .user_agent(format!("codex_cli_rs/{}", CODEX_CLIENT_VERSION))
         .build()?;
@@ -380,7 +393,7 @@ pub async fn discover_official_models(
     );
     let response = client
         .get(models_url)
-        .bearer_auth(access_token)
+        .header(reqwest::header::AUTHORIZATION, authorization)
         .header("ChatGPT-Account-Id", account_id)
         .header("chatgpt-account-id", account_id)
         .header("originator", CODEX_ORIGINATOR)
@@ -976,6 +989,9 @@ pub fn credential_secret_json(
         "id_token": credential.secret.id_token,
         "session_token": credential.secret.session_token,
         "api_key": credential.secret.api_key,
+        "agent_runtime_id": credential.secret.agent_runtime_id,
+        "agent_private_key": credential.secret.agent_private_key,
+        "task_id": credential.secret.task_id,
     }))?)
 }
 

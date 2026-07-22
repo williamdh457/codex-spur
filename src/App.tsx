@@ -5,6 +5,8 @@ import modelPickerShot from "./assets/codex-model-picker.png";
 import {
   applyCodexConfig,
   cancelOpenAiBrowserLogin,
+  disableKimiPublish,
+  enableKimiPublish,
   cancelXaiDeviceLogin,
   clearProxyRequestEvents,
   completeOpenAiOauthCallbackUrl,
@@ -19,7 +21,9 @@ import {
   getPoolSchedulerConfig,
   getProviderRouting,
   importCredentialsJson,
+  importSessionJson,
   importProviderConfigJson,
+  kimiTargetStatus,
   listCredentials,
   listModelRoutes,
   listPoolMembersDetailed,
@@ -136,7 +140,7 @@ function Overview({
         {snapshot.providers.length === 0 ? (
           <EmptyState
             title="还没有供应商"
-            body="像 CC Switch 一样添加：OpenAI、导入 JSON、导入账号，或 Kimi / DeepSeek。保存并拉取后会出现在这里。"
+            body="添加 OpenAI（官方订阅 / 账号 JSON / session）或 Kimi / DeepSeek。保存并拉取后会出现在这里。"
             action="添加供应商"
             onAction={onAddProvider}
           />
@@ -254,9 +258,8 @@ function Overview({
 
 type AddMethodId =
   | "openai-official"
-  | "openai-api"
   | "openai-accounts"
-  | "openai-config-json"
+  | "openai-session"
   | "xai-official"
   | "xai-api"
   | "kimi"
@@ -273,7 +276,7 @@ type AddMethod = {
   kind: ProviderKind;
   title: string;
   hint: string;
-  mode: "api" | "configJson" | "accounts" | "oauth";
+  mode: "api" | "configJson" | "accounts" | "session" | "oauth";
   category: EntryCategory;
 };
 
@@ -333,33 +336,25 @@ const ADD_METHODS: AddMethod[] = [
   {
     id: "openai-official",
     kind: "openai",
-    title: "OpenAI",
-    hint: "浏览器登录 ChatGPT · 写入本实例账号",
+    title: "OpenAI · 官方订阅",
+    hint: "浏览器登录 ChatGPT（PKCE）",
     mode: "oauth",
     category: "official",
-  },
-  {
-    id: "openai-api",
-    kind: "openai",
-    title: "OpenAI",
-    hint: "api.openai.com 密钥（非官方订阅额度）",
-    mode: "api",
-    category: "api",
   },
   {
     id: "openai-accounts",
     kind: "openai",
     title: "OpenAI · 导入账号 JSON",
-    hint: "多账号凭据 JSON → 一个实例内调度池",
+    hint: "单/多账号 JSON → Agent Identity / OAuth 入库",
     mode: "accounts",
     category: "json",
   },
   {
-    id: "openai-config-json",
+    id: "openai-session",
     kind: "openai",
-    title: "OpenAI · 导入配置 JSON",
-    hint: "供应商 base_url + api_key / models（不是账号 JSON）",
-    mode: "configJson",
+    title: "OpenAI · 导入 session 文件",
+    hint: "ChatGPT session dump → 注册 Agent Identity",
+    mode: "session",
     category: "json",
   },
   {
@@ -439,14 +434,89 @@ function providerUrl(provider: ProviderSummary): string {
   return provider.baseUrl ?? provider.defaultBaseUrl ?? DEFAULT_BASE_URL[provider.kind] ?? "";
 }
 
-function useEscapeClose(onClose: () => void) {
+function useEscapeClose(onClose: () => void, enabled = true) {
   useEffect(() => {
+    if (!enabled) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [enabled, onClose]);
+}
+
+type ConfirmRequest = {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  danger?: boolean;
+  onConfirm: () => void | Promise<void>;
+};
+
+/** In-app confirmation (never window.confirm — blocked/silent inside Tauri modals). */
+function ConfirmSheet({
+  request,
+  busy,
+  onCancel,
+}: {
+  request: ConfirmRequest;
+  busy: boolean;
+  onCancel: () => void;
+}) {
+  const titleId = useId();
+  const confirmRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    confirmRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) {
+        event.preventDefault();
+        event.stopPropagation();
+        onCancel();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [busy, onCancel]);
+
+  return (
+    <div
+      className="confirm-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !busy) onCancel();
+      }}
+    >
+      <section
+        className="confirm-sheet"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+      >
+        <header className="confirm-sheet__header">
+          <h3 id={titleId}>{request.title}</h3>
+          <p>{request.body}</p>
+        </header>
+        <footer className="confirm-sheet__footer">
+          <button type="button" className="button button--secondary" disabled={busy} onClick={onCancel}>
+            取消
+          </button>
+          <button
+            ref={confirmRef}
+            type="button"
+            className={`button ${request.danger ? "button--danger" : "button--primary"}`}
+            disabled={busy}
+            onClick={() => void request.onConfirm()}
+          >
+            {busy ? "处理中…" : request.confirmLabel}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
 }
 
 function resolveAddMethod(id: AddMethodId): AddMethod {
@@ -464,7 +534,9 @@ function resolveAddMethod(id: AddMethodId): AddMethod {
 
 function supportsOfficialQuota(account: CredentialSummary): boolean {
   // Official ChatGPT usage windows require a subscription-style credential, not a plain API key.
+  // Agent Identity is durable subscription auth without OAuth refresh tokens.
   const kind = account.kind.toLowerCase();
+  if (kind === "agent_identity" || kind === "agentidentity") return true;
   return kind !== "api_key" && kind !== "apikey";
 }
 
@@ -599,6 +671,8 @@ function AddProviderWizard({
   const [deviceLogin, setDeviceLogin] = useState<DeviceLoginStart | null>(null);
   const [loginStatus, setLoginStatus] = useState<string | null>(null);
   const [callbackUrl, setCallbackUrl] = useState("");
+  /** Paste buffer for account JSON (text import; never logged). */
+  const [accountsJsonText, setAccountsJsonText] = useState("");
   const pollRef = useRef<number | null>(null);
   const finishingLoginRef = useRef(false);
 
@@ -722,7 +796,12 @@ function AddProviderWizard({
     }
   };
 
-  const submitAccounts = async (file: File) => {
+  const submitAccountsJson = async (raw: string, clearFile = false, asSession = false) => {
+    const input = raw.trim();
+    if (!input) {
+      setMessage(asSession ? "请粘贴 session JSON，或选择 session 文件。" : "请粘贴账号 JSON，或选择 JSON 文件。");
+      return;
+    }
     setBusy(true);
     setMessage(null);
     let createdId: string | null = null;
@@ -730,12 +809,16 @@ function AddProviderWizard({
     try {
       const created = await createProviderInstance(method.kind, displayName.trim() || undefined);
       createdId = created.id;
-      const imported = await importCredentialsJson(created.id, await file.text());
+      const imported = asSession
+        ? await importSessionJson(created.id, input)
+        : await importCredentialsJson(created.id, input);
       if (imported.length === 0) {
-        throw new Error("未解析到任何账号，请检查 JSON。");
+        throw new Error(asSession ? "未从 session 解析到账号。" : "未解析到任何账号，请检查 JSON。");
       }
       accountsImported = true;
+      setAccountsJsonText("");
       try {
+        // Empty base_url → official ChatGPT Codex discovery path.
         const routes = await discoverProviderModels(created.id, "", undefined);
         const count = routes.filter((route) => route.providerId === created.id).length;
         await finishCreate(created, count);
@@ -752,8 +835,12 @@ function AddProviderWizard({
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
-      if (accountFileRef.current) accountFileRef.current.value = "";
+      if (clearFile && accountFileRef.current) accountFileRef.current.value = "";
     }
+  };
+
+  const submitAccounts = async (file: File) => {
+    await submitAccountsJson(await file.text(), true, method.mode === "session");
   };
 
   const stopPolling = () => {
@@ -1076,25 +1163,110 @@ function AddProviderWizard({
             )}
 
             {method.mode === "accounts" && (
-              <section className="modal-section" aria-label="导入账号 JSON 账号池">
+              <section className="modal-section" aria-label="导入账号 JSON">
                 <div className="callout">
                   <strong>
                     OpenAI · 导入账号 JSON
                     <span className="method-badge method-badge--json">JSON</span>
                   </strong>
                   <p>
-                    从 JSON 文件导入<strong>多账号</strong>（account.json / Sub2API / access_token…）到
-                    <strong>同一个</strong> OpenAI 实例的内部调度池（粘性 → Top-K）。
-                    不是全局账号池产品；导入后可在实例内看 5h / 7d 额度并调度。
+                    粘贴或上传<strong>账号</strong> JSON（单对象 / 数组 / <code>accounts[]</code> / Codex auth.json / Sub2API 导出 / Agent Identity）。
+                    ChatGPT access 会自动注册为 <strong>Agent Identity</strong>，导入后立刻拉取官方模型。
+                    Session dump 请改用「导入 session 文件」。
                   </p>
-                  <button type="button" className="button button--primary" disabled={busy} onClick={() => accountFileRef.current?.click()}>
-                    {busy ? "导入中…" : "选择账号 JSON 并添加"}
-                  </button>
+                  <label className="field">
+                    <span>粘贴账号 JSON</span>
+                    <textarea
+                      className="field-textarea field-textarea--code"
+                      rows={8}
+                      value={accountsJsonText}
+                      onChange={(event) => setAccountsJsonText(event.target.value)}
+                      placeholder={'{"access_token":"…"} 或 accounts 数组 / auth_mode=agentIdentity'}
+                      spellCheck={false}
+                      autoComplete="off"
+                      disabled={busy}
+                    />
+                  </label>
+                  <div className="form-actions form-actions--wrap">
+                    <button
+                      type="button"
+                      className="button button--primary"
+                      disabled={busy || !accountsJsonText.trim()}
+                      onClick={() => void submitAccountsJson(accountsJsonText, false, false)}
+                    >
+                      {busy ? "导入中…" : "从文本导入并添加"}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--secondary"
+                      disabled={busy}
+                      onClick={() => accountFileRef.current?.click()}
+                    >
+                      选择 JSON 文件
+                    </button>
+                  </div>
                   <input
                     ref={accountFileRef}
                     className="visually-hidden"
                     type="file"
-                    accept=".json,application/json"
+                    accept=".json,application/json,.txt,text/plain"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) void submitAccounts(file);
+                    }}
+                  />
+                </div>
+              </section>
+            )}
+
+            {method.mode === "session" && (
+              <section className="modal-section" aria-label="导入 session 文件">
+                <div className="callout">
+                  <strong>
+                    OpenAI · 导入 session 文件
+                    <span className="method-badge method-badge--json">Session</span>
+                  </strong>
+                  <p>
+                    从浏览器打开 <code>https://chatgpt.com/api/auth/session</code>，复制整页 JSON
+                    （含 <code>WARNING_BANNER</code> 也可）。将注册 <strong>Agent Identity</strong>
+                    （无需接码），并立刻拉取官方模型。
+                  </p>
+                  <label className="field">
+                    <span>粘贴 session JSON</span>
+                    <textarea
+                      className="field-textarea field-textarea--code"
+                      rows={8}
+                      value={accountsJsonText}
+                      onChange={(event) => setAccountsJsonText(event.target.value)}
+                      placeholder={'{"accessToken":"…","user":{…},"account":{…}}'}
+                      spellCheck={false}
+                      autoComplete="off"
+                      disabled={busy}
+                    />
+                  </label>
+                  <div className="form-actions form-actions--wrap">
+                    <button
+                      type="button"
+                      className="button button--primary"
+                      disabled={busy || !accountsJsonText.trim()}
+                      onClick={() => void submitAccountsJson(accountsJsonText, false, true)}
+                    >
+                      {busy ? "注册并导入中…" : "导入 session 并添加"}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--secondary"
+                      disabled={busy}
+                      onClick={() => accountFileRef.current?.click()}
+                    >
+                      选择 session 文件
+                    </button>
+                  </div>
+                  <input
+                    ref={accountFileRef}
+                    className="visually-hidden"
+                    type="file"
+                    accept=".json,application/json,.txt,text/plain"
                     onChange={(event) => {
                       const file = event.target.files?.[0];
                       if (file) void submitAccounts(file);
@@ -1150,13 +1322,17 @@ function EditProviderSheet({
 }: {
   provider: ProviderSummary;
   onClose: () => void;
+  /** Quiet refresh after mutations (does not flash global loading). */
   onChanged: () => Promise<void>;
 }) {
   const accountFileRef = useRef<HTMLInputElement>(null);
+  const sessionFileRef = useRef<HTMLInputElement>(null);
   const configFileRef = useRef<HTMLInputElement>(null);
+  const [accountsJsonText, setAccountsJsonText] = useState("");
   const [name, setName] = useState(provider.name);
-  const [source, setSource] = useState<"official" | "apiKey">(
-    provider.kind === "openai" && (provider.baseUrl?.includes("chatgpt.com") ?? true) ? "official" : "apiKey",
+  // Non-OpenAI still uses apiKey form; OpenAI always uses official discovery path.
+  const [source] = useState<"official" | "apiKey">(
+    provider.kind === "openai" ? "official" : "apiKey",
   );
   const [baseUrl, setBaseUrl] = useState(() => providerUrl(provider));
   const [apiKey, setApiKey] = useState("");
@@ -1170,13 +1346,17 @@ function EditProviderSheet({
   );
   const [poolId, setPoolId] = useState<string | null>(provider.activePoolId);
   const [busy, setBusy] = useState(false);
+  const [deletingCredentialId, setDeletingCredentialId] = useState<string | null>(null);
+  const [deletingProvider, setDeletingProvider] = useState(false);
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [quotas, setQuotas] = useState<Record<string, OpenAiQuotaSnapshot | null>>({});
   const [quotaBusy, setQuotaBusy] = useState<Record<string, boolean>>({});
   const [quotaErrors, setQuotaErrors] = useState<Record<string, string | null>>({});
   const [quotaClockMs, setQuotaClockMs] = useState(() => Date.now());
+  const deleteBusy = deletingCredentialId != null || deletingProvider;
 
-  useEscapeClose(onClose);
+  useEscapeClose(onClose, !confirm && !deleteBusy);
 
   useEffect(() => {
     const timer = window.setInterval(() => setQuotaClockMs(Date.now()), 60_000);
@@ -1292,12 +1472,28 @@ function EditProviderSheet({
   };
 
   const configureApi = async () => {
-    if (source === "apiKey" && !baseUrl.trim() && !provider.defaultBaseUrl && !provider.baseUrl) {
-      setMessage("请填写 Base URL。");
+    if (provider.kind === "openai") {
+      if (accounts.length === 0) {
+        setMessage("请先用官方订阅 / 账号 JSON / session 添加至少一个账号。");
+        return;
+      }
+      setBusy(true);
+      setMessage(null);
+      try {
+        const routes = await discoverProviderModels(provider.id, "", undefined);
+        const count = routes.filter((route) => route.providerId === provider.id).length;
+        setMessage(`已拉取 ${count} 个官方模型。`);
+        await applyAccountSnapshot(provider.id, provider.activePoolId, provider.routingMode, provider.fixedCredentialId);
+        await onChanged();
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(false);
+      }
       return;
     }
-    if (source === "official" && provider.kind === "openai" && accounts.length === 0) {
-      setMessage("官方订阅需要先导入账号 JSON。");
+    if (source === "apiKey" && !baseUrl.trim() && !provider.defaultBaseUrl && !provider.baseUrl) {
+      setMessage("请填写 Base URL。");
       return;
     }
     setBusy(true);
@@ -1320,23 +1516,48 @@ function EditProviderSheet({
     }
   };
 
-  const importAccountFile = async (file: File) => {
+  const importAccountsJson = async (raw: string, clearFile = false, asSession = false) => {
+    const input = raw.trim();
+    if (!input) {
+      setMessage(asSession ? "请粘贴 session JSON，或选择 session 文件。" : "请粘贴账号 JSON，或选择 JSON 文件。");
+      return;
+    }
     setBusy(true);
     setMessage(null);
     try {
-      const imported = await importCredentialsJson(provider.id, await file.text());
+      const imported = asSession
+        ? await importSessionJson(provider.id, input)
+        : await importCredentialsJson(provider.id, input);
+      setAccountsJsonText("");
       await applyAccountSnapshot(provider.id, provider.activePoolId, provider.routingMode, provider.fixedCredentialId);
-      setMessage(`已导入 ${imported.length} 个账号到此实例。`);
+      // Immediately refresh official models after account/session import.
+      let modelNote = "";
+      try {
+        const routes = await discoverProviderModels(provider.id, "", undefined);
+        const count = routes.filter((route) => route.providerId === provider.id).length;
+        modelNote = `，已拉取 ${count} 个模型`;
+      } catch (modelError) {
+        modelNote = `，模型拉取失败：${modelError instanceof Error ? modelError.message : String(modelError)}`;
+      }
+      setMessage(`已导入 ${imported.length} 个账号到此实例${modelNote}。`);
       await onChanged();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
-      if (accountFileRef.current) accountFileRef.current.value = "";
+      if (clearFile && accountFileRef.current) accountFileRef.current.value = "";
     }
   };
 
+  const importAccountFile = async (file: File, asSession = false) => {
+    await importAccountsJson(await file.text(), true, asSession);
+  };
+
   const importConfigFile = async (file: File) => {
+    if (provider.kind === "openai") {
+      setMessage("OpenAI 已不再支持导入供应商配置 JSON，请用账号 JSON 或 session。");
+      return;
+    }
     setBusy(true);
     setMessage(null);
     try {
@@ -1391,65 +1612,107 @@ function EditProviderSheet({
     }
   };
 
-  const remove = async () => {
-    if (!window.confirm(`确定删除供应商「${provider.name}」？其账号与模型候选会一并删除。`)) return;
-    setBusy(true);
+  const executeDeleteProvider = async () => {
+    setDeletingProvider(true);
     setMessage(null);
     try {
       await deleteProviderInstance(provider.id);
-      await onChanged();
+      setConfirm(null);
       onClose();
+      void onChanged();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
-      setBusy(false);
+      setConfirm(null);
+    } finally {
+      setDeletingProvider(false);
     }
   };
 
-  const removeAccount = async (account: CredentialSummary) => {
-    const identity =
-      account.label ??
-      account.maskedEmail ??
-      account.maskedAccountId ??
-      account.fingerprintPrefix;
-    if (
-      !window.confirm(
-        `确定删除账号「${identity}」？\n\n此操作不可恢复：本地加密凭据将永久删除，并从调度池移出。`,
-      )
-    ) {
-      return;
-    }
-    setBusy(true);
+  const requestDeleteProvider = () => {
+    setConfirm({
+      title: `删除供应商「${provider.name}」？`,
+      body: "此操作不可恢复：账号凭据、调度池成员与模型候选会一并删除。",
+      confirmLabel: "删除供应商",
+      danger: true,
+      onConfirm: () => executeDeleteProvider(),
+    });
+  };
+
+  const executeDeleteAccount = async (account: CredentialSummary, identity: string) => {
+    setDeletingCredentialId(account.id);
     setMessage(null);
+    // Optimistic remove so the row disappears even if snapshot refresh is slow.
+    setAccounts((prev) => prev.filter((item) => item.id !== account.id));
+    setMembers((prev) => prev.filter((item) => item.credentialId !== account.id));
+    setQuotas((prev) => {
+      const next = { ...prev };
+      delete next[account.id];
+      return next;
+    });
+    if (fixedCredentialId === account.id) {
+      setFixedCredentialId(null);
+      setRoutingMode("pool");
+    }
     try {
       const result = await deleteCredential(account.id);
-      const routing = await getProviderRouting(provider.id);
-      await applyAccountSnapshot(
-        provider.id,
-        routing?.activePoolId ?? provider.activePoolId,
-        routing?.routingMode ?? "pool",
-        routing?.fixedCredentialId ?? null,
-      );
-      await onChanged();
+      setConfirm(null);
+      try {
+        const routing = await getProviderRouting(provider.id);
+        await applyAccountSnapshot(
+          provider.id,
+          routing?.activePoolId ?? provider.activePoolId,
+          routing?.routingMode ?? "pool",
+          routing?.fixedCredentialId ?? null,
+        );
+      } catch {
+        // Local optimistic state already updated.
+      }
+      void onChanged();
 
       if (result.remainingAccounts === 0) {
-        const deleteProvider = window.confirm(
-          `「${provider.name}」已无账号。是否一并删除此供应商实例？\n\n删除后模型候选也会移除。`,
-        );
-        if (deleteProvider) {
-          await deleteProviderInstance(provider.id);
-          await onChanged();
-          onClose();
-          return;
-        }
         setMessage("账号已删除。此实例暂无账号。");
+        setConfirm({
+          title: `「${provider.name}」已无账号`,
+          body: "是否一并删除此供应商实例？删除后模型候选也会移除。",
+          confirmLabel: "删除供应商",
+          danger: true,
+          onConfirm: () => executeDeleteProvider(),
+        });
       } else {
         setMessage(`已删除账号「${identity}」。`);
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
+      setConfirm(null);
+      // Re-sync list from storage after a failed/partial delete attempt.
+      try {
+        await applyAccountSnapshot(
+          provider.id,
+          provider.activePoolId,
+          provider.routingMode,
+          provider.fixedCredentialId,
+        );
+      } catch {
+        // ignore
+      }
     } finally {
-      setBusy(false);
+      setDeletingCredentialId(null);
     }
+  };
+
+  const requestDeleteAccount = (account: CredentialSummary) => {
+    const identity =
+      account.label ??
+      account.maskedEmail ??
+      account.maskedAccountId ??
+      account.fingerprintPrefix;
+    setConfirm({
+      title: `删除账号「${identity}」？`,
+      body: "此操作不可恢复：本地加密凭据将永久删除，并从调度池移出。",
+      confirmLabel: "删除账号",
+      danger: true,
+      onConfirm: () => executeDeleteAccount(account, identity),
+    });
   };
 
 
@@ -1481,20 +1744,12 @@ function EditProviderSheet({
 
             <section className="modal-section" aria-label="连接">
               <div className="modal-section__header"><div><h3>连接</h3><p>保存并拉取会刷新此实例的模型候选。</p></div></div>
-              {provider.kind === "openai" && (
-                <div className="segmented-control" role="tablist" aria-label="OpenAI 通道">
-                  <button type="button" className={source === "official" ? "segmented-control__item--active" : ""} onClick={() => { setSource("official"); setBaseUrl(provider.defaultBaseUrl ?? "https://chatgpt.com/backend-api/codex"); }}>官方订阅</button>
-                  <button type="button" className={source === "apiKey" ? "segmented-control__item--active" : ""} onClick={() => { setSource("apiKey"); setBaseUrl(provider.baseUrl && !provider.baseUrl.includes("chatgpt.com") ? provider.baseUrl : "https://api.openai.com/v1"); }}>OpenAI API Key</button>
-                </div>
-              )}
-              {source === "official" && provider.kind === "openai" ? (
+              {provider.kind === "openai" ? (
                 <div className="callout">
-                  <strong>
-                    官方订阅通道
-                  </strong>
+                  <strong>OpenAI 官方通道</strong>
                   <p>
-                    使用此实例内的官方账号（浏览器登录或账号 JSON 导入）拉取 ChatGPT 后端模型。
-                    健康账号：{provider.healthyCredentialCount}/{provider.credentialCount}。下方账号列表可看 5h / 7d 额度。
+                    仅支持三种加号方式：官方订阅、账号 JSON、session 文件。健康账号：
+                    {provider.healthyCredentialCount}/{provider.credentialCount}。
                   </p>
                 </div>
               ) : (
@@ -1505,7 +1760,7 @@ function EditProviderSheet({
               )}
               <div className="form-actions">
                 <button type="button" className="button button--primary" disabled={busy} onClick={() => void configureApi()}>
-                  {busy ? "正在保存并拉取…" : "保存并拉取模型"}
+                  {busy ? "正在保存并拉取…" : provider.kind === "openai" ? "重新拉取官方模型" : "保存并拉取模型"}
                 </button>
               </div>
             </section>
@@ -1515,18 +1770,57 @@ function EditProviderSheet({
                 <div>
                   <h3>账号{accounts.length > 1 ? " · 实例内调度池" : ""}</h3>
                   <p>
-                    账号属于此实例。
-                    {accounts.length > 1
-                      ? "多账号时在实例内做池调度（粘性 → Top-K），不是全局账号池产品。"
-                      : "可继续导入账号 JSON 组成实例内调度池。"}
-                    {provider.kind === "openai" ? " 官方订阅账号显示 5 小时 / 7 天额度。" : ""}
+                    {provider.kind === "openai"
+                      ? "可继续：导入账号 JSON、导入 session，或使用官方订阅登录再加一号。导入后自动拉模型。"
+                      : accounts.length > 1
+                        ? "多账号时在实例内做池调度（粘性 → Top-K）。"
+                        : "可继续导入账号 JSON 组成实例内调度池。"}
                   </p>
                 </div>
                 <span className="badge badge--neutral">{accounts.length} 个</span>
               </div>
+              <label className="field">
+                <span>{provider.kind === "openai" ? "粘贴账号 JSON 或 session JSON" : "粘贴账号 JSON"}</span>
+                <textarea
+                  className="field-textarea field-textarea--code"
+                  rows={5}
+                  value={accountsJsonText}
+                  onChange={(event) => setAccountsJsonText(event.target.value)}
+                  placeholder={
+                    provider.kind === "openai"
+                      ? '账号 JSON：{"access_token":"…"} / accounts[]\nsession：{"accessToken":"…","user":{…},"account":{…}}'
+                      : '{"access_token":"…"} / accounts 数组'
+                  }
+                  spellCheck={false}
+                  autoComplete="off"
+                  disabled={busy}
+                />
+              </label>
               <div className="form-actions form-actions--wrap">
-                <button type="button" className="button button--secondary" disabled={busy} onClick={() => accountFileRef.current?.click()}>导入账号 JSON（账号池）</button>
-                <button type="button" className="button button--secondary" disabled={busy} onClick={() => configFileRef.current?.click()}>导入供应商配置 JSON</button>
+                <button
+                  type="button"
+                  className="button button--primary"
+                  disabled={busy || !accountsJsonText.trim()}
+                  onClick={() => void importAccountsJson(accountsJsonText, false, false)}
+                >
+                  导入账号 JSON
+                </button>
+                {provider.kind === "openai" ? (
+                  <button
+                    type="button"
+                    className="button button--primary"
+                    disabled={busy || !accountsJsonText.trim()}
+                    onClick={() => void importAccountsJson(accountsJsonText, false, true)}
+                  >
+                    导入 session
+                  </button>
+                ) : null}
+                <button type="button" className="button button--secondary" disabled={busy} onClick={() => accountFileRef.current?.click()}>选择账号 JSON 文件</button>
+                {provider.kind === "openai" ? (
+                  <button type="button" className="button button--secondary" disabled={busy} onClick={() => sessionFileRef.current?.click()}>选择 session 文件</button>
+                ) : (
+                  <button type="button" className="button button--secondary" disabled={busy} onClick={() => configFileRef.current?.click()}>导入供应商配置 JSON</button>
+                )}
                 {provider.kind === "openai" && accounts.some(supportsOfficialQuota) ? (
                   <button
                     type="button"
@@ -1537,7 +1831,8 @@ function EditProviderSheet({
                     刷新全部额度
                   </button>
                 ) : null}
-                <input ref={accountFileRef} className="visually-hidden" type="file" accept=".json,application/json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAccountFile(file); }} />
+                <input ref={accountFileRef} className="visually-hidden" type="file" accept=".json,application/json,.txt,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAccountFile(file, false); }} />
+                <input ref={sessionFileRef} className="visually-hidden" type="file" accept=".json,application/json,.txt,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAccountFile(file, true); }} />
                 <input ref={configFileRef} className="visually-hidden" type="file" accept=".json,application/json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importConfigFile(file); }} />
               </div>
 
@@ -1606,13 +1901,13 @@ function EditProviderSheet({
                           <button
                             type="button"
                             className="button button--secondary button--danger-text"
-                            disabled={busy}
+                            disabled={deleteBusy}
                             onClick={(event) => {
                               event.stopPropagation();
-                              void removeAccount(account);
+                              requestDeleteAccount(account);
                             }}
                           >
-                            删除
+                            {deletingCredentialId === account.id ? "删除中…" : "删除"}
                           </button>
                           {routingMode === "pool" && member ? (
                             <div className="member-knobs" onClick={(event) => event.stopPropagation()}>
@@ -1704,11 +1999,29 @@ function EditProviderSheet({
           </div>
         </div>
         <footer className="provider-modal__footer">
-          <button type="button" className="button button--secondary" disabled={busy} onClick={() => void remove()}>删除此供应商</button>
+          <button
+            type="button"
+            className="button button--secondary button--danger-text"
+            disabled={deleteBusy}
+            onClick={() => requestDeleteProvider()}
+          >
+            {deletingProvider ? "删除中…" : "删除此供应商"}
+          </button>
           <span>模型发布请到「模型」页开启。</span>
-          <button type="button" className="button button--secondary" onClick={onClose}>完成</button>
+          <button type="button" className="button button--secondary" disabled={deleteBusy} onClick={onClose}>
+            完成
+          </button>
         </footer>
       </section>
+      {confirm ? (
+        <ConfirmSheet
+          request={confirm}
+          busy={deleteBusy}
+          onCancel={() => {
+            if (!deleteBusy) setConfirm(null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
@@ -2173,6 +2486,132 @@ function CheckField({
   );
 }
 
+/** Experimental: two-button Kimi publish (enable / disable). */
+function KimiPublishPanel() {
+  const [busy, setBusy] = useState(false);
+  /** Sole source of the status line after user actions / load. */
+  const [stateLabel, setStateLabel] = useState("状态：…");
+  const [message, setMessage] = useState<string | null>(null);
+  const [messageTone, setMessageTone] = useState<"ok" | "warn" | "err">("ok");
+  const loadStatus = async () => {
+    try {
+      const s = await kimiTargetStatus();
+      if (s.publishActive) {
+        setStateLabel(
+          `状态：已启用${s.lastModelCount != null ? ` · ${s.lastModelCount} 个模型` : ""} · 请完全退出并重开 Kimi`,
+        );
+      } else {
+        setStateLabel("状态：未启用");
+      }
+    } catch (error) {
+      setStateLabel("状态：未启用");
+      setMessage(error instanceof Error ? error.message : String(error));
+      setMessageTone("err");
+    }
+  };
+
+  const runEnable = async () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage(null);
+    setStateLabel("状态：启用中…");
+    try {
+      const result = await enableKimiPublish();
+      setStateLabel(
+        result.enabled
+          ? `状态：已启用${result.modelCount > 0 ? ` · ${result.modelCount} 个模型` : ""}（仅写盘）`
+          : "状态：未启用",
+      );
+      setMessage(result.message + (result.warnings.length ? `\n· ${result.warnings.slice(0, 4).join("\n· ")}` : ""));
+      setMessageTone("ok");
+    } catch (error) {
+      setStateLabel("状态：未启用");
+      setMessage(`启用失败：${error instanceof Error ? error.message : String(error)}`);
+      setMessageTone("err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runDisable = async () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage(null);
+    setStateLabel("状态：关闭中…");
+    try {
+      const result = await disableKimiPublish();
+      setStateLabel("状态：未启用");
+      setMessage(result.message + (result.warnings.length ? `\n· ${result.warnings.slice(0, 3).join("\n· ")}` : ""));
+      setMessageTone("ok");
+    } catch (error) {
+      setMessage(`关闭失败：${error instanceof Error ? error.message : String(error)}`);
+      setMessageTone("err");
+      await loadStatus();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="panel" aria-label="发布到 Kimi App">
+      <div className="panel__header">
+        <div>
+          <h2>发布到 Kimi App（实验）</h2>
+          <p>
+            启用 = 只写入 Kimi 缓存/配置（不改系统代理）。关闭 = 恢复备份。右下角要显示 Spur
+            模型需另做路径拦截，见 docs/kimi-app-selective-block.md。
+          </p>
+        </div>
+      </div>
+      <div className="settings-body">
+        <p
+          className="panel-hint"
+          style={{
+            fontSize: 13,
+            fontWeight: 600,
+            color: stateLabel.includes("已启用") ? "var(--success, #2a8)" : undefined,
+          }}
+        >
+          {stateLabel}
+        </p>
+        <div className="settings-body--inline">
+          <button type="button" className="button button--primary" disabled={busy} onClick={() => void runEnable()}>
+            {busy ? "处理中…" : "启用发布"}
+          </button>
+          <button type="button" className="button button--secondary" disabled={busy} onClick={() => void runDisable()}>
+            关闭发布
+          </button>
+          <button type="button" className="button button--secondary" disabled={busy} onClick={() => void loadStatus()}>
+            刷新状态
+          </button>
+        </div>
+        {message ? (
+          <div
+            className="empty-inline"
+            style={{
+              textAlign: "left",
+              whiteSpace: "pre-wrap",
+              borderColor:
+                messageTone === "err"
+                  ? "var(--danger, #c44)"
+                  : messageTone === "warn"
+                    ? "var(--warning, #b80)"
+                    : undefined,
+            }}
+          >
+            {message}
+          </div>
+        ) : (
+          <p className="panel-hint">
+            点启用只写盘，Kimi 应能正常联网打开。勿开「整站代理 www.kimi.com」。稳定多模型请用
+            Codex Apply。
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2292,6 +2731,8 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
           </button>
         </div>
       </section>
+
+      <KimiPublishPanel />
 
       <section className="panel" aria-label="账号池设置">
         <div className="panel__header">
@@ -2716,14 +3157,19 @@ export default function App() {
     [dismissToast],
   );
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const refresh = useCallback(async (opts?: { quiet?: boolean }) => {
+    const quiet = opts?.quiet === true;
+    if (!quiet) setLoading(true);
     try {
       setSnapshot(await getAppSnapshot());
     } finally {
-      setLoading(false);
+      if (!quiet) setLoading(false);
     }
   }, []);
+
+  const quietRefresh = useCallback(async () => {
+    await refresh({ quiet: true });
+  }, [refresh]);
 
   useEffect(() => {
     let active = true;
@@ -2852,7 +3298,7 @@ export default function App() {
             <h1>{title}</h1>
           </div>
           <div className="toolbar__actions">
-            <button type="button" className="icon-button" aria-label="刷新" onClick={() => void refresh()}>
+            <button type="button" className="icon-button" aria-label="刷新" onClick={() => void refresh({})}>
               {loading ? "…" : "↻"}
             </button>
             <button
@@ -2880,13 +3326,13 @@ export default function App() {
         </div>
       </main>
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
-      {addOpen && <AddProviderWizard onClose={() => setAddOpen(false)} onCreated={refresh} />}
+      {addOpen && <AddProviderWizard onClose={() => setAddOpen(false)} onCreated={quietRefresh} />}
       {editProvider && (
         <EditProviderSheet
           key={editProvider.id}
           provider={snapshot.providers.find((item) => item.id === editProvider.id) ?? editProvider}
           onClose={() => setEditProvider(null)}
-          onChanged={refresh}
+          onChanged={quietRefresh}
         />
       )}
     </div>

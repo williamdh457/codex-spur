@@ -299,3 +299,71 @@ export type CodexApplyOutcome = {
   modelLabels?: string[];
   warnings?: string[];
 };
+
+/** Experimental Kimi Desktop publisher status (config/cache only). */
+export type KimiTargetStatus = {
+  installed: boolean;
+  appVersion: string | null;
+  versionSupported: boolean;
+  userDir: string;
+  cachePath: string;
+  configPath: string;
+  runtimeTomlPath: string;
+  controlUrl: string | null;
+  controlReady: boolean;
+  lastPublishAt: string | null;
+  lastModelCount: number | null;
+  /** Persisted: last 启用发布 succeeded. */
+  publishActive: boolean;
+  warnings: string[];
+};
+
+export type KimiPublishPreview = {
+  experimental: boolean;
+  kimiVersion: string | null;
+  gatewayBaseUrl: string;
+  modelCount: number;
+  modelLabels: string[];
+  cachePath: string;
+  configPath: string;
+  runtimeTomlPath: string;
+  cachePreview: string;
+  configDiffSummary: string;
+  tomlDiffSummary: string;
+  warnings: string[];
+};
+
+export type KimiPublishOutcome = {
+  experimental: boolean;
+  modelCount: number;
+  modelLabels: string[];
+  backupDir: string;
+  cachePath: string;
+  configPath: string;
+  runtimeTomlPath: string;
+  controlUpdated: boolean;
+  restartRecommended: boolean;
+  warnings: string[];
+};
+
+/** Local CONNECT proxy that blocks www.kimi.com for Work model-list fallback. */
+export type KimiListShieldStatus = {
+  running: boolean;
+  port: number | null;
+  listen: string | null;
+  blockedHosts: string[];
+  blockedConnects: number;
+  tunneledConnects: number;
+  note: string;
+};
+
+/** One-shot enable/disable result for the two-button Kimi publish UI. */
+export type KimiPublishToggleResult = {
+  enabled: boolean;
+  modelCount: number;
+  modelLabels: string[];
+  shieldListen: string | null;
+  proxyOk: boolean;
+  message: string;
+  warnings: string[];
+};

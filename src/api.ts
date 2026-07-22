@@ -9,6 +9,11 @@ import type {
   ApplyPreview,
   CodexApplyOutcome,
   CredentialSummary,
+  KimiListShieldStatus,
+  KimiPublishOutcome,
+  KimiPublishPreview,
+  KimiPublishToggleResult,
+  KimiTargetStatus,
   DeleteCredentialResult,
   ModelRouteSummary,
   OpenAiQuotaSnapshot,
@@ -81,6 +86,87 @@ export async function applyCodexConfig(): Promise<CodexApplyOutcome> {
 
 export async function restorePreviousCodexConfig(): Promise<string | null> {
   return invoke<string | null>("restore_previous_codex_config");
+}
+
+/** Experimental: Kimi Desktop GUI publisher (config/cache only, not Codex Apply). */
+export async function kimiTargetStatus(): Promise<KimiTargetStatus> {
+  if (!isTauriRuntime()) {
+    return {
+      installed: false,
+      appVersion: null,
+      versionSupported: false,
+      userDir: "~/Library/Application Support/kimi-desktop",
+      cachePath: "",
+      configPath: "",
+      runtimeTomlPath: "",
+      controlUrl: null,
+      controlReady: false,
+      lastPublishAt: null,
+      lastModelCount: null,
+      publishActive: false,
+      warnings: ["浏览器预览无真实 Kimi 目录；请用 Tauri 桌面端操作。"],
+    };
+  }
+  return invoke<KimiTargetStatus>("kimi_target_status");
+}
+
+export async function previewKimiPublish(): Promise<KimiPublishPreview> {
+  if (!isTauriRuntime()) {
+    return {
+      experimental: true,
+      kimiVersion: null,
+      gatewayBaseUrl: "http://127.0.0.1:17861/coding/v1",
+      modelCount: 0,
+      modelLabels: [],
+      cachePath: "",
+      configPath: "",
+      runtimeTomlPath: "",
+      cachePreview: "{}",
+      configDiffSummary: "browser preview",
+      tomlDiffSummary: "browser preview",
+      warnings: ["浏览器预览不会写入 Kimi 目录。"],
+    };
+  }
+  return invoke<KimiPublishPreview>("preview_kimi_publish");
+}
+
+export async function applyKimiPublish(): Promise<KimiPublishOutcome> {
+  return invoke<KimiPublishOutcome>("apply_kimi_publish");
+}
+
+export async function restoreKimiPublish(): Promise<string | null> {
+  // Maps to full disable (restore + stop shield + clear proxy).
+  const result = await invoke<KimiPublishToggleResult>("disable_kimi_publish");
+  return result.message;
+}
+
+export async function reapplyKimiModelList(): Promise<KimiPublishOutcome> {
+  return invoke<KimiPublishOutcome>("reapply_kimi_model_list");
+}
+
+/** One-click: publish + shield + system proxy. */
+export async function enableKimiPublish(): Promise<KimiPublishToggleResult> {
+  return invoke<KimiPublishToggleResult>("enable_kimi_publish");
+}
+
+/** One-click: restore + stop shield + clear system proxy. */
+export async function disableKimiPublish(): Promise<KimiPublishToggleResult> {
+  return invoke<KimiPublishToggleResult>("disable_kimi_publish");
+}
+
+export async function kimiListShieldStatus(): Promise<KimiListShieldStatus> {
+  if (!isTauriRuntime()) {
+    return {
+      running: false,
+      port: null,
+      listen: null,
+      blockedHosts: ["www.kimi.com"],
+      blockedConnects: 0,
+      tunneledConnects: 0,
+      note: "浏览器预览无法启动列表保护。",
+    };
+  }
+  return invoke<KimiListShieldStatus>("kimi_list_shield_status");
 }
 
 export async function listModelRoutes(): Promise<ModelRouteSummary[]> {
@@ -243,6 +329,12 @@ export async function listCredentials(providerId?: string): Promise<CredentialSu
 export async function importCredentialsJson(providerId: string, input: string): Promise<CredentialSummary[]> {
   if (!isTauriRuntime()) return [];
   return invoke<CredentialSummary[]>("import_credentials_json", { providerId, input });
+}
+
+/** ChatGPT `/api/auth/session` dump → Agent Identity credential. */
+export async function importSessionJson(providerId: string, input: string): Promise<CredentialSummary[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<CredentialSummary[]>("import_session_json", { providerId, input });
 }
 
 export async function testAccount(credentialId: string, modelId: string): Promise<void> {

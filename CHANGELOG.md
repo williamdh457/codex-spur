@@ -4,11 +4,22 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-22
+
+### Features
+
+- **OpenAI entry simplified to three methods only**:
+  1. Official ChatGPT browser OAuth (PKCE)
+  2. Import account JSON (single/multi)
+  3. Import ChatGPT session dump
+- Removed OpenAI **API Key** and **provider config JSON** entry paths from the add/edit UI (legacy API-key instances still run).
+- **Agent Identity** for ChatGPT sessions: register Ed25519 runtime via `auth.openai.com` `agent/register`, store only runtime + private key, sign upstream requests with `AgentAssertion` (no SMS OAuth path required for session import).
+- Session/account import auto-discovers official Codex models so the provider becomes usable immediately after import (new instance or add-to-existing).
+
 ### Packaging
 
-- Windows **x64 NSIS** installer path via Tauri 2 (`npm run bundle:nsis` / GitHub Actions `windows-release.yml`).
-- Windows runtime fixes for Codex home (`USERPROFILE\.codex`), tray template icons (macOS-only), and publish CLI data-dir fallbacks.
-- Website release manifest supports dual assets (macOS DMG + Windows NSIS).
+- macOS Apple Silicon DMG for **0.1.2**.
+- Windows NSIS continues via tag-triggered `windows-release.yml`.
 
 ## [0.1.1] - 2026-07-21
 

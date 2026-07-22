@@ -1456,7 +1456,8 @@ struct AffinityInputs {
 struct UpstreamAuth {
     credential_id: String,
     lease_id: String,
-    token: String,
+    /// Full `Authorization` header value (`Bearer …` or `AgentAssertion …`).
+    authorization: String,
     account_id: Option<String>,
     layer: SelectionLayer,
     sticky_escaped: bool,
@@ -1467,7 +1468,7 @@ fn apply_upstream_headers(
     auth: &UpstreamAuth,
     target: &RouteTarget,
 ) -> reqwest::RequestBuilder {
-    request = request.bearer_auth(&auth.token);
+    request = request.header(reqwest::header::AUTHORIZATION, &auth.authorization);
     if let Some(account_id) = auth.account_id.as_deref() {
         request = request.header("ChatGPT-Account-Id", account_id);
     }
@@ -1805,12 +1806,89 @@ async fn decrypt_auth(
         }
     }
 
+    // Agent Identity: register/sign a task and use AgentAssertion (no OAuth bearer).
+    if let Some(mut agent_key) = crate::openai_agent_identity::agent_key_from_secret(&secret) {
+        if agent_key.task_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            match crate::openai_agent_identity::register_agent_task(&agent_key).await {
+                Ok(task_id) => {
+                    agent_key.task_id = Some(task_id.clone());
+                    secret.task_id = Some(task_id);
+                    secret_dirty = true;
+                }
+                Err(error) => {
+                    return Err(error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "agent_task_register_failed",
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
+        let task_id = agent_key.task_id.clone().unwrap_or_default();
+        let authorization =
+            match crate::openai_agent_identity::authorization_header_for_agent_task(
+                &agent_key, &task_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "agent_assertion_failed",
+                        &error.to_string(),
+                    ));
+                }
+            };
+        if secret_dirty {
+            if let Ok(json) = serde_json::to_vec(&serde_json::json!({
+                "access_token": secret.access_token,
+                "refresh_token": secret.refresh_token,
+                "id_token": secret.id_token,
+                "session_token": secret.session_token,
+                "api_key": secret.api_key,
+                "agent_runtime_id": secret.agent_runtime_id,
+                "agent_private_key": secret.agent_private_key,
+                "task_id": secret.task_id,
+            })) {
+                if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
+                    if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                        let account_id_for_store = credential
+                            .account_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty());
+                        let _ = state
+                            .storage
+                            .update_credential_secret(
+                                &credential.id,
+                                &envelope_json,
+                                None,
+                                account_id_for_store,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        return Ok(Some(UpstreamAuth {
+            credential_id: credential.id,
+            lease_id: lease.id.clone(),
+            authorization,
+            account_id: credential.account_id,
+            layer: lease.layer,
+            sticky_escaped: lease.sticky_escaped,
+        }));
+    }
+
     if secret_dirty {
         if let Ok(json) = serde_json::to_vec(&serde_json::json!({
             "access_token": secret.access_token,
             "refresh_token": secret.refresh_token,
             "id_token": secret.id_token,
             "session_token": secret.session_token,
+            "api_key": secret.api_key,
+            "agent_runtime_id": secret.agent_runtime_id,
+            "agent_private_key": secret.agent_private_key,
+            "task_id": secret.task_id,
         })) {
             if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
                 if let Ok(envelope_json) = serde_json::to_string(&envelope) {
@@ -1855,7 +1933,7 @@ async fn decrypt_auth(
     Ok(token.map(|token| UpstreamAuth {
         credential_id: credential.id,
         lease_id: lease.id.clone(),
-        token,
+        authorization: format!("Bearer {token}"),
         account_id: credential.account_id,
         layer: lease.layer,
         sticky_escaped: lease.sticky_escaped,
@@ -3108,6 +3186,229 @@ async fn passthrough(
     }
 }
 
+
+/// Kimi Desktop agent-gw compatible entry (experimental).
+/// Maps model aliases (`spur-…`) → Spur route slugs via alias map, then reuses
+/// the Chat Completions upstream path. Binds only on the existing localhost proxy.
+async fn kimi_coding_chat_completions(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    kimi_coding_chat_completions_inner(state, headers, body).await
+}
+
+async fn kimi_coding_chat_completions_v1(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Some clients call /coding/v1/v1/chat/completions when base already ends with /v1.
+    kimi_coding_chat_completions_inner(state, headers, body).await
+}
+
+async fn kimi_coding_chat_completions_inner(
+    state: ProxyState,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !authorized(&headers, &state.secret) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Invalid local proxy token for Kimi-compat gateway",
+        );
+    }
+    let mut parsed = match serde_json::from_slice::<Value>(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                &format!("Invalid chat body: {err}"),
+            );
+        }
+    };
+    let model = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if model.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "missing_model", "model is required");
+    }
+    let route_slug = resolve_kimi_model_to_route(&model);
+    let target = state.routes.read().await.get(&route_slug).cloned();
+    let Some(target) = target else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_route",
+            &format!(
+                "No Spur route for Kimi model `{model}` (mapped `{route_slug}`). Publish routes in Codex Spur first."
+            ),
+        );
+    };
+    if let Some(object) = parsed.as_object_mut() {
+        object.insert("model".into(), Value::String(target.upstream_model.clone()));
+    }
+    let affinity = affinity_inputs(&headers, &parsed);
+    state.metrics.record_request(&parsed);
+    let _ = state
+        .storage
+        .record_usage(
+            &target.provider_id,
+            &target.upstream_model,
+            &UsageDelta {
+                request_count: 1,
+                input_tokens: estimated_tokens(&parsed),
+                output_tokens: 0,
+                cache_observations: 0,
+                cache_hits: 0,
+                failed_requests: 0,
+            },
+        )
+        .await;
+    forward_native_chat_completions(&state, &target, parsed, &affinity).await
+}
+
+fn resolve_kimi_model_to_route(model: &str) -> String {
+    if let Some(mapped) = crate::kimi_target::load_alias_route_map().get(model) {
+        return mapped.clone();
+    }
+    model.to_string()
+}
+
+/// Forward an already-Chat-Completions body (Kimi agent-gw style) to upstream.
+async fn forward_native_chat_completions(
+    state: &ProxyState,
+    target: &RouteTarget,
+    mut request_body: Value,
+    affinity: &AffinityInputs,
+) -> Response {
+    if let Some(object) = request_body.as_object_mut() {
+        object.insert("model".into(), Value::String(target.upstream_model.clone()));
+    }
+    let wants_stream = request_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let endpoint = endpoint(&target.base_url, &target.kind, "chat/completions");
+    let max_switches = state
+        .storage
+        .max_failover_switches(&target.provider_id)
+        .await
+        .unwrap_or(3)
+        .max(1) as usize;
+    let mut exclude: Vec<String> = Vec::new();
+    let started = std::time::Instant::now();
+    for attempt in 0..max_switches {
+        let mut request = state.client.post(&endpoint).json(&request_body);
+        let auth = match upstream_auth(state, target, affinity, &exclude).await {
+            Ok(Some(auth)) => {
+                request = apply_upstream_headers(request, &auth, target);
+                Some(auth)
+            }
+            Ok(None) => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "no_upstream_credential",
+                    "No healthy upstream credential for this route; re-login the account in Codex Spur",
+                );
+            }
+            Err(response) => return response,
+        };
+        let upstream = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(auth) = auth {
+                    let _ = state.storage.release_lease(&auth.lease_id).await;
+                    if attempt + 1 < max_switches {
+                        exclude.push(auth.credential_id);
+                        continue;
+                    }
+                }
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_transport_error",
+                    &format!("Upstream request failed: {error}"),
+                );
+            }
+        };
+        let status = upstream.status();
+        if is_failover_status(status) {
+            if let Some(auth) = auth {
+                let body_bytes = upstream.bytes().await.unwrap_or_default();
+                let headers = Default::default();
+                let _ = handle_upstream_failure(
+                    state,
+                    &target.provider_id,
+                    &auth,
+                    status,
+                    &headers,
+                    Some(body_bytes.as_ref()),
+                )
+                .await;
+                let _ = state.storage.release_lease(&auth.lease_id).await;
+                if attempt + 1 < max_switches {
+                    exclude.push(auth.credential_id);
+                    continue;
+                }
+                return error_response(
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    "upstream_error",
+                    &String::from_utf8_lossy(&body_bytes),
+                );
+            }
+        }
+        if let Some(auth) = &auth {
+            record_diag(
+                state,
+                target,
+                auth,
+                attempt,
+                "ok",
+                false,
+                None,
+                started.elapsed().as_millis() as i64,
+            )
+            .await;
+            let _ = state.storage.release_lease(&auth.lease_id).await;
+        }
+        if wants_stream {
+            return adapt_chat_stream(
+                upstream,
+                &state.metrics,
+                &state.storage,
+                &target.provider_id,
+                &target.upstream_model,
+            )
+            .await;
+        }
+        let status_code =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let payload = upstream.json::<Value>().await.unwrap_or_else(|_| {
+            json!({"error":{"type":"upstream_error","message":"Upstream request failed"}})
+        });
+        return (status_code, Json(payload)).into_response();
+    }
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        "upstream_retry_exhausted",
+        "All eligible accounts failed",
+    )
+}
+
+async fn kimi_coding_health(State(state): State<ProxyState>) -> Response {
+    Json(json!({
+        "ok": true,
+        "service": "codex-spur-kimi-compat",
+        "experimental": true,
+        "catalogModels": state.catalog.read().await.models.len(),
+    }))
+    .into_response()
+}
+
+
 fn error_response(status: StatusCode, kind: &str, message: &str) -> Response {
     (
         status,
@@ -3195,6 +3496,10 @@ pub async fn start_with_secret(
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
+        // Experimental Kimi Desktop agent-gw compatible surface (config injection path).
+        .route("/coding/healthz", get(kimi_coding_health))
+        .route("/coding/v1/chat/completions", post(kimi_coding_chat_completions))
+        .route("/coding/v1/v1/chat/completions", post(kimi_coding_chat_completions_v1))
         .with_state(state);
     let address: SocketAddr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

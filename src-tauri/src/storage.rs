@@ -81,15 +81,15 @@ impl Storage {
             .map_err(sqlx::Error::Io)?;
         let path = data_dir.join("codex-select.sqlite3");
         let url = format!("sqlite://{}", path.display());
-        let options = SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
+        // foreign_keys(true) applies on every pool connection (PRAGMA is per-connection).
+        let options = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(options)
             .await?;
         sqlx::query("PRAGMA journal_mode = WAL;")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA foreign_keys = ON;")
             .execute(&pool)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
@@ -138,7 +138,7 @@ impl Storage {
                AND (
                  SELECT COUNT(*) FROM credentials c
                  WHERE c.provider_id = providers.id
-                   AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')
+                   AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session', 'agent_identity')
                ) >= 2",
         )
         .execute(&self.pool)
@@ -151,7 +151,7 @@ impl Storage {
                AND (
                  SELECT COUNT(*) FROM credentials c
                  WHERE c.provider_id = providers.id
-                   AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')
+                   AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session', 'agent_identity')
                ) = 1
                AND (
                  SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id
@@ -295,7 +295,7 @@ impl Storage {
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
                 (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind = 'api_key') AS api_key_count,
-                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')) AS oauth_count
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session', 'agent_identity')) AS oauth_count
              FROM providers
              ORDER BY CASE kind WHEN 'openai' THEN 0 WHEN 'xai' THEN 1 WHEN 'kimi' THEN 2 WHEN 'deepseek' THEN 3 WHEN 'minimax' THEN 4 ELSE 5 END, name, id",
         )
@@ -314,7 +314,7 @@ impl Storage {
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
                 (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind = 'api_key') AS api_key_count,
-                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session')) AS oauth_count
+                (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session', 'agent_identity')) AS oauth_count
              FROM providers WHERE id = ?",
         )
         .bind(provider_id)
@@ -379,10 +379,13 @@ impl Storage {
     }
 
     pub async fn delete_provider_instance(&self, provider_id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM providers WHERE id = ?")
+        let result = sqlx::query("DELETE FROM providers WHERE id = ?")
             .bind(provider_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::Protocol("供应商不存在".into()));
+        }
         Ok(())
     }
 
@@ -477,6 +480,21 @@ impl Storage {
                 entry_category: row.try_get("entry_category").ok().flatten(),
             })
             .collect())
+    }
+
+    pub async fn set_provider_base_url(
+        &self,
+        provider_id: &str,
+        base_url: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE providers SET base_url = ?, configured = CASE WHEN ? IS NOT NULL AND TRIM(?) != '' THEN 1 ELSE configured END WHERE id = ?")
+            .bind(base_url)
+            .bind(base_url)
+            .bind(base_url)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn replace_discovered_models(
@@ -2847,5 +2865,54 @@ mod delete_credential_tests {
             .await
             .expect_err("should fail");
         assert!(err.to_string().contains("账号不存在"));
+    }
+
+    #[tokio::test]
+    async fn delete_provider_cascades_credentials_pools_and_routes() {
+        let storage = open_temp_storage().await;
+        insert_provider(&storage, "p1", "Provider 1").await;
+        insert_credential_row(&storage, "c1", "p1", "fp-c1").await;
+        let pool_id = storage.ensure_default_pool("p1").await.expect("pool");
+        storage
+            .add_pool_member(&pool_id, "c1")
+            .await
+            .expect("member");
+        sqlx::query(
+            "INSERT INTO model_routes (id, provider_id, upstream_model, display_name, enabled, catalog_json)
+             VALUES ('r1', 'p1', 'm1', 'Model 1', 1, '{}')",
+        )
+        .execute(&storage.pool)
+        .await
+        .expect("route");
+
+        storage
+            .delete_provider_instance("p1")
+            .await
+            .expect("delete provider");
+
+        let providers = storage.list_providers().await.expect("providers");
+        assert!(!providers.iter().any(|p| p.id == "p1"));
+        let creds = storage.list_credentials(Some("p1")).await.expect("creds");
+        assert!(creds.is_empty());
+        let pools: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_pools WHERE provider_id = 'p1'")
+            .fetch_one(&storage.pool)
+            .await
+            .expect("pools");
+        assert_eq!(pools, 0);
+        let routes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE provider_id = 'p1'")
+            .fetch_one(&storage.pool)
+            .await
+            .expect("routes");
+        assert_eq!(routes, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_missing_provider_errors() {
+        let storage = open_temp_storage().await;
+        let err = storage
+            .delete_provider_instance("missing")
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("供应商不存在"));
     }
 }

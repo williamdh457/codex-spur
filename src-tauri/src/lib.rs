@@ -3,9 +3,12 @@
 pub mod catalog;
 pub mod codex_config;
 mod content_encoding;
+mod kimi_list_shield;
+mod kimi_target;
 mod credentials;
 mod domain;
 mod media_sanitizer;
+mod openai_agent_identity;
 mod openai_oauth;
 pub mod providers;
 mod proxy;
@@ -47,6 +50,8 @@ pub struct AppState {
     xai_oauth: xai_oauth::XaiOAuthManager,
     /// Shutdown sender for the active browser OAuth callback listener.
     openai_oauth_listener: Mutex<Option<oneshot::Sender<()>>>,
+    /// Optional local CONNECT proxy that blocks www.kimi.com model-list host.
+    kimi_list_shield: kimi_list_shield::KimiListShield,
 }
 
 impl AppState {
@@ -111,7 +116,7 @@ impl AppState {
             attention_items,
             desktop_visibility,
         };
-        Ok(Self {
+        let state = Self {
             snapshot: RwLock::new(snapshot),
             catalog,
             routes,
@@ -121,7 +126,11 @@ impl AppState {
             openai_oauth: openai_oauth::OpenAiOAuthManager::new(),
             xai_oauth: xai_oauth::XaiOAuthManager::new(),
             openai_oauth_listener: Mutex::new(None),
-        })
+            kimi_list_shield: kimi_list_shield::KimiListShield::new(),
+        };
+        // Older builds left system proxy → 127.0.0.1:17862 which breaks Kimi entirely.
+        clear_residual_kimi_system_proxy_if_needed();
+        Ok(state)
     }
 
     async fn rebuild_runtime(&self) -> Result<(), String> {
@@ -133,35 +142,41 @@ impl AppState {
         let (catalog_value, route_values) =
             catalog::build_from_routes(&stored_routes).map_err(|error| error.to_string())?;
         let published_models = catalog_value.models.len() as u32;
-        *self.catalog.write().await = catalog_value;
-        *self.routes.write().await = route_values;
-        let mut snapshot = self.snapshot.write().await;
-        snapshot.published_models = published_models;
-        snapshot.proxy.catalog_revision = format!("models-{published_models}");
-        snapshot.providers = self
+        let providers = self
             .storage
             .list_providers()
             .await
             .map_err(|error| error.to_string())?;
-        // Refresh binding + Desktop visibility from live ~/.codex (not isolated CODEX_HOME).
-        let proxy_running = snapshot.proxy.running;
-        let proxy_base = snapshot.proxy.base_url.clone();
+
+        // Snapshot proxy fields without holding write lock across disk/Codex inspect.
+        let (proxy_running, proxy_base) = {
+            let snapshot = self.snapshot.read().await;
+            (snapshot.proxy.running, snapshot.proxy.base_url.clone())
+        };
         let desktop_visibility =
             codex_config::inspect_desktop_visibility(Some(proxy_running), proxy_base.as_deref());
         let live = codex_config::inspect_live_binding_with_proxy(
             Some(proxy_running),
             proxy_base.as_deref(),
         );
-        snapshot.binding.state = live.state;
-        snapshot.binding.codex_home = live.codex_home.display().to_string();
-        snapshot.binding.provider_id = live.provider_id;
-        snapshot.binding.catalog_path = live.catalog_path.display().to_string();
-        snapshot.desktop_visibility = desktop_visibility;
-        snapshot.attention_items = live.attention;
+        let mut attention = live.attention;
         if published_models == 0 {
-            snapshot
-                .attention_items
-                .push("添加供应商并拉取模型后，才能应用到 Codex。".into());
+            attention.push("添加供应商并拉取模型后，才能应用到 Codex。".into());
+        }
+
+        *self.catalog.write().await = catalog_value;
+        *self.routes.write().await = route_values;
+        {
+            let mut snapshot = self.snapshot.write().await;
+            snapshot.published_models = published_models;
+            snapshot.proxy.catalog_revision = format!("models-{published_models}");
+            snapshot.providers = providers;
+            snapshot.binding.state = live.state;
+            snapshot.binding.codex_home = live.codex_home.display().to_string();
+            snapshot.binding.provider_id = live.provider_id;
+            snapshot.binding.catalog_path = live.catalog_path.display().to_string();
+            snapshot.desktop_visibility = desktop_visibility;
+            snapshot.attention_items = attention;
         }
         Ok(())
     }
@@ -526,6 +541,330 @@ async fn restore_previous_codex_config() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
+async fn kimi_target_status() -> Result<kimi_target::KimiTargetStatus, String> {
+    Ok(kimi_target::inspect_status())
+}
+
+#[tauri::command]
+async fn preview_kimi_publish(
+    state: State<'_, AppState>,
+) -> Result<kimi_target::KimiPublishPreview, String> {
+    let snapshot = state.snapshot.read().await;
+    let base_url = snapshot
+        .proxy
+        .base_url
+        .clone()
+        .ok_or_else(|| "本地代理尚未启动".to_string())?;
+    drop(snapshot);
+    state.rebuild_runtime().await?;
+    let catalog = state.catalog.read().await.clone();
+    let routes = state.routes.read().await.clone();
+    let secret = state.proxy.read().await.secret.clone();
+    kimi_target::preview(&base_url, secret.as_str(), &catalog, &routes).map_err(|e| e.to_string())
+}
+
+/// Write-only publish (方案 B): no system proxy, no whole-host shield.
+async fn kimi_publish_core(
+    state: &AppState,
+) -> Result<kimi_target::KimiPublishOutcome, String> {
+    let snapshot = state.snapshot.read().await;
+    let base_url = snapshot
+        .proxy
+        .base_url
+        .clone()
+        .ok_or_else(|| "本地代理尚未启动".to_string())?;
+    drop(snapshot);
+    state.rebuild_runtime().await?;
+    let catalog = state.catalog.read().await.clone();
+    let routes = state.routes.read().await.clone();
+    let secret = state.proxy.read().await.secret.clone();
+    let mut outcome = kimi_target::apply(&base_url, secret.as_str(), &catalog, &routes)
+        .map_err(|e| e.to_string())?;
+    // Ensure leftover whole-host shield is not left running from older builds.
+    let _ = state.kimi_list_shield.stop().await;
+    #[cfg(target_os = "macos")]
+    {
+        if proxy_points_at_spur_shield() {
+            let _ = disable_macos_https_proxy();
+            outcome.warnings.push(
+                "已关闭残留的系统代理（旧版整站拦截会弄挂 Kimi，方案 B 不再使用）。".into(),
+            );
+        }
+    }
+    outcome.warnings.push(
+        "右下角若仍只有官方模型：请用路径拦截 DescribeKimiWorkConfig（docs/kimi-app-selective-block.md），勿整站拦 www.kimi.com。"
+            .into(),
+    );
+    Ok(outcome)
+}
+
+#[tauri::command]
+async fn apply_kimi_publish(
+    state: State<'_, AppState>,
+) -> Result<kimi_target::KimiPublishOutcome, String> {
+    kimi_publish_core(&state).await
+}
+
+#[tauri::command]
+async fn restore_kimi_publish(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let result = disable_kimi_publish(state).await?;
+    Ok(if result.message.contains("备份") {
+        Some(result.message)
+    } else {
+        None
+    })
+}
+
+#[tauri::command]
+async fn reapply_kimi_model_list(
+    state: State<'_, AppState>,
+) -> Result<kimi_target::KimiPublishOutcome, String> {
+    kimi_publish_core(&state).await
+}
+
+/// One-shot 方案 B: write Kimi config only (no system proxy / whole-host block).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KimiPublishToggleResult {
+    enabled: bool,
+    model_count: u32,
+    model_labels: Vec<String>,
+    shield_listen: Option<String>,
+    proxy_ok: bool,
+    message: String,
+    warnings: Vec<String>,
+}
+
+#[tauri::command]
+async fn enable_kimi_publish(
+    state: State<'_, AppState>,
+) -> Result<KimiPublishToggleResult, String> {
+    let outcome = kimi_publish_core(&state).await?;
+    let mut warnings = outcome.warnings;
+
+    if let Err(err) = kimi_target::set_publish_active(true) {
+        warnings.push(format!("写入启用标记失败：{err}"));
+    }
+
+    let listed = if outcome.model_labels.is_empty() {
+        format!("{} 个模型", outcome.model_count)
+    } else {
+        outcome
+            .model_labels
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let message = format!(
+        "已启用（仅写盘）：写入 {listed} 到 Kimi 缓存/配置。\n\
+         · 不会改系统代理，Kimi 应能正常打开。\n\
+         · 右下角若仍只有官方列表：用路径拦截 DescribeKimiWorkConfig（见 docs/kimi-app-selective-block.md），再完全退出重开 Kimi。\n\
+         · 禁止整站代理 www.kimi.com（会弄挂 Kimi）。\n\
+         · 日常稳定多模型请用 Codex Review & Apply。"
+    );
+
+    Ok(KimiPublishToggleResult {
+        enabled: true,
+        model_count: outcome.model_count,
+        model_labels: outcome.model_labels,
+        shield_listen: None,
+        proxy_ok: true, // true = "safe mode" / no broken system proxy
+        message,
+        warnings,
+    })
+}
+
+/// One-shot: restore Kimi backup + clear residual shield/proxy + inactive flag.
+#[tauri::command]
+async fn disable_kimi_publish(
+    state: State<'_, AppState>,
+) -> Result<KimiPublishToggleResult, String> {
+    let mut warnings = Vec::new();
+    let restored = kimi_target::restore_latest().map_err(|e| e.to_string())?;
+    if restored.is_none() {
+        if let Err(err) = kimi_target::uninstall_spur_bits() {
+            warnings.push(format!("清理 Spur 注入：{err}"));
+        } else {
+            warnings.push("无备份可恢复，已尝试移除 Spur 注入项。".into());
+        }
+    }
+
+    let _ = state.kimi_list_shield.stop().await;
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(err) = disable_macos_https_proxy() {
+            warnings.push(format!("关闭系统代理：{err}"));
+        }
+    }
+
+    if let Err(err) = kimi_target::set_publish_active(false) {
+        warnings.push(format!("清除启用标记失败：{err}"));
+    }
+
+    let message = match restored {
+        Some(path) => format!(
+            "已关闭发布：已恢复备份并清理残留代理。请完全退出并重开 Kimi。\n备份：{path}"
+        ),
+        None => "已关闭发布：已清理 Spur 注入与残留代理。请完全退出并重开 Kimi。".into(),
+    };
+
+    Ok(KimiPublishToggleResult {
+        enabled: false,
+        model_count: 0,
+        model_labels: Vec::new(),
+        shield_listen: None,
+        proxy_ok: false,
+        message,
+        warnings,
+    })
+}
+
+#[tauri::command]
+async fn kimi_list_shield_status(
+    state: State<'_, AppState>,
+) -> Result<kimi_list_shield::KimiListShieldStatus, String> {
+    Ok(state.kimi_list_shield.status().await)
+}
+
+#[tauri::command]
+async fn start_kimi_list_shield(
+    state: State<'_, AppState>,
+) -> Result<kimi_list_shield::KimiListShieldStatus, String> {
+    state
+        .kimi_list_shield
+        .start()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_kimi_list_shield(
+    state: State<'_, AppState>,
+) -> Result<kimi_list_shield::KimiListShieldStatus, String> {
+    state
+        .kimi_list_shield
+        .stop()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Legacy no-op: whole-host system proxy is forbidden (breaks Kimi). Path-only intercept only.
+#[tauri::command]
+async fn enable_kimi_list_shield_system_proxy(
+    _state: State<'_, AppState>,
+) -> Result<String, String> {
+    Err(
+        "已禁用：整站系统代理会弄挂 Kimi。请用路径拦截 DescribeKimiWorkConfig（docs/kimi-app-selective-block.md）。"
+            .into(),
+    )
+}
+
+#[tauri::command]
+async fn disable_kimi_list_shield_system_proxy() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        disable_macos_https_proxy()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok("非 macOS，无系统代理可关。".into())
+    }
+}
+
+/// True if any primary service has HTTP(S) proxy → 127.0.0.1:17862–17894 (old list shield).
+#[cfg(target_os = "macos")]
+fn proxy_points_at_spur_shield() -> bool {
+    for service in primary_network_services() {
+        for flag in ["-getwebproxy", "-getsecurewebproxy"] {
+            let Ok(output) = std::process::Command::new("networksetup")
+                .args([flag, &service])
+                .output()
+            else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&output.stdout);
+            let enabled = text.lines().any(|l| l.contains("Enabled: Yes"));
+            let spur_host = text.lines().any(|l| l.contains("Server: 127.0.0.1"));
+            let spur_port = text.lines().any(|l| {
+                l.starts_with("Port:")
+                    && l.split(':')
+                        .nth(1)
+                        .and_then(|p| p.trim().parse::<u16>().ok())
+                        .is_some_and(|p| (17862..=17894).contains(&p))
+            });
+            if enabled && spur_host && spur_port {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Clear residual system proxy left by older Spur builds (safe to call at startup).
+pub fn clear_residual_kimi_system_proxy_if_needed() {
+    #[cfg(target_os = "macos")]
+    {
+        if proxy_points_at_spur_shield() {
+            match disable_macos_https_proxy() {
+                Ok(msg) => tracing::warn!(%msg, "cleared residual Spur Kimi system proxy"),
+                Err(err) => tracing::warn!(%err, "failed to clear residual system proxy"),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn primary_network_services() -> Vec<String> {
+    let output = std::process::Command::new("networksetup")
+        .args(["-listallnetworkservices"])
+        .output();
+    let Ok(output) = output else {
+        return vec!["Wi-Fi".into()];
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut services = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("An asterisk") || line.starts_with('*') {
+            continue;
+        }
+        // Prefer common active interfaces first
+        if line == "Wi-Fi" || line == "Ethernet" || line.contains("USB") || line.contains("Thunderbolt")
+        {
+            services.push(line.to_string());
+        }
+    }
+    if services.is_empty() {
+        services.push("Wi-Fi".into());
+    }
+    services
+}
+
+#[cfg(target_os = "macos")]
+fn disable_macos_https_proxy() -> Result<String, String> {
+    let services = primary_network_services();
+    let mut ok = Vec::new();
+    for service in &services {
+        let _ = std::process::Command::new("networksetup")
+            .args(["-setwebproxystate", service, "off"])
+            .output();
+        let _ = std::process::Command::new("networksetup")
+            .args(["-setsecurewebproxystate", service, "off"])
+            .output();
+        ok.push(service.clone());
+    }
+    Ok(format!(
+        "已尝试关闭 {} 的系统 HTTP/HTTPS 代理。",
+        ok.join(", ")
+    ))
+}
+
+#[tauri::command]
 async fn list_model_routes(state: State<'_, AppState>) -> Result<Vec<ModelRouteSummary>, String> {
     state
         .storage
@@ -722,8 +1061,64 @@ async fn discover_provider_models(
             .vault
             .decrypt(&credential.id, &credential.secret_envelope)
             .map_err(|error| error.to_string())?;
-        let secret = SecretMaterial::from_json_bytes(plaintext.as_slice())
+        let mut secret = SecretMaterial::from_json_bytes(plaintext.as_slice())
             .map_err(|error| format!("凭据数据损坏：{error}"))?;
+        // Agent Identity path: sign models list with AgentAssertion.
+        if let Some(mut agent_key) = openai_agent_identity::agent_key_from_secret(&secret) {
+            let account_id = credential
+                .account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "Agent Identity 账号缺少 account_id".to_string())?
+                .to_string();
+            if agent_key.task_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                let task_id = openai_agent_identity::register_agent_task(&agent_key)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                agent_key.task_id = Some(task_id.clone());
+                secret.task_id = Some(task_id);
+                if let Ok(json) = providers::credential_secret_json(
+                    &credentials::CanonicalCredential {
+                        kind: credentials::CredentialKind::AgentIdentity,
+                        state: credentials::CredentialState::Refreshable,
+                        provider_id: provider_id.clone(),
+                        label: None,
+                        email: None,
+                        account_id: Some(account_id.clone()),
+                        expires_at: None,
+                        fingerprint: String::new(),
+                        refreshable: true,
+                        secret: secret.clone(),
+                    },
+                ) {
+                    if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
+                        if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                            let _ = state
+                                .storage
+                                .update_credential_secret(
+                                    &credential.id,
+                                    &envelope_json,
+                                    None,
+                                    Some(account_id.as_str()),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+            let task_id = agent_key.task_id.clone().unwrap_or_default();
+            let authorization = openai_agent_identity::authorization_header_for_agent_task(
+                &agent_key, &task_id,
+            )
+            .map_err(|e| e.to_string())?;
+            (
+                providers::discover_official_models_with_authorization(&authorization, &account_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                "https://chatgpt.com/backend-api/codex".to_string(),
+            )
+        } else {
         let access_token = secret
             .access_token
             .as_deref()
@@ -743,6 +1138,10 @@ async fn discover_provider_models(
                 "refresh_token": secret.refresh_token,
                 "id_token": secret.id_token,
                 "session_token": secret.session_token,
+                "api_key": secret.api_key,
+                "agent_runtime_id": secret.agent_runtime_id,
+                "agent_private_key": secret.agent_private_key,
+                "task_id": secret.task_id,
             })) {
                 if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
                     if let Ok(envelope_json) = serde_json::to_string(&envelope) {
@@ -765,6 +1164,7 @@ async fn discover_provider_models(
                 .map_err(|error| error.to_string())?,
             "https://chatgpt.com/backend-api/codex".to_string(),
         )
+        }
     } else if official_xai {
         // Subscription OAuth: CLI chat proxy (not api.x.ai).
         let subscription_base = providers::resolve_xai_upstream_base(
@@ -1541,7 +1941,10 @@ async fn delete_provider_instance(
         .delete_provider_instance(&provider_id)
         .await
         .map_err(|error| error.to_string())?;
-    state.rebuild_runtime().await?;
+    // Storage delete already committed; do not surface rebuild failures as "delete failed".
+    if let Err(err) = state.rebuild_runtime().await {
+        tracing::warn!(%err, provider_id = %provider_id, "rebuild_runtime after delete_provider_instance failed");
+    }
     Ok(())
 }
 
@@ -1612,6 +2015,88 @@ async fn set_model_enabled(
     list_model_routes(state).await
 }
 
+async fn insert_canonical_credential(
+    state: &AppState,
+    provider_id: &str,
+    credential: credentials::CanonicalCredential,
+) -> Result<bool, String> {
+    let credential = credential.assign_provider(provider_id);
+    let id = Uuid::new_v4().to_string();
+    let plaintext = Zeroizing::new(
+        providers::credential_secret_json(&credential).map_err(|error| error.to_string())?,
+    );
+    let envelope = state
+        .vault
+        .encrypt(&id, 1, plaintext.as_slice())
+        .map_err(|error| error.to_string())?;
+    let envelope_json = serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
+    let inserted = state
+        .storage
+        .insert_credential(&credential, &id, &envelope_json)
+        .await
+        .map_err(|error| error.to_string())?;
+    if inserted {
+        let pool_id = state
+            .storage
+            .ensure_default_pool(provider_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .storage
+            .add_pool_member(&pool_id, &id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let _ = state.storage.set_active_pool(provider_id, &pool_id).await;
+    }
+    Ok(inserted)
+}
+
+/// Upgrade ChatGPT access/session credentials to durable Agent Identity when possible.
+async fn maybe_upgrade_to_agent_identity(
+    credential: credentials::CanonicalCredential,
+) -> Result<credentials::CanonicalCredential, String> {
+    use credentials::CredentialKind;
+    if credential.kind == CredentialKind::AgentIdentity {
+        return Ok(credential);
+    }
+    // Keep real OAuth (with refresh) as-is.
+    if credential.kind == CredentialKind::OAuth && credential.secret.has_refresh_token() {
+        return Ok(credential);
+    }
+    // API keys stay API keys.
+    if credential.kind == CredentialKind::ApiKey {
+        return Ok(credential);
+    }
+    let Some(access) = credential
+        .secret
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return Ok(credential);
+    };
+    match openai_agent_identity::upgrade_access_token_to_agent_identity(
+        &access,
+        credential.email.clone(),
+        credential.account_id.clone(),
+        credential.label.clone(),
+    )
+    .await
+    {
+        Ok(mut upgraded) => {
+            upgraded.provider_id = credential.provider_id;
+            Ok(upgraded)
+        }
+        Err(error) => {
+            // Fall back to storing the original access-only credential.
+            tracing::warn!(%error, "agent identity upgrade failed; storing access credential");
+            Ok(credential)
+        }
+    }
+}
+
 #[tauri::command]
 async fn import_credentials_json(
     state: State<'_, AppState>,
@@ -1621,33 +2106,9 @@ async fn import_credentials_json(
     let credentials = credentials::parse_json_import(&input).map_err(|error| error.to_string())?;
     let mut any_inserted = false;
     for credential in credentials {
-        let credential = credential.assign_provider(&provider_id);
-        let id = Uuid::new_v4().to_string();
-        let plaintext = Zeroizing::new(
-            providers::credential_secret_json(&credential).map_err(|error| error.to_string())?,
-        );
-        let envelope = state
-            .vault
-            .encrypt(&id, 1, plaintext.as_slice())
-            .map_err(|error| error.to_string())?;
-        let envelope_json = serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
-        let inserted = state
-            .storage
-            .insert_credential(&credential, &id, &envelope_json)
-            .await
-            .map_err(|error| error.to_string())?;
-        if inserted {
+        let credential = maybe_upgrade_to_agent_identity(credential).await?;
+        if insert_canonical_credential(&state, &provider_id, credential).await? {
             any_inserted = true;
-            let pool_id = state
-                .storage
-                .ensure_default_pool(&provider_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            state
-                .storage
-                .add_pool_member(&pool_id, &id)
-                .await
-                .map_err(|error| error.to_string())?;
         }
     }
     if any_inserted {
@@ -1657,6 +2118,52 @@ async fn import_credentials_json(
             .set_provider_entry_category(&provider_id, "json")
             .await
             .map_err(|error| error.to_string())?;
+        // Point instance at official Codex backend so models can be discovered immediately.
+        let official_base = "https://chatgpt.com/backend-api/codex";
+        let _ = state
+            .storage
+            .set_provider_base_url(&provider_id, Some(official_base))
+            .await;
+    }
+    list_credentials(state, Some(provider_id)).await
+}
+
+/// Import a ChatGPT `/api/auth/session` dump and upgrade to Agent Identity.
+#[tauri::command]
+async fn import_session_json(
+    state: State<'_, AppState>,
+    provider_id: String,
+    input: String,
+) -> Result<Vec<CredentialSummary>, String> {
+    let session =
+        credentials::parse_session_import(&input).map_err(|error| error.to_string())?;
+    let access = session
+        .secret
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "session 缺少 accessToken".to_string())?;
+    let upgraded = openai_agent_identity::upgrade_access_token_to_agent_identity(
+        access,
+        session.email.clone(),
+        session.account_id.clone(),
+        session.label.clone(),
+    )
+    .await
+    .map_err(|error| format!("Agent Identity 注册失败：{error}"))?;
+    let inserted = insert_canonical_credential(&state, &provider_id, upgraded).await?;
+    if inserted {
+        state
+            .storage
+            .set_provider_entry_category(&provider_id, "json")
+            .await
+            .map_err(|error| error.to_string())?;
+        let official_base = "https://chatgpt.com/backend-api/codex";
+        let _ = state
+            .storage
+            .set_provider_base_url(&provider_id, Some(official_base))
+            .await;
     }
     list_credentials(state, Some(provider_id)).await
 }
@@ -1672,7 +2179,10 @@ async fn delete_credential(
         .delete_credential(&credential_id)
         .await
         .map_err(|error| error.to_string())?;
-    state.rebuild_runtime().await?;
+    // Storage delete already committed; do not surface rebuild failures as "delete failed".
+    if let Err(err) = state.rebuild_runtime().await {
+        tracing::warn!(%err, credential_id = %credential_id, "rebuild_runtime after delete_credential failed");
+    }
     Ok(result)
 }
 
@@ -2147,6 +2657,18 @@ pub fn run() {
             preview_codex_apply,
             apply_codex_config,
             restore_previous_codex_config,
+            kimi_target_status,
+            preview_kimi_publish,
+            apply_kimi_publish,
+            restore_kimi_publish,
+            reapply_kimi_model_list,
+            enable_kimi_publish,
+            disable_kimi_publish,
+            kimi_list_shield_status,
+            start_kimi_list_shield,
+            stop_kimi_list_shield,
+            enable_kimi_list_shield_system_proxy,
+            disable_kimi_list_shield_system_proxy,
             list_model_routes,
             discover_provider_models,
             import_provider_config_json,
@@ -2168,6 +2690,7 @@ pub fn run() {
             set_active_pool,
             set_model_enabled,
             import_credentials_json,
+            import_session_json,
             list_credentials,
             delete_credential,
             test_account,
@@ -2202,4 +2725,74 @@ pub fn run() {
             tauri::async_runtime::block_on(state.shutdown());
         }
     });
+}
+
+#[cfg(test)]
+mod ops_import {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// One-shot local import: set SPUR_IMPORT_JSON (+ optional SPUR_DATA_DIR, SPUR_PROVIDER_NAME).
+    /// Never prints secrets. Used by operators; skipped unless env is set.
+    #[tokio::test]
+    async fn import_credentials_json_from_env_path() {
+        let Some(json_path) = std::env::var_os("SPUR_IMPORT_JSON") else {
+            return;
+        };
+        let Some(data_dir) = std::env::var_os("SPUR_DATA_DIR").map(PathBuf::from) else {
+            eprintln!("SPUR_DATA_DIR required with SPUR_IMPORT_JSON");
+            return;
+        };
+        let name = std::env::var("SPUR_PROVIDER_NAME")
+            .unwrap_or_else(|_| "OpenAI · Web Session".into());
+        let input = std::fs::read_to_string(&json_path).expect("read import json");
+        let credentials =
+            credentials::parse_json_import(&input).expect("parse import json");
+        assert!(
+            !credentials.is_empty(),
+            "no credentials parsed from import file"
+        );
+
+        let vault = vault::SecretVault::load_or_create(&data_dir).expect("vault");
+        let storage = storage::Storage::open(&data_dir).await.expect("storage");
+        let provider_id = storage
+            .create_provider_instance("openai", Some(name.as_str()))
+            .await
+            .expect("create provider");
+        storage
+            .set_provider_entry_category(&provider_id, "json")
+            .await
+            .expect("entry category");
+
+        let mut inserted = 0u32;
+        for credential in credentials {
+            let credential = credential.assign_provider(&provider_id);
+            let id = Uuid::new_v4().to_string();
+            let plaintext = Zeroizing::new(
+                providers::credential_secret_json(&credential).expect("secret json"),
+            );
+            let envelope = vault
+                .encrypt(&id, 1, plaintext.as_slice())
+                .expect("encrypt");
+            let envelope_json = serde_json::to_string(&envelope).expect("envelope");
+            let did = storage
+                .insert_credential(&credential, &id, &envelope_json)
+                .await
+                .expect("insert");
+            if did {
+                inserted += 1;
+                let pool_id = storage
+                    .ensure_default_pool(&provider_id)
+                    .await
+                    .expect("pool");
+                storage
+                    .add_pool_member(&pool_id, &id)
+                    .await
+                    .expect("pool member");
+            }
+        }
+        // Summary only — no tokens, no emails in full.
+        eprintln!("import_ok provider_id={provider_id} inserted={inserted}");
+        assert!(inserted > 0, "expected at least one inserted credential");
+    }
 }

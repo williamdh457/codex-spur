@@ -13,6 +13,9 @@ pub enum CredentialKind {
     /// Explicit rename: plain `snake_case` turns this into `chat_gpt_web_session`.
     #[serde(rename = "chatgpt_web_session", alias = "chat_gpt_web_session")]
     ChatGptWebSession,
+    /// Durable Codex Agent Identity (Ed25519 runtime + private key, no OAuth tokens).
+    #[serde(rename = "agent_identity", alias = "agentIdentity")]
+    AgentIdentity,
 }
 
 impl CredentialKind {
@@ -22,6 +25,7 @@ impl CredentialKind {
             Self::ApiKey => "api_key",
             Self::OAuth => "oauth",
             Self::ChatGptWebSession => "chatgpt_web_session",
+            Self::AgentIdentity => "agent_identity",
         }
     }
 }
@@ -60,6 +64,9 @@ pub struct SecretMaterial {
     pub id_token: Option<String>,
     pub session_token: Option<String>,
     pub api_key: Option<String>,
+    pub agent_runtime_id: Option<String>,
+    pub agent_private_key: Option<String>,
+    pub task_id: Option<String>,
 }
 
 impl std::fmt::Debug for SecretMaterial {
@@ -83,6 +90,11 @@ impl SecretMaterial {
             id_token: string("id_token"),
             session_token: string("session_token"),
             api_key: string("api_key"),
+            agent_runtime_id: string("agent_runtime_id")
+                .or_else(|| string("agentRuntimeId")),
+            agent_private_key: string("agent_private_key")
+                .or_else(|| string("agentPrivateKey")),
+            task_id: string("task_id").or_else(|| string("taskId")),
         })
     }
 
@@ -90,6 +102,16 @@ impl SecretMaterial {
         self.refresh_token
             .as_ref()
             .is_some_and(|value| !value.is_empty())
+    }
+
+    pub fn is_agent_identity(&self) -> bool {
+        self.agent_runtime_id
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+            && self
+                .agent_private_key
+                .as_ref()
+                .is_some_and(|v| !v.trim().is_empty())
     }
 }
 
@@ -100,8 +122,9 @@ impl CanonicalCredential {
             provider_id,
             self.account_id.as_deref().or(self.email.as_deref()),
             self.secret
-                .access_token
+                .agent_runtime_id
                 .as_deref()
+                .or(self.secret.access_token.as_deref())
                 .or(self.secret.api_key.as_deref())
                 .or(self.secret.session_token.as_deref()),
         );
@@ -118,7 +141,8 @@ impl CanonicalCredential {
             masked_account_id: self.account_id.as_deref().map(mask_identity),
             expires_at: self.expires_at,
             fingerprint_prefix: self.fingerprint.chars().take(12).collect(),
-            refreshable: self.refreshable && self.secret.has_refresh_token(),
+            refreshable: self.kind == CredentialKind::AgentIdentity
+                || (self.refreshable && self.secret.has_refresh_token()),
         }
     }
 }
@@ -160,10 +184,17 @@ pub enum ImportError {
     InvalidRoot,
     #[error("account object does not contain a usable credential")]
     MissingCredential,
+    #[error("this looks like provider config JSON (base_url/api_key/models), not account JSON")]
+    ProviderConfigNotAccount,
+    #[error("agent identity private key is invalid")]
+    InvalidAgentPrivateKey,
 }
 
 pub fn parse_json_import(input: &str) -> Result<Vec<CanonicalCredential>, ImportError> {
     let value: Value = serde_json::from_str(input).map_err(|_| ImportError::InvalidRoot)?;
+    if looks_like_provider_config_only(&value) {
+        return Err(ImportError::ProviderConfigNotAccount);
+    }
     let objects = collect_objects(&value);
     if objects.is_empty() {
         return Err(ImportError::InvalidRoot);
@@ -172,6 +203,87 @@ pub fn parse_json_import(input: &str) -> Result<Vec<CanonicalCredential>, Import
         .into_iter()
         .filter_map(normalize_object)
         .collect::<Result<Vec<_>, _>>()
+}
+
+/// ChatGPT `/api/auth/session` dump (optionally with WARNING_BANNER).
+pub fn parse_session_import(input: &str) -> Result<CanonicalCredential, ImportError> {
+    let value: Value = serde_json::from_str(input).map_err(|_| ImportError::InvalidRoot)?;
+    let object = value.as_object().ok_or(ImportError::InvalidRoot)?;
+    // Prefer nested session surface if present.
+    let access = object
+        .get("accessToken")
+        .or_else(|| object.get("access_token"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or(ImportError::MissingCredential)?;
+    let email = object
+        .get("user")
+        .and_then(|u| u.get("email"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let account_id = object
+        .get("account")
+        .and_then(|a| a.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            crate::openai_oauth::chatgpt_account_id_from_token(&access)
+        });
+    let label = object
+        .get("user")
+        .and_then(|u| u.get("name"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let session_token = object
+        .get("sessionToken")
+        .or_else(|| object.get("session_token"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let expires_at = object
+        .get("expires")
+        .and_then(parse_expires_value)
+        .or_else(|| crate::openai_oauth::jwt_exp_unix(&access));
+    Ok(CanonicalCredential {
+        kind: CredentialKind::ChatGptWebSession,
+        state: CredentialState::AccessOnly,
+        provider_id: "openai".into(),
+        label,
+        email,
+        account_id,
+        expires_at,
+        fingerprint: String::new(),
+        refreshable: false,
+        secret: SecretMaterial {
+            access_token: Some(access),
+            session_token,
+            ..SecretMaterial::default()
+        },
+    })
+}
+
+fn looks_like_provider_config_only(value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    let has_base = map.contains_key("base_url") || map.contains_key("baseUrl");
+    let has_models = map.contains_key("models");
+    let has_account_shape = [
+        "access_token",
+        "accessToken",
+        "refresh_token",
+        "session_token",
+        "sessionToken",
+        "accounts",
+        "agent_identity",
+        "agentIdentity",
+        "auth_mode",
+        "authMode",
+        "tokens",
+    ]
+    .iter()
+    .any(|k| map.contains_key(*k));
+    has_base && has_models && !has_account_shape
 }
 
 fn collect_objects(value: &Value) -> Vec<&Value> {
@@ -183,6 +295,87 @@ fn collect_objects(value: &Value) -> Vec<&Value> {
         Value::Object(_) => vec![value],
         _ => Vec::new(),
     }
+}
+
+fn parse_agent_identity_object(
+    object: &serde_json::Map<String, Value>,
+) -> Option<Result<CanonicalCredential, ImportError>> {
+    let auth_mode = object
+        .get("auth_mode")
+        .or_else(|| object.get("authMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let agent_map = object
+        .get("agent_identity")
+        .or_else(|| object.get("agentIdentity"))
+        .and_then(Value::as_object);
+    let is_mode = auth_mode.eq_ignore_ascii_case("agentidentity");
+    if !is_mode && agent_map.is_none() {
+        return None;
+    }
+    let surface = agent_map.unwrap_or(object);
+    let runtime = surface
+        .get("agent_runtime_id")
+        .or_else(|| surface.get("agentRuntimeId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())?
+        .to_string();
+    let private_key = surface
+        .get("agent_private_key")
+        .or_else(|| surface.get("agentPrivateKey"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())?
+        .to_string();
+    if crate::openai_agent_identity::validate_agent_private_key(&private_key).is_err() {
+        return Some(Err(ImportError::InvalidAgentPrivateKey));
+    }
+    let account_id = surface
+        .get("account_id")
+        .or_else(|| surface.get("accountId"))
+        .or_else(|| surface.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            object
+                .get("account_id")
+                .or_else(|| object.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    let email = surface
+        .get("email")
+        .or_else(|| object.get("email"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let label = object
+        .get("label")
+        .or_else(|| object.get("name"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let task_id = surface
+        .get("task_id")
+        .or_else(|| surface.get("taskId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned);
+    Some(Ok(CanonicalCredential {
+        kind: CredentialKind::AgentIdentity,
+        state: CredentialState::Refreshable,
+        provider_id: "openai".into(),
+        label,
+        email,
+        account_id,
+        expires_at: None,
+        fingerprint: String::new(),
+        refreshable: true,
+        secret: SecretMaterial {
+            agent_runtime_id: Some(runtime),
+            agent_private_key: Some(private_key),
+            task_id,
+            ..SecretMaterial::default()
+        },
+    }))
 }
 
 /// Resolve the object that holds token / secret fields.
@@ -222,6 +415,10 @@ fn field_string(
 
 fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportError>> {
     let object = value.as_object()?;
+    // Agent Identity auth.json (Codex / Sub2API): no OAuth tokens stored.
+    if let Some(agent) = parse_agent_identity_object(object) {
+        return Some(agent);
+    }
     // Unwrap nested auth containers once (Codex Tools accounts export), then
     // reuse the same field extraction path as native auth.json / flat tokens.
     let auth = auth_surface(object);
@@ -324,11 +521,18 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
         });
     let expires_at = object
         .get("expires_at")
-        .and_then(Value::as_i64)
-        .or_else(|| object.get("expiresAt").and_then(Value::as_i64))
-        .or_else(|| object.get("expires").and_then(Value::as_i64))
-        .or_else(|| auth.get("expires_at").and_then(Value::as_i64))
-        .or_else(|| auth.get("expiresAt").and_then(Value::as_i64));
+        .or_else(|| object.get("expiresAt"))
+        .or_else(|| object.get("expires"))
+        .or_else(|| auth.get("expires_at"))
+        .or_else(|| auth.get("expiresAt"))
+        .or_else(|| auth.get("expires"))
+        .and_then(parse_expires_value)
+        // ChatGPT session dumps often omit numeric exp; fall back to JWT `exp`.
+        .or_else(|| {
+            access_token
+                .as_deref()
+                .and_then(crate::openai_oauth::jwt_exp_unix)
+        });
     let kind = if api_key.is_some() {
         CredentialKind::ApiKey
     } else if session_token.is_some() && refresh_token.is_none() {
@@ -361,6 +565,13 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
             .or_else(|| auth.get("label"))
             .or_else(|| auth.get("name"))
             .and_then(Value::as_str)
+            .or_else(|| {
+                object
+                    .get("user")
+                    .or_else(|| auth.get("user"))
+                    .and_then(|user| user.get("name"))
+                    .and_then(Value::as_str)
+            })
             .filter(|value| !value.trim().is_empty())
             .map(ToOwned::to_owned),
         email,
@@ -374,6 +585,9 @@ fn normalize_object(value: &Value) -> Option<Result<CanonicalCredential, ImportE
             id_token,
             session_token,
             api_key,
+            agent_runtime_id: None,
+            agent_private_key: None,
+            task_id: None,
         },
     }))
 }
@@ -387,6 +601,50 @@ fn fingerprint(provider: &str, identity: Option<&str>, secret: Option<&str>) -> 
     hasher.update([0]);
     hasher.update(secret.unwrap_or_default().as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Accept unix seconds (number/string) or a few ISO-8601 forms used by session dumps.
+fn parse_expires_value(value: &Value) -> Option<i64> {
+    if let Some(n) = value.as_i64() {
+        return Some(n);
+    }
+    if let Some(n) = value.as_u64() {
+        return i64::try_from(n).ok();
+    }
+    if let Some(n) = value.as_f64() {
+        if n.is_finite() {
+            return Some(n as i64);
+        }
+    }
+    let raw = value.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(n) = raw.parse::<i64>() {
+        return Some(n);
+    }
+    // 2026-10-20T10:04:27.756Z / 2026-10-20T10:04:27Z
+    let normalized = raw.trim_end_matches('Z').replace('T', " ");
+    let date_time = normalized.split('.').next().unwrap_or(normalized.as_str());
+    let mut parts = date_time.split([' ', ':', '-']);
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    let hour: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minute: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let second: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days from civil date (Howard Hinnant algorithm) → unix seconds (UTC).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 #[cfg(test)]
@@ -411,6 +669,48 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<CredentialKind>("\"oauth\"").expect("canonical"),
             CredentialKind::OAuth
+        );
+    }
+
+    #[test]
+    fn parses_chatgpt_session_dump_camel_case() {
+        // Real browser session dumps often start with WARNING_BANNER; paste whole blob as-is.
+        let input = r#"{
+            "WARNING_BANNER": "DO NOT SHARE — sensitive session material",
+            "user": {"email": "a@example.com", "name": "Ada"},
+            "account": {"id": "acc-1", "planType": "plus"},
+            "accessToken": "access-only-token",
+            "sessionToken": "session-only-token",
+            "expires": "2026-10-20T10:04:27.756Z",
+            "authProvider": "openai",
+            "rumViewTags": {"light_account": {"fetched": false}}
+        }"#;
+        let parsed = parse_json_import(input).expect("imports session dump");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, CredentialKind::ChatGptWebSession);
+        assert_eq!(parsed[0].state, CredentialState::AccessOnly);
+        assert_eq!(parsed[0].email.as_deref(), Some("a@example.com"));
+        assert_eq!(parsed[0].account_id.as_deref(), Some("acc-1"));
+        assert_eq!(parsed[0].label.as_deref(), Some("Ada"));
+        assert_eq!(parsed[0].secret.access_token.as_deref(), Some("access-only-token"));
+        assert_eq!(parsed[0].secret.session_token.as_deref(), Some("session-only-token"));
+        assert!(!parsed[0].refreshable);
+        assert_eq!(parsed[0].expires_at, Some(1_792_490_667));
+    }
+
+    #[test]
+    fn parse_expires_iso_and_unix() {
+        assert_eq!(
+            parse_expires_value(&serde_json::json!(1_700_000_000)),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            parse_expires_value(&serde_json::json!("1700000000")),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            parse_expires_value(&serde_json::json!("2026-10-20T10:04:27.756Z")),
+            Some(1_792_490_667)
         );
     }
 
