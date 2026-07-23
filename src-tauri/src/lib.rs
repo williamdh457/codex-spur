@@ -1998,6 +1998,48 @@ async fn delete_provider_instance(
     if let Err(err) = state.rebuild_runtime().await {
         tracing::warn!(%err, provider_id = %provider_id, "rebuild_runtime after delete_provider_instance failed");
     }
+    // Keep ~/.codex model-catalog.json in sync. Otherwise Desktop keeps showing
+    // ghost models (e.g. "723 · GPT-5.6-Sol") whose provider/credentials are gone,
+    // and turns fail with no_upstream_credential / Unauthorized.
+    if let Err(err) = republish_codex_catalog_best_effort(&state).await {
+        tracing::warn!(%err, provider_id = %provider_id, "republish after delete_provider_instance failed");
+    }
+    Ok(())
+}
+
+/// Best-effort rewrite of the on-disk Codex catalog from current enabled routes.
+/// Does not fail the caller; requires a known proxy base URL + bearer.
+async fn republish_codex_catalog_best_effort(state: &AppState) -> Result<(), String> {
+    let (base_url, secret) = {
+        let snapshot = state.snapshot.read().await;
+        let base = snapshot
+            .proxy
+            .base_url
+            .clone()
+            .ok_or_else(|| "proxy base_url unavailable".to_string())?;
+        drop(snapshot);
+        let proxy = state.proxy.read().await;
+        (base, proxy.secret.clone())
+    };
+    state.rebuild_runtime().await?;
+    let catalog = state.catalog.read().await.clone();
+    let result = codex_config::apply(&base_url, &secret, &catalog).map_err(|e| e.to_string())?;
+    let _ = state
+        .storage
+        .record_apply_revision(
+            &Uuid::new_v4().to_string(),
+            &result.catalog_path.display().to_string(),
+            &result.config_path.display().to_string(),
+            result.before_hash.as_deref(),
+            &result.after_hash,
+            "applied",
+        )
+        .await;
+    {
+        let mut snapshot = state.snapshot.write().await;
+        snapshot.published_models = result.model_count;
+        snapshot.proxy.catalog_revision = format!("models-{}", result.model_count);
+    }
     Ok(())
 }
 
@@ -2315,7 +2357,10 @@ async fn import_credentials_json(
     list_credentials(state, Some(provider_id)).await
 }
 
-/// Import a ChatGPT `/api/auth/session` dump and upgrade to Agent Identity.
+/// Import a ChatGPT `/api/auth/session` dump.
+///
+/// Same policy as account-JSON import (Sub2API-style access-only session is valid):
+/// best-effort Agent Identity upgrade; on `agent/register` failure keep access-only.
 #[tauri::command]
 async fn import_session_json(
     state: State<'_, AppState>,
@@ -2324,13 +2369,16 @@ async fn import_session_json(
 ) -> Result<Vec<CredentialSummary>, String> {
     let session =
         credentials::parse_session_import(&input).map_err(|error| error.to_string())?;
-    let access = session
+    if session
         .secret
         .access_token
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "session 缺少 accessToken".to_string())?;
+        .is_none()
+    {
+        return Err("session 缺少 accessToken".to_string());
+    }
     // Repair existing agent_identity / oauth rows by account_id without re-registering.
     if try_merge_usage_tokens_into_existing(&state, &provider_id, &session).await? {
         state
@@ -2345,22 +2393,10 @@ async fn import_session_json(
             .await;
         return list_credentials(state, Some(provider_id)).await;
     }
-    let preserved = openai_agent_identity::PreservedUsageTokens {
-        refresh_token: session.secret.refresh_token.clone(),
-        id_token: session.secret.id_token.clone(),
-        session_token: session.secret.session_token.clone(),
-        expires_at: session.expires_at,
-    };
-    let upgraded = openai_agent_identity::upgrade_access_token_to_agent_identity_with_tokens(
-        access,
-        session.email.clone(),
-        session.account_id.clone(),
-        session.label.clone(),
-        preserved,
-    )
-    .await
-    .map_err(|error| format!("Agent Identity 注册失败：{error}"))?;
-    let changed = insert_canonical_credential(&state, &provider_id, upgraded).await?;
+    // Soft-fallback on agent registry errors (e.g. agent_registry_not_enabled).
+    // Hard-fail only for missing/expired tokens handled inside parse + upgrade helpers.
+    let credential = maybe_upgrade_to_agent_identity(session).await?;
+    let changed = insert_canonical_credential(&state, &provider_id, credential).await?;
     if changed {
         state
             .storage

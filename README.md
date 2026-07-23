@@ -96,7 +96,7 @@ Closing the main window keeps the menu-bar proxy alive. Quitting the app stops t
 |---|---|
 | Platform | macOS (Apple Silicon) · Windows x64 |
 | Stack | Tauri 2 · React · TypeScript · Rust |
-| Version | **0.1.1** |
+| Version | **0.1.5** |
 | License | MIT |
 
 ---
@@ -173,7 +173,7 @@ Typical data directory:
 **macOS**
 
 1. Open the [latest Release](https://github.com/williamdh457/codex-spur/releases/latest) and download  
-   `Codex.Spur_0.1.1_aarch64.dmg` (GitHub may normalize spaces in the asset name)
+   `Codex.Spur_0.1.5_aarch64.dmg` (GitHub may normalize spaces in the asset name)
 2. Open the DMG and drag **Codex Spur** into **Applications**
 3. Open the app (see [“app is damaged”](#if-macos-says-app-is-damaged) if macOS blocks the first launch)
 4. Leave the menu-bar process running while you use Spur-backed models
@@ -380,11 +380,11 @@ Codex Spur is a local integration helper. Upstream APIs and Desktop behavior can
 
 ```bash
 npm run bundle:dmg
-git tag -a v0.1.1 -m "v0.1.1"
+git tag -a v0.1.5 -m "v0.1.5"
 git push origin main --tags
-gh release create v0.1.1 \
-  "src-tauri/target/release/bundle/dmg/Codex Spur_0.1.1_aarch64.dmg" \
-  --title "Codex Spur 0.1.1" \
+gh release create v0.1.5 \
+  "src-tauri/target/release/bundle/dmg/Codex Spur_0.1.5_aarch64.dmg" \
+  --title "Codex Spur 0.1.5" \
   --notes-file CHANGELOG.md
 ```
 

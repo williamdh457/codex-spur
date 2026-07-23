@@ -735,6 +735,22 @@ mod tests {
         assert_eq!(parsed[0].secret.session_token.as_deref(), Some("session-only-token"));
         assert!(!parsed[0].refreshable);
         assert_eq!(parsed[0].expires_at, Some(1_792_490_667));
+
+        // Dedicated session import path must accept the same blob as access-only
+        // (Agent Identity upgrade is best-effort at the command layer, not required to parse).
+        let session = parse_session_import(input).expect("parse_session_import accepts dump");
+        assert_eq!(session.kind, CredentialKind::ChatGptWebSession);
+        assert_eq!(session.state, CredentialState::AccessOnly);
+        assert_eq!(session.secret.access_token.as_deref(), Some("access-only-token"));
+        assert_eq!(session.secret.session_token.as_deref(), Some("session-only-token"));
+        assert!(!session.refreshable);
+    }
+
+    #[test]
+    fn parse_session_import_requires_access_token() {
+        let err = parse_session_import(r#"{"user":{"email":"a@b.c"},"account":{"id":"x"}}"#)
+            .expect_err("missing accessToken");
+        assert!(matches!(err, ImportError::MissingCredential));
     }
 
     #[test]

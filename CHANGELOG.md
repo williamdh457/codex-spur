@@ -4,6 +4,18 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-23
+
+### Fixed
+
+- **Session import hard-fail asymmetry**: “导入 session 文件” no longer aborts the whole import when OpenAI `agent/register` returns `agent_registry_not_enabled` (or any registry error). It now uses the same best-effort Agent Identity upgrade + **access-only fallback** as “导入账号 JSON” (Sub2API-style session import behavior). UI copy updated accordingly.
+- **Ghost models after provider delete**: deleting a provider now best-effort rewrites `~/.codex/codex-select/model-catalog.json` from remaining enabled routes, so Desktop no longer keeps picker entries (e.g. `723 · GPT-5.6-Sol`) that map to missing credentials (`no_upstream_credential` / 401).
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.5**.
+- GitHub Release notes include Gatekeeper “app is damaged” workarounds (`xattr -cr`).
+
 ## [0.1.4] - 2026-07-23
 
 ### Fixed

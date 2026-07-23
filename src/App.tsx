@@ -357,7 +357,7 @@ const ADD_METHODS: AddMethod[] = [
     id: "openai-session",
     kind: "openai",
     title: "OpenAI · 导入 session 文件",
-    hint: "ChatGPT session dump → 注册 Agent Identity",
+    hint: "ChatGPT session dump → 尽力 Agent Identity，失败则 access-only",
     mode: "session",
     category: "json",
   },
@@ -564,6 +564,28 @@ function describeCredentialKind(account: CredentialSummary): string {
   }
   if (kind === "api_key" || kind === "apikey") return "API Key";
   return account.refreshable ? `${account.kind} · 可刷新` : `${account.kind} · 仅访问`;
+}
+
+/** Note after ChatGPT session / account import about Agent Identity vs access-only. */
+function importAuthNote(accounts: CredentialSummary[]): string {
+  if (accounts.length === 0) return "";
+  const kinds = accounts.map((a) => a.kind.toLowerCase());
+  if (kinds.some((k) => k === "agent_identity" || k === "agentidentity")) {
+    return "（含 Agent Identity）";
+  }
+  if (
+    kinds.some(
+      (k) =>
+        k === "chatgpt_web_session" ||
+        k === "chat_gpt_web_session" ||
+        k === "oauth" ||
+        k === "o_auth" ||
+        k === "access_only",
+    )
+  ) {
+    return "（access-only：Agent Identity 未启用或注册失败，token 过期需重新导出 session）";
+  }
+  return "";
 }
 
 function accountDisplayName(account: CredentialSummary): string {
@@ -878,15 +900,22 @@ function AddProviderWizard({
       }
       accountsImported = true;
       setAccountsJsonText("");
+      const authNote = importAuthNote(imported);
       try {
         // Empty base_url → official ChatGPT Codex discovery path.
         const routes = await discoverProviderModels(created.id, "", undefined);
         const count = routes.filter((route) => route.providerId === created.id).length;
-        finishCreate(created, count);
+        setMessage(
+          `已导入 ${imported.length} 个账号到「${created.name}」${authNote}，已拉取 ${count} 个模型。`,
+        );
+        onClose();
+        void onCreated().catch((error) => {
+          console.error("Failed to refresh provider snapshot after create", error);
+        });
       } catch (modelError) {
         await onCreated();
         setMessage(
-          `已导入 ${imported.length} 个账号到「${created.name}」，模型拉取失败：${
+          `已导入 ${imported.length} 个账号到「${created.name}」${authNote}，模型拉取失败：${
             modelError instanceof Error ? modelError.message : String(modelError)
           }。实例已保留，可稍后重试。`,
         );
@@ -1242,8 +1271,8 @@ function AddProviderWizard({
                   </strong>
                   <p>
                     粘贴或上传<strong>账号</strong> JSON（单对象 / 数组 / <code>accounts[]</code> / Codex auth.json / Sub2API 导出 / Agent Identity）。
-                    ChatGPT access 会自动注册为 <strong>Agent Identity</strong>，导入后立刻拉取官方模型。
-                    Session dump 请改用「导入 session 文件」。
+                    ChatGPT access 会<strong>尽力</strong>注册为 Agent Identity；若上游关闭 registry，仍按 access token 入库。
+                    导入后立刻拉取官方模型。Session dump 也可用「导入 session 文件」（策略相同）。
                   </p>
                   <label className="field">
                     <span>粘贴账号 JSON</span>
@@ -1299,8 +1328,9 @@ function AddProviderWizard({
                   </strong>
                   <p>
                     从浏览器打开 <code>https://chatgpt.com/api/auth/session</code>，复制整页 JSON
-                    （含 <code>WARNING_BANNER</code> 也可）。将注册 <strong>Agent Identity</strong>
-                    （无需接码），并立刻拉取官方模型。
+                    （含 <code>WARNING_BANNER</code> 也可）。优先注册 <strong>Agent Identity</strong>；
+                    若 OpenAI 返回 registry 不可用，则按 <strong>access-only</strong> 入库（与「导入账号 JSON」一致），
+                    无需在本应用内接码。无 refresh_token 时过期需重新导出。导入后立刻拉取官方模型。
                   </p>
                   <label className="field">
                     <span>粘贴 session JSON</span>
@@ -1630,6 +1660,7 @@ function EditProviderSheet({
       setAccountsJsonText("");
       await applyAccountSnapshot(provider.id, provider.activePoolId, provider.routingMode, provider.fixedCredentialId);
       // Immediately refresh official models after account/session import.
+      const authNote = importAuthNote(imported);
       let modelNote = "";
       try {
         const routes = await discoverProviderModels(provider.id, "", undefined);
@@ -1638,7 +1669,7 @@ function EditProviderSheet({
       } catch (modelError) {
         modelNote = `，模型拉取失败：${modelError instanceof Error ? modelError.message : String(modelError)}`;
       }
-      setMessage(`已导入 ${imported.length} 个账号到此实例${modelNote}。`);
+      setMessage(`已导入 ${imported.length} 个账号到此实例${authNote}${modelNote}。`);
       await onChanged();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
