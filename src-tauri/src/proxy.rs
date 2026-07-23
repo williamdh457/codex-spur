@@ -2236,10 +2236,11 @@ fn rewrite_openai_message_item_id(item: &mut Value) {
 ///
 /// Layers:
 /// 1. Message ids must begin with `msg` (legacy Spur/CC Switch used `resp_…_msg`).
-/// 2. Drop **all** reasoning items (foreign encrypted_content decrypts fail;
-///    bridge-only reasoning 404s under `store=false`).
-/// 3. When `store` is not `true`, drop `item_reference` (unresolvable offline).
-/// 4. If any input item was dropped, strip `previous_response_id` so OpenAI does
+/// 2. Drop **all** reasoning and compaction items (their encrypted state is
+///    provider-private and cannot be replayed across model families).
+/// 3. Drop unknown history carriers with top-level `encrypted_content` defensively.
+/// 4. When `store` is not `true`, drop `item_reference` (unresolvable offline).
+/// 5. If any input item was dropped, strip `previous_response_id` so OpenAI does
 ///    not chase a Spur-synthetic or already-invalid server id.
 fn sanitize_openai_responses_input(request: &mut Value) {
     let store_is_true = request.get("store").and_then(Value::as_bool) == Some(true);
@@ -2251,8 +2252,13 @@ fn sanitize_openai_responses_input(request: &mut Value) {
         for mut item in items.drain(..) {
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
             match item_type {
-                "reasoning" => {
-                    // Never portable across Grok/DeepSeek/Kimi ↔ OpenAI.
+                "reasoning" | "compaction" => {
+                    // Provider-private encrypted state is never portable across
+                    // Grok/DeepSeek/Kimi ↔ OpenAI.
+                    dropped_any = true;
+                }
+                _ if item.get("encrypted_content").is_some() => {
+                    // Future/unknown encrypted history carriers must fail closed.
                     dropped_any = true;
                 }
                 "item_reference" if drop_item_references => {
@@ -2391,9 +2397,9 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
 /// Drop Codex-only / non-portable input carriers that third-party Responses hosts reject.
 ///
 /// - `additional_tools`: Responses Lite private carrier (xAI ModelInput fails)
-/// - **all** `reasoning` items: OpenAI/xAI `encrypted_content` is not portable across
-///   providers (official GPT → Grok fails with "Could not decrypt encrypted_content");
-///   summary-only bridge reasoning is also dropped for symmetry with the OpenAI path
+/// - **all** `reasoning` and `compaction` items: their encrypted state is not portable
+///   across providers (official GPT → Grok fails with "Could not decrypt encrypted_content")
+/// - unknown history carriers with top-level `encrypted_content` (fail closed)
 /// - `item_reference` when `store` is not true (unresolvable on foreign hosts)
 /// - If anything was dropped, strip `previous_response_id` so affinity does not chase
 ///   an OpenAI (or other foreign) response id on xAI/MiniMax/etc.
@@ -2413,9 +2419,13 @@ fn sanitize_responses_input_for_upstream(request: &mut Value) {
                 dropped_any = true;
             }
             // Symmetric with sanitize_openai_responses_input: foreign encrypted
-            // reasoning cannot be decrypted by the current upstream (e.g. OpenAI
-            // gAAAAA… blobs on xAI → invalid-argument decrypt error).
-            "reasoning" => {
+            // reasoning/compaction cannot be decrypted by the current upstream
+            // (e.g. OpenAI gAAAAA… blobs on xAI → invalid-argument decrypt error).
+            "reasoning" | "compaction" => {
+                dropped_any = true;
+            }
+            _ if item.get("encrypted_content").is_some() => {
+                // Future/unknown encrypted history carriers must fail closed.
                 dropped_any = true;
             }
             "item_reference" if drop_item_references => {

@@ -187,6 +187,20 @@ export async function createProviderInstance(kind: string, name?: string): Promi
   return invoke<ProviderSummary>("create_provider_instance", { kind, name: name ?? null });
 }
 
+export type OpenCodeGoCredentialStatus = {
+  found: boolean;
+  pathLabel: string;
+  message: string;
+};
+
+export async function inspectOpenCodeGoCredential(): Promise<OpenCodeGoCredentialStatus> {
+  return invoke<OpenCodeGoCredentialStatus>("inspect_opencode_go_credential");
+}
+
+export async function importOpenCodeGoCredential(providerId: string): Promise<CredentialSummary> {
+  return invoke<CredentialSummary>("import_opencode_go_credential", { providerId });
+}
+
 export type DeviceLoginStart = {
   deviceCode: string;
   userCode: string;

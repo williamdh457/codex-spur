@@ -109,6 +109,7 @@ Closing the main window keeps the menu-bar proxy alive. Quitting the app stops t
 - **Add → save & fetch models → a new row on Overview**
 - OpenAI entry methods: official browser OAuth (PKCE), API key, multi-account credentials JSON, provider config JSON
 - Kimi Code defaults to `https://api.kimi.com/coding/v1`
+- OpenCode Go imports the local `opencode-go` API credential from `$XDG_DATA_HOME/opencode/auth.json` (fallback `~/.local/share/opencode/auth.json`) or accepts a manually entered key, and uses `https://opencode.ai/zen/go/v1`
 - Fetched models stay **candidates** until you enable them on the Models page
 
 ### Routing & scheduling

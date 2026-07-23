@@ -101,6 +101,14 @@ pub struct ModelRouteSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OpenCodeGoCredentialStatus {
+    pub found: bool,
+    pub path_label: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CredentialSummary {
     pub id: String,
     pub provider_id: String,

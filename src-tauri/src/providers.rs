@@ -49,6 +49,12 @@ pub fn kind_meta(kind: &str) -> Option<(&'static str, &'static str, &'static str
             "Chat Completions",
             Some("https://api.kimi.com/coding/v1"),
         )),
+        "opencode-go" => Some((
+            "OpenCode Go",
+            "Global",
+            "Chat Completions",
+            Some(crate::opencode_go::DEFAULT_BASE_URL),
+        )),
         "deepseek" => Some((
             "DeepSeek",
             "Global",
@@ -1060,9 +1066,21 @@ mod tests {
 
     #[test]
     fn every_codex_level_has_a_mapping() {
-        for provider in ["kimi", "deepseek", "minimax", "custom", "xai"] {
+        for provider in ["kimi", "deepseek", "minimax", "opencode-go", "custom", "xai"] {
             assert_eq!(reasoning_profile(provider, "model").mappings.len(), 8);
         }
+    }
+
+    #[test]
+    fn opencode_go_kind_meta_uses_chat_completions_endpoint() {
+        let meta = kind_meta("opencode-go").expect("OpenCode Go kind");
+        assert_eq!(meta.0, "OpenCode Go");
+        assert_eq!(meta.2, "Chat Completions");
+        assert_eq!(meta.3, Some(crate::opencode_go::DEFAULT_BASE_URL));
+        assert_eq!(
+            default_base_url_for_kind("opencode-go").as_deref(),
+            Some(crate::opencode_go::DEFAULT_BASE_URL)
+        );
     }
 
     #[test]

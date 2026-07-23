@@ -23,7 +23,7 @@ export type CodexBindingStatus = {
   catalogPath: string;
 };
 
-export type ProviderKind = "openai" | "xai" | "kimi" | "deepseek" | "minimax" | "custom";
+export type ProviderKind = "openai" | "xai" | "kimi" | "deepseek" | "minimax" | "opencode-go" | "custom";
 
 export type ProviderSummary = {
   id: string;

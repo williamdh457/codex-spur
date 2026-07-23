@@ -4,6 +4,12 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-23
+
+### Features
+
+- Add first-class **OpenCode Go** provider support with secure local credential import, manual API-key fallback, model discovery, and Chat Completions proxy routing.
+
 ## [0.1.2] - 2026-07-22
 
 ### Features

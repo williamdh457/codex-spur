@@ -298,7 +298,7 @@ impl Storage {
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind = 'api_key') AS api_key_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.kind IN ('oauth', 'o_auth', 'chatgpt_web_session', 'chat_gpt_web_session', 'agent_identity')) AS oauth_count
              FROM providers
-             ORDER BY CASE kind WHEN 'openai' THEN 0 WHEN 'xai' THEN 1 WHEN 'kimi' THEN 2 WHEN 'deepseek' THEN 3 WHEN 'minimax' THEN 4 ELSE 5 END, name, id",
+             ORDER BY CASE kind WHEN 'openai' THEN 0 WHEN 'xai' THEN 1 WHEN 'kimi' THEN 2 WHEN 'deepseek' THEN 3 WHEN 'minimax' THEN 4 WHEN 'opencode-go' THEN 5 ELSE 6 END, name, id",
         )
         .fetch_all(&self.pool)
         .await?;

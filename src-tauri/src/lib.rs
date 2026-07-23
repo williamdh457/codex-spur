@@ -10,6 +10,7 @@ mod domain;
 mod media_sanitizer;
 mod openai_agent_identity;
 mod openai_oauth;
+mod opencode_go;
 pub mod providers;
 mod proxy;
 mod quota;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 use credentials::{CredentialImportSummary, SecretMaterial};
 use domain::{
     AccountPoolSummary, AppSnapshot, ApplyPreview, CodexApplyOutcome, CodexBindingStatus,
-    CredentialSummary, DeleteCredentialResult, ModelRouteSummary, OpenAiQuotaSnapshot, PoolMemberDetail, ProviderRouting,
+    CredentialSummary, DeleteCredentialResult, ModelRouteSummary, OpenAiQuotaSnapshot, OpenCodeGoCredentialStatus, PoolMemberDetail, ProviderRouting,
     ProviderSummary, ProxyRequestEvent, ProxyStatus,
 };
 use scheduler::PoolSchedulerConfig;
@@ -981,6 +982,53 @@ async fn publish_discovered_models(
         .route_summaries()
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn inspect_opencode_go_credential() -> Result<OpenCodeGoCredentialStatus, String> {
+    let path = opencode_go::auth_path().map_err(|error| error.to_string())?;
+    let path_label = opencode_go::path_label(&path);
+    match opencode_go::read_api_key(&path).await {
+        Ok(_) => Ok(OpenCodeGoCredentialStatus {
+            found: true,
+            path_label,
+            message: "已找到 OpenCode Go API 凭据".into(),
+        }),
+        Err(error) => Ok(OpenCodeGoCredentialStatus {
+            found: false,
+            path_label,
+            message: error.to_string(),
+        }),
+    }
+}
+
+#[tauri::command]
+async fn import_opencode_go_credential(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<CredentialSummary, String> {
+    let provider = state
+        .storage
+        .get_provider(&provider_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "供应商不存在".to_string())?;
+    if provider.kind != "opencode-go" {
+        return Err("该供应商不是 OpenCode Go".into());
+    }
+    let path = opencode_go::auth_path().map_err(|error| error.to_string())?;
+    let key = opencode_go::read_api_key(&path)
+        .await
+        .map_err(|error| error.to_string())?;
+    store_api_key_credential(&state, &provider_id, key.as_str()).await?;
+    state
+        .storage
+        .list_credentials(Some(&provider_id))
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "OpenCode Go 凭据保存失败".to_string())
 }
 
 #[tauri::command]
@@ -2821,6 +2869,8 @@ pub fn run() {
             disable_kimi_list_shield_system_proxy,
             list_model_routes,
             discover_provider_models,
+            inspect_opencode_go_credential,
+            import_opencode_go_credential,
             import_provider_config_json,
             create_provider_instance,
             delete_provider_instance,

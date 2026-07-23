@@ -21,6 +21,8 @@ import {
   getPoolSchedulerConfig,
   getProviderRouting,
   importCredentialsJson,
+  importOpenCodeGoCredential,
+  inspectOpenCodeGoCredential,
   importSessionJson,
   importProviderConfigJson,
   kimiTargetStatus,
@@ -266,6 +268,7 @@ type AddMethodId =
   | "kimi"
   | "deepseek"
   | "minimax"
+  | "opencode-go"
   | "custom"
   | "custom-config-json";
 
@@ -399,6 +402,14 @@ const ADD_METHODS: AddMethod[] = [
     category: "api",
   },
   {
+    id: "opencode-go",
+    kind: "opencode-go",
+    title: "OpenCode Go",
+    hint: "自动导入本机凭据，或手动填写 API Key",
+    mode: "api",
+    category: "api",
+  },
+  {
     id: "custom",
     kind: "custom",
     title: "自定义",
@@ -422,6 +433,7 @@ const DEFAULT_BASE_URL: Record<ProviderKind, string> = {
   kimi: "https://api.kimi.com/coding/v1",
   deepseek: "https://api.deepseek.com/v1",
   minimax: "https://api.minimaxi.com/v1",
+  "opencode-go": "https://opencode.ai/zen/go/v1",
   custom: "",
 };
 
@@ -681,6 +693,7 @@ function AddProviderWizard({
   const [displayName, setDisplayName] = useState("");
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL.openai);
   const [apiKey, setApiKey] = useState("");
+  const [openCodeGoStatus, setOpenCodeGoStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   /** OpenAI official subscription — browser PKCE session (no secrets). */
@@ -742,6 +755,12 @@ function AddProviderWizard({
     setMethodId(nextId);
     setMessage(null);
     setApiKey("");
+    setOpenCodeGoStatus(null);
+    if (next.kind === "opencode-go") {
+      void inspectOpenCodeGoCredential()
+        .then((status) => setOpenCodeGoStatus(`${status.message}（${status.pathLabel}）`))
+        .catch((error) => setOpenCodeGoStatus(error instanceof Error ? error.message : String(error)));
+    }
     if (browserLogin) {
       void cancelOpenAiBrowserLogin().catch(() => undefined);
     }
@@ -771,6 +790,25 @@ function AddProviderWizard({
     setMessage(warning ?? `已添加 ${created.name}，拉取 ${modelCount} 个模型候选。`);
     await onCreated();
     if (!warning) onClose();
+  };
+
+  const submitOpenCodeGoImport = async () => {
+    setBusy(true);
+    setMessage(null);
+    let createdId: string | null = null;
+    try {
+      const created = await createProviderInstance("opencode-go", displayName.trim() || undefined);
+      createdId = created.id;
+      await importOpenCodeGoCredential(created.id);
+      const routes = await discoverProviderModels(created.id, DEFAULT_BASE_URL["opencode-go"], undefined);
+      const count = routes.filter((route) => route.providerId === created.id).length;
+      await finishCreate(created, count);
+    } catch (error) {
+      if (createdId) await rollback(createdId);
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const submitApi = async () => {
@@ -1131,6 +1169,16 @@ function AddProviderWizard({
                     默认端点 <code>https://api.x.ai/v1</code>（API Key）。订阅用户请优先用「Grok · 官方订阅」（走 <code>cli-chat-proxy.grok.com</code>）；此处用于 xAI API Key。
                   </p>
                 )}
+                {method.kind === "opencode-go" && (
+                  <div className="callout">
+                    <strong>从 OpenCode 自动导入</strong>
+                    <p>读取本机 <code>opencode-go</code> API 凭据，重新加密保存到 Spur；不会读取 OpenCode Zen 凭据。</p>
+                    {openCodeGoStatus && <p className="panel-hint">{openCodeGoStatus}</p>}
+                    <button type="button" className="button button--primary" disabled={busy} onClick={() => void submitOpenCodeGoImport()}>
+                      {busy ? "正在导入并拉取…" : "从 OpenCode 导入并拉取模型"}
+                    </button>
+                  </div>
+                )}
                 <label className="field">
                   <span>Base URL</span>
                   <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://provider.example.com/v1" spellCheck={false} />
@@ -1141,7 +1189,7 @@ function AddProviderWizard({
                 </label>
                 <div className="form-actions">
                   <button type="button" className="button button--primary" disabled={busy} onClick={() => void submitApi()}>
-                    {busy ? "正在保存并拉取…" : "保存并拉取模型"}
+                    {busy ? "正在保存并拉取…" : method.kind === "opencode-go" ? "使用手动 Key 保存并拉取" : "保存并拉取模型"}
                   </button>
                 </div>
               </section>
