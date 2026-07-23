@@ -17,11 +17,22 @@ pub struct RateLimitCooldown {
 }
 
 /// Whether this HTTP status should trigger account failover.
+#[allow(dead_code)]
 pub fn is_failover_status(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        401 | 402 | 403 | 429 | 529
-    ) || status.is_server_error()
+    is_failover_status_with_options(status, false)
+}
+
+/// Failover check with Sub2API-like `failover_on_400` option.
+pub fn is_failover_status_with_options(
+    status: reqwest::StatusCode,
+    failover_on_400: bool,
+) -> bool {
+    let code = status.as_u16();
+    if matches!(code, 401 | 402 | 403 | 429 | 529) || status.is_server_error() {
+        return true;
+    }
+    // Narrow 400 failover: only when explicitly enabled (Sub2API default off).
+    failover_on_400 && code == 400
 }
 
 pub fn status_category(status: reqwest::StatusCode) -> &'static str {
@@ -386,6 +397,14 @@ mod tests {
         assert!(is_failover_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
         assert!(is_failover_status(reqwest::StatusCode::from_u16(529).unwrap()));
         assert!(!is_failover_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_failover_status_with_options(
+            reqwest::StatusCode::BAD_REQUEST,
+            false
+        ));
+        assert!(is_failover_status_with_options(
+            reqwest::StatusCode::BAD_REQUEST,
+            true
+        ));
     }
 
     #[test]

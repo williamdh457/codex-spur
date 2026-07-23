@@ -1,7 +1,9 @@
-use super::scoring::{lottery_weights, score_among_peers, QUOTA_SNAPSHOT_STALE_SECS};
+use super::scoring::{
+    lottery_weights, score_among_peers, sticky_soft_bonus, QUOTA_SNAPSHOT_STALE_SECS,
+};
 use super::types::{
-    CandidateAccount, PoolSchedulerConfig, RoutingMode, ScheduleState, SelectOutcome,
-    SelectRequest, SelectionLayer,
+    CandidateAccount, FallbackSelectionMode, PoolSchedulerConfig, RoutingMode, ScheduleState,
+    SelectOutcome, SelectRequest, SelectionLayer,
 };
 
 /// Whether a sticky-bound account may still be used (health/quota/cooldown).
@@ -140,43 +142,57 @@ pub fn select_account(
         RoutingMode::Pool => {}
     }
 
-    // 1) previous_response_id sticky
-    if request.previous_response_id.is_some() {
-        if let Some(bound_id) = request.previous_response_binding.as_deref() {
-            if !excluded(bound_id, &request.exclude_credential_ids) {
-                if let Some(candidate) = find_candidate(candidates, bound_id) {
-                    if sticky_eligible(candidate, config, request.now_unix) {
-                        if sticky_concurrency_full(candidate) && !config.sticky_wait_enabled {
-                            sticky_escaped = true;
+    // Hard sticky layers (default). Sticky-weighted mode skips hard hits and uses score bonuses.
+    if !config.sticky_weighted_enabled {
+        // 1) previous_response_id sticky
+        if request.previous_response_id.is_some() {
+            if let Some(bound_id) = request.previous_response_binding.as_deref() {
+                if !excluded(bound_id, &request.exclude_credential_ids) {
+                    if let Some(candidate) = find_candidate(candidates, bound_id) {
+                        if sticky_eligible(candidate, config, request.now_unix) {
+                            if sticky_concurrency_full(candidate) && !config.sticky_wait_enabled {
+                                sticky_escaped = true;
+                            } else {
+                                // Concurrency-full + wait enabled: still return sticky so storage can wait.
+                                return Some(SelectOutcome {
+                                    credential_id: bound_id.to_string(),
+                                    layer: SelectionLayer::PreviousResponse,
+                                    rebind_previous_response: false,
+                                    // Bind session onto the same account for prompt-cache continuity.
+                                    rebind_session: request.session_key.is_some(),
+                                    sticky_escaped: false,
+                                });
+                            }
                         } else {
-                            // Concurrency-full + wait enabled: still return sticky so storage can wait.
-                            return Some(SelectOutcome {
-                                credential_id: bound_id.to_string(),
-                                layer: SelectionLayer::PreviousResponse,
-                                rebind_previous_response: false,
-                                // Bind session onto the same account for prompt-cache continuity.
-                                rebind_session: request.session_key.is_some(),
-                                sticky_escaped: false,
-                            });
+                            sticky_escaped = true;
                         }
                     } else {
                         sticky_escaped = true;
                     }
-                } else {
-                    sticky_escaped = true;
                 }
             }
         }
-    }
 
-    // 2) session-hash sticky
-    if request.session_key.is_some() {
-        if let Some(bound_id) = request.session_binding.as_deref() {
-            if !excluded(bound_id, &request.exclude_credential_ids) {
-                if let Some(candidate) = find_candidate(candidates, bound_id) {
-                    if sticky_eligible(candidate, config, request.now_unix) {
-                        if sticky_concurrency_full(candidate) {
-                            if config.sticky_wait_enabled {
+        // 2) session-hash sticky
+        if request.session_key.is_some() {
+            if let Some(bound_id) = request.session_binding.as_deref() {
+                if !excluded(bound_id, &request.exclude_credential_ids) {
+                    if let Some(candidate) = find_candidate(candidates, bound_id) {
+                        if sticky_eligible(candidate, config, request.now_unix) {
+                            if sticky_concurrency_full(candidate) {
+                                if config.sticky_wait_enabled {
+                                    return Some(SelectOutcome {
+                                        credential_id: bound_id.to_string(),
+                                        layer: SelectionLayer::Session,
+                                        rebind_previous_response: request
+                                            .previous_response_id
+                                            .is_some(),
+                                        rebind_session: false,
+                                        sticky_escaped,
+                                    });
+                                }
+                                sticky_escaped = true;
+                            } else {
                                 return Some(SelectOutcome {
                                     credential_id: bound_id.to_string(),
                                     layer: SelectionLayer::Session,
@@ -185,67 +201,157 @@ pub fn select_account(
                                     sticky_escaped,
                                 });
                             }
-                            sticky_escaped = true;
                         } else {
-                            return Some(SelectOutcome {
-                                credential_id: bound_id.to_string(),
-                                layer: SelectionLayer::Session,
-                                rebind_previous_response: request.previous_response_id.is_some(),
-                                rebind_session: false,
-                                sticky_escaped,
-                            });
+                            sticky_escaped = true;
                         }
                     } else {
                         sticky_escaped = true;
                     }
-                } else {
+                }
+            }
+        }
+    } else {
+        // Soft sticky: mark escaped when bound accounts are unhealthy so diagnostics stay truthful.
+        for bound in [
+            request.previous_response_binding.as_deref(),
+            request.session_binding.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(candidate) = find_candidate(candidates, bound) {
+                if !sticky_eligible(candidate, config, request.now_unix) {
                     sticky_escaped = true;
                 }
+            } else if request.previous_response_binding.is_some()
+                || request.session_binding.is_some()
+            {
+                sticky_escaped = true;
             }
         }
     }
 
     // 3) load-aware Top-K weighted selection
-    let eligible: Vec<&CandidateAccount> = candidates
+    // First try accounts with free concurrency slots.
+    let mut eligible: Vec<&CandidateAccount> = candidates
         .iter()
         .filter(|item| {
             !excluded(&item.credential_id, &request.exclude_credential_ids)
                 && is_base_eligible(item, config, request.now_unix, true)
         })
         .collect();
+
+    // When all healthy accounts are concurrency-full, signal storage to fallback-wait by
+    // returning the best full account when fallback is enabled (slot wait happens outside).
+    let mut used_fallback_signal = false;
+    if eligible.is_empty() && config.fallback_wait_enabled {
+        let full_but_healthy: Vec<&CandidateAccount> = candidates
+            .iter()
+            .filter(|item| {
+                !excluded(&item.credential_id, &request.exclude_credential_ids)
+                    && is_base_eligible(item, config, request.now_unix, false)
+                    && sticky_concurrency_full(item)
+            })
+            .collect();
+        if !full_but_healthy.is_empty() {
+            eligible = full_but_healthy;
+            used_fallback_signal = true;
+        }
+    }
     if eligible.is_empty() {
         return None;
     }
 
     let peer_owned: Vec<CandidateAccount> = eligible.iter().map(|c| (*c).clone()).collect();
+    let prev_bind = request.previous_response_binding.as_deref();
+    let sess_bind = request.session_binding.as_deref();
     let mut scored: Vec<(&CandidateAccount, f64)> = eligible
         .iter()
         .map(|c| {
-            (
-                *c,
-                score_among_peers(c, &peer_owned, config, request.now_unix),
-            )
+            let base = score_among_peers(c, &peer_owned, config, request.now_unix);
+            let bonus = sticky_soft_bonus(c, config, prev_bind, sess_bind);
+            (*c, base + bonus)
         })
         .collect();
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.0.priority.cmp(&a.0.priority))
-            .then_with(|| a.0.credential_id.cmp(&b.0.credential_id))
-    });
 
-    let top_k = config.lb_top_k.max(1) as usize;
+    if used_fallback_signal {
+        match config.fallback_selection_mode {
+            FallbackSelectionMode::LastUsed => {
+                scored.sort_by(|a, b| {
+                    // Older last_used first (None treated as oldest).
+                    let a_t = a.0.last_used_at.unwrap_or(0);
+                    let b_t = b.0.last_used_at.unwrap_or(0);
+                    a_t.cmp(&b_t)
+                        .then_with(|| a.0.credential_id.cmp(&b.0.credential_id))
+                });
+            }
+            FallbackSelectionMode::Random => {
+                // Deterministic shuffle from seed: sort by score then pick via lottery below.
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.credential_id.cmp(&b.0.credential_id))
+                });
+            }
+        }
+    } else {
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.priority.cmp(&a.0.priority))
+                .then_with(|| a.0.credential_id.cmp(&b.0.credential_id))
+        });
+    }
+
+    let top_k = if used_fallback_signal {
+        // Fallback: pick ordered candidate (last_used already sorted; random uses full lottery).
+        match config.fallback_selection_mode {
+            FallbackSelectionMode::LastUsed => 1,
+            FallbackSelectionMode::Random => scored.len().max(1),
+        }
+    } else {
+        config.lb_top_k.max(1) as usize
+    };
     let top: Vec<(&CandidateAccount, f64)> = scored.into_iter().take(top_k).collect();
     let scores: Vec<f64> = top.iter().map(|(_, s)| *s).collect();
     let member_weights: Vec<i64> = top.iter().map(|(c, _)| c.weight).collect();
     let lottery = lottery_weights(&scores, &member_weights);
     let selected = weighted_pick_f64(&top, &lottery, selection_seed)?;
 
+    // Sticky-weighted: report sticky layer when the chosen account matches a binding.
+    let (layer, rebind_prev, rebind_sess) = if config.sticky_weighted_enabled {
+        if prev_bind == Some(selected.credential_id.as_str()) {
+            (
+                SelectionLayer::PreviousResponse,
+                false,
+                request.session_key.is_some(),
+            )
+        } else if sess_bind == Some(selected.credential_id.as_str()) {
+            (
+                SelectionLayer::Session,
+                request.previous_response_id.is_some(),
+                false,
+            )
+        } else {
+            (
+                SelectionLayer::LoadBalance,
+                request.previous_response_id.is_some(),
+                request.session_key.is_some(),
+            )
+        }
+    } else {
+        (
+            SelectionLayer::LoadBalance,
+            request.previous_response_id.is_some(),
+            request.session_key.is_some(),
+        )
+    };
+
     Some(SelectOutcome {
         credential_id: selected.credential_id.clone(),
-        layer: SelectionLayer::LoadBalance,
-        rebind_previous_response: request.previous_response_id.is_some(),
-        rebind_session: request.session_key.is_some(),
+        layer,
+        rebind_previous_response: rebind_prev,
+        rebind_session: rebind_sess,
         sticky_escaped,
     })
 }
@@ -298,6 +404,8 @@ mod tests {
             quota_remaining: Some(1.0),
             session_reset_at: None,
             quota_fetched_at: Some(0),
+            upstream_cost_rate: 1.0,
+            last_used_at: None,
         }
     }
 
@@ -546,5 +654,81 @@ mod tests {
         let outcome = select_account(&[bound, other], &config, &request, 0).unwrap();
         assert_eq!(outcome.credential_id, "sticky");
         assert_eq!(outcome.layer, SelectionLayer::Session);
+    }
+
+    #[test]
+    fn sticky_defaults_match_sub2api() {
+        let config = PoolSchedulerConfig::default();
+        assert_eq!(config.sticky_wait_timeout_secs, 120);
+        assert_eq!(config.sticky_wait_max_waiting, 3);
+        assert_eq!(config.max_failover_switches, 10);
+        assert_eq!(config.fallback_wait_timeout_secs, 30);
+        assert_eq!(config.overload_529_cooldown_secs, 600);
+        assert!(!config.sticky_weighted_enabled);
+        assert!(!config.failover_on_400);
+        assert!((config.score_weights.previous_response - 5.0).abs() < 1e-9);
+        assert!((config.score_weights.session_sticky - 3.0).abs() < 1e-9);
+        assert!((config.score_weights.upstream_cost - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sticky_weighted_prefers_bound_account_via_score() {
+        let bound = candidate("sticky", 1, 0);
+        let other = candidate("other", 1, 0);
+        let config = PoolSchedulerConfig {
+            sticky_weighted_enabled: true,
+            lb_top_k: 1,
+            score_weights: ScoreWeights {
+                previous_response: 5.0,
+                ..ScoreWeights::default()
+            },
+            ..PoolSchedulerConfig::default()
+        };
+        let mut request = req();
+        request.previous_response_id = Some("resp".into());
+        request.previous_response_binding = Some("sticky".into());
+        let outcome = select_account(&[other, bound], &config, &request, 0).unwrap();
+        assert_eq!(outcome.credential_id, "sticky");
+        assert_eq!(outcome.layer, SelectionLayer::PreviousResponse);
+    }
+
+    #[test]
+    fn sticky_weighted_can_pick_other_when_bound_unhealthy() {
+        let mut bound = candidate("sticky", 1, 0);
+        bound.healthy = false;
+        bound.schedule_state = ScheduleState::AuthInvalid;
+        let other = candidate("other", 1, 0);
+        let config = PoolSchedulerConfig {
+            sticky_weighted_enabled: true,
+            lb_top_k: 1,
+            ..PoolSchedulerConfig::default()
+        };
+        let mut request = req();
+        request.session_key = Some("sess".into());
+        request.session_binding = Some("sticky".into());
+        let outcome = select_account(&[bound, other], &config, &request, 0).unwrap();
+        assert_eq!(outcome.credential_id, "other");
+        assert_eq!(outcome.layer, SelectionLayer::LoadBalance);
+        assert!(outcome.sticky_escaped);
+    }
+
+    #[test]
+    fn fallback_signals_full_account_when_all_slots_taken() {
+        let mut a = candidate("a", 1, 0);
+        a.active_leases = 1;
+        a.concurrency_limit = 1;
+        let mut b = candidate("b", 1, 0);
+        b.active_leases = 2;
+        b.concurrency_limit = 2;
+        b.last_used_at = Some(100);
+        a.last_used_at = Some(50); // older → preferred under last_used
+        let config = PoolSchedulerConfig {
+            fallback_wait_enabled: true,
+            fallback_selection_mode: FallbackSelectionMode::LastUsed,
+            ..PoolSchedulerConfig::default()
+        };
+        let outcome = select_account(&[a, b], &config, &req(), 0).unwrap();
+        assert_eq!(outcome.credential_id, "a");
+        assert_eq!(outcome.layer, SelectionLayer::LoadBalance);
     }
 }

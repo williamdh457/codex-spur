@@ -32,6 +32,7 @@ import {
   pollXaiDeviceLogin,
   previewCodexApply,
   refreshOpenAiQuota,
+  renameCredential,
   renameProviderInstance,
   restorePreviousCodexConfig,
   setDiagnosticsMaxEvents,
@@ -538,6 +539,23 @@ function supportsOfficialQuota(account: CredentialSummary): boolean {
   const kind = account.kind.toLowerCase();
   if (kind === "agent_identity" || kind === "agentidentity") return true;
   return kind !== "api_key" && kind !== "apikey";
+}
+
+function describeCredentialKind(account: CredentialSummary): string {
+  const kind = account.kind.toLowerCase();
+  if (kind === "agent_identity" || kind === "agentidentity") return "Agent Identity";
+  if (kind === "oauth" || kind === "o_auth") {
+    return account.refreshable ? "OAuth · 可刷新" : "OAuth · 仅访问";
+  }
+  if (kind === "chatgpt_web_session" || kind === "chat_gpt_web_session") {
+    return account.refreshable ? "Web Session · 可刷新" : "Web Session · 仅访问";
+  }
+  if (kind === "api_key" || kind === "apikey") return "API Key";
+  return account.refreshable ? `${account.kind} · 可刷新` : `${account.kind} · 仅访问`;
+}
+
+function accountDisplayName(account: CredentialSummary): string {
+  return account.label ?? account.maskedEmail ?? account.maskedAccountId ?? account.fingerprintPrefix;
 }
 
 function formatQuotaReset(resetAt: number | null): string {
@@ -1288,6 +1306,19 @@ function AddProviderWizard({
   );
 }
 
+function mergeSchedulerConfig(partial: Partial<PoolSchedulerConfig> | null | undefined): PoolSchedulerConfig {
+  const d = defaultSchedulerConfig();
+  if (!partial) return d;
+  return {
+    ...d,
+    ...partial,
+    stickyEscape: { ...d.stickyEscape, ...(partial.stickyEscape ?? {}) },
+    scoreWeights: { ...d.scoreWeights, ...(partial.scoreWeights ?? {}) },
+    fallbackSelectionMode:
+      partial.fallbackSelectionMode === "random" ? "random" : d.fallbackSelectionMode,
+  };
+}
+
 function defaultSchedulerConfig(): PoolSchedulerConfig {
   return {
     lbTopK: 7,
@@ -1301,17 +1332,29 @@ function defaultSchedulerConfig(): PoolSchedulerConfig {
       ttft: 0.5,
       reset: 0,
       quotaHeadroom: 1,
+      upstreamCost: 0,
+      previousResponse: 5,
+      sessionSticky: 3,
     },
     stickyEscape: { enabled: true, ttftMs: 15000, errorRate: 0.5 },
     preferSoonestReset: false,
     default429CooldownSecs: 30,
-    maxFailoverSwitches: 3,
+    maxFailoverSwitches: 10,
     leaseTtlSecs: 900,
     excludeZeroQuota: true,
     quotaAutoPause5h: 1,
     quotaAutoPause7d: 1,
     stickyWaitEnabled: true,
-    stickyWaitTimeoutSecs: 30,
+    stickyWaitTimeoutSecs: 120,
+    stickyWaitMaxWaiting: 3,
+    fallbackWaitEnabled: true,
+    fallbackWaitTimeoutSecs: 30,
+    fallbackMaxWaiting: 100,
+    fallbackSelectionMode: "last_used",
+    stickyWeightedEnabled: false,
+    rateLimit429CooldownEnabled: true,
+    overload529CooldownSecs: 600,
+    failoverOn400: false,
   };
 }
 
@@ -1354,6 +1397,9 @@ function EditProviderSheet({
   const [quotaBusy, setQuotaBusy] = useState<Record<string, boolean>>({});
   const [quotaErrors, setQuotaErrors] = useState<Record<string, string | null>>({});
   const [quotaClockMs, setQuotaClockMs] = useState(() => Date.now());
+  const [renamingCredentialId, setRenamingCredentialId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
   const deleteBusy = deletingCredentialId != null || deletingProvider;
 
   useEscapeClose(onClose, !confirm && !deleteBusy);
@@ -1602,6 +1648,7 @@ function EditProviderSheet({
         member.priority,
         member.enabled,
         member.concurrencyLimit,
+        member.upstreamCostRate ?? 1,
       );
       setMembers(await listPoolMembersDetailed(poolId));
       setMessage("已更新账号调度参数。");
@@ -1701,11 +1748,7 @@ function EditProviderSheet({
   };
 
   const requestDeleteAccount = (account: CredentialSummary) => {
-    const identity =
-      account.label ??
-      account.maskedEmail ??
-      account.maskedAccountId ??
-      account.fingerprintPrefix;
+    const identity = accountDisplayName(account);
     setConfirm({
       title: `删除账号「${identity}」？`,
       body: "此操作不可恢复：本地加密凭据将永久删除，并从调度池移出。",
@@ -1713,6 +1756,39 @@ function EditProviderSheet({
       danger: true,
       onConfirm: () => executeDeleteAccount(account, identity),
     });
+  };
+
+  const beginRenameAccount = (account: CredentialSummary) => {
+    setRenamingCredentialId(account.id);
+    setRenameDraft(account.label ?? "");
+  };
+
+  const cancelRenameAccount = () => {
+    setRenamingCredentialId(null);
+    setRenameDraft("");
+  };
+
+  const commitRenameAccount = async (credentialId: string) => {
+    if (renameBusy) return;
+    setRenameBusy(true);
+    setMessage(null);
+    try {
+      const updated = await renameCredential(credentialId, renameDraft);
+      setAccounts((prev) => prev.map((item) => (item.id === credentialId ? updated : item)));
+      setMembers((prev) =>
+        prev.map((item) =>
+          item.credentialId === credentialId ? { ...item, label: updated.label } : item,
+        ),
+      );
+      setRenamingCredentialId(null);
+      setRenameDraft("");
+      setMessage("账号名称已更新。");
+      await onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRenameBusy(false);
+    }
   };
 
 
@@ -1890,9 +1966,33 @@ function EditProviderSheet({
                             <StatusDot tone={account.healthy ? "healthy" : "error"} />
                           )}
                           <span className="modal-account-row__meta">
-                            <strong>{account.label ?? account.maskedEmail ?? account.maskedAccountId ?? account.fingerprintPrefix}</strong>
+                            {renamingCredentialId === account.id ? (
+                              <input
+                                className="account-rename-input"
+                                value={renameDraft}
+                                autoFocus
+                                disabled={renameBusy}
+                                maxLength={64}
+                                placeholder={account.maskedEmail ?? account.maskedAccountId ?? "账号显示名"}
+                                aria-label="账号显示名"
+                                onChange={(event) => setRenameDraft(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    void commitRenameAccount(account.id);
+                                  } else if (event.key === "Escape") {
+                                    event.preventDefault();
+                                    cancelRenameAccount();
+                                  }
+                                }}
+                              />
+                            ) : (
+                              <strong title="双击重命名" onDoubleClick={() => beginRenameAccount(account)}>
+                                {accountDisplayName(account)}
+                              </strong>
+                            )}
                             <small>
-                              {account.kind} · {account.refreshable ? "可刷新" : "仅访问"}
+                              {describeCredentialKind(account)}
                               {member ? ` · ${member.scheduleState}` : ""}
                               {member?.cooldownUntil ? " · cooldown" : ""}
                             </small>
@@ -1900,8 +2000,23 @@ function EditProviderSheet({
                           <span className={`badge ${account.healthy ? "badge--success" : "badge--error"}`}>{account.healthy ? "可用" : "失效"}</span>
                           <button
                             type="button"
+                            className="button button--secondary"
+                            disabled={deleteBusy || renameBusy}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              if (renamingCredentialId === account.id) {
+                                void commitRenameAccount(account.id);
+                              } else {
+                                beginRenameAccount(account);
+                              }
+                            }}
+                          >
+                            {renamingCredentialId === account.id ? (renameBusy ? "保存中…" : "保存") : "重命名"}
+                          </button>
+                          <button
+                            type="button"
                             className="button button--secondary button--danger-text"
-                            disabled={deleteBusy}
+                            disabled={deleteBusy || renameBusy}
                             onClick={(event) => {
                               event.stopPropagation();
                               requestDeleteAccount(account);
@@ -1954,6 +2069,30 @@ function EditProviderSheet({
                                   onChange={(event) => {
                                     const concurrencyLimit = Number(event.target.value) || 1;
                                     setMembers((prev) => prev.map((item) => item.credentialId === member.credentialId ? { ...item, concurrencyLimit } : item));
+                                  }}
+                                  onBlur={() => {
+                                    const current = members.find((item) => item.credentialId === member.credentialId);
+                                    if (current) void saveMember(current);
+                                  }}
+                                />
+                              </label>
+                              <label title="上游计费倍率（调度评分用；1=中性）">
+                                <span>成本</span>
+                                <input
+                                  type="number"
+                                  min={0.01}
+                                  step={0.1}
+                                  value={member.upstreamCostRate ?? 1}
+                                  disabled={busy}
+                                  onChange={(event) => {
+                                    const upstreamCostRate = Number(event.target.value) || 1;
+                                    setMembers((prev) =>
+                                      prev.map((item) =>
+                                        item.credentialId === member.credentialId
+                                          ? { ...item, upstreamCostRate }
+                                          : item,
+                                      ),
+                                    );
                                   }}
                                   onBlur={() => {
                                     const current = members.find((item) => item.credentialId === member.credentialId);
@@ -2327,7 +2466,61 @@ const SCHEDULER_FIELD_HELP = {
     key: "stickyWaitTimeoutSecs",
     label: "Sticky 等待秒",
     meaning: "Sticky wait timeout (seconds)",
-    effect: "粘性并发等待的最长时间；超时后可逃逸到其他账号。",
+    effect: "粘性并发等待的最长时间（Sub2API 默认 120s）；超时后可逃逸到其他账号。",
+  },
+  stickyWaitMaxWaiting: {
+    key: "stickyWaitMaxWaiting",
+    label: "Sticky 最大排队",
+    meaning: "Sticky max waiting",
+    effect: "同一粘性账号允许同时等待的请求数；超出则立刻换号（Sub2API=3）。",
+  },
+  fallbackWaitEnabled: {
+    key: "fallbackWaitEnabled",
+    label: "兜底并发等待",
+    meaning: "Fallback wait enabled",
+    effect: "全部账号并发满时，排队等待任意空位再选号。",
+  },
+  fallbackWaitTimeoutSecs: {
+    key: "fallbackWaitTimeoutSecs",
+    label: "兜底等待秒",
+    meaning: "Fallback wait timeout",
+    effect: "兜底并发等待最长时间（Sub2API 默认 30s）。",
+  },
+  fallbackMaxWaiting: {
+    key: "fallbackMaxWaiting",
+    label: "兜底最大排队",
+    meaning: "Fallback max waiting",
+    effect: "兜底等待队列上限（Sub2API 默认 100）。",
+  },
+  fallbackSelectionMode: {
+    key: "fallbackSelectionMode",
+    label: "兜底选号方式",
+    meaning: "Fallback selection mode",
+    effect: "last_used=最久未用优先；random=随机（Sub2API）。",
+  },
+  stickyWeightedEnabled: {
+    key: "stickyWeightedEnabled",
+    label: "Sticky 加权模式",
+    meaning: "Sticky weighted",
+    effect: "开启后粘性进入打分（可跨号）；关闭则硬绑定 previous_response/session。",
+  },
+  rateLimit429CooldownEnabled: {
+    key: "rateLimit429CooldownEnabled",
+    label: "429 冷却开关",
+    meaning: "Rate-limit cooldown enabled",
+    effect: "收到 429/额度耗尽时是否写入冷却；关闭仍可换号但不记冷却。",
+  },
+  overload529CooldownSecs: {
+    key: "overload529CooldownSecs",
+    label: "529 冷却（秒）",
+    meaning: "Overload 529 cooldown",
+    effect: "上游 529 过载后暂停调度的秒数（Sub2API 默认 10 分钟=600）。",
+  },
+  failoverOn400: {
+    key: "failoverOn400",
+    label: "400 允许换号",
+    meaning: "Failover on 400",
+    effect: "开启后部分 400 也会切换账号重试（Sub2API 默认关，慎用）。",
   },
   stickyEscapeEnabled: {
     key: "stickyEscape.enabled",
@@ -2406,6 +2599,24 @@ const SCHEDULER_FIELD_HELP = {
     label: "权重 · 额度余量",
     meaning: "W·quotaHeadroom",
     effect: "评分中剩余额度因子权重；越高越偏向仍有配额的账号。",
+  },
+  wUpstreamCost: {
+    key: "scoreWeights.upstreamCost",
+    label: "权重 · 上游成本",
+    meaning: "W·upstreamCost",
+    effect: "倾向上游计费倍率更低的账号；0=关闭（Sub2API 默认）。",
+  },
+  wPreviousResponse: {
+    key: "scoreWeights.previousResponse",
+    label: "权重 · previous_response",
+    meaning: "W·previousResponse",
+    effect: "Sticky 加权模式下，绑定 previous_response 的账号加分（默认 5）。",
+  },
+  wSessionSticky: {
+    key: "scoreWeights.sessionSticky",
+    label: "权重 · session sticky",
+    meaning: "W·sessionSticky",
+    effect: "Sticky 加权模式下，绑定 session 的账号加分（默认 3）。",
   },
 } as const satisfies Record<string, FieldHelp>;
 
@@ -2637,6 +2848,15 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
       c.leaseTtlSecs !== d.leaseTtlSecs ||
       c.stickyWaitEnabled !== d.stickyWaitEnabled ||
       c.stickyWaitTimeoutSecs !== d.stickyWaitTimeoutSecs ||
+      c.stickyWaitMaxWaiting !== d.stickyWaitMaxWaiting ||
+      c.fallbackWaitEnabled !== d.fallbackWaitEnabled ||
+      c.fallbackWaitTimeoutSecs !== d.fallbackWaitTimeoutSecs ||
+      c.fallbackMaxWaiting !== d.fallbackMaxWaiting ||
+      c.fallbackSelectionMode !== d.fallbackSelectionMode ||
+      c.stickyWeightedEnabled !== d.stickyWeightedEnabled ||
+      c.rateLimit429CooldownEnabled !== d.rateLimit429CooldownEnabled ||
+      c.overload529CooldownSecs !== d.overload529CooldownSecs ||
+      c.failoverOn400 !== d.failoverOn400 ||
       c.stickyEscape.enabled !== d.stickyEscape.enabled ||
       c.stickyEscape.ttftMs !== d.stickyEscape.ttftMs ||
       c.stickyEscape.errorRate !== d.stickyEscape.errorRate ||
@@ -2649,7 +2869,10 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
       c.scoreWeights.errorRate !== d.scoreWeights.errorRate ||
       c.scoreWeights.ttft !== d.scoreWeights.ttft ||
       c.scoreWeights.reset !== d.scoreWeights.reset ||
-      c.scoreWeights.quotaHeadroom !== d.scoreWeights.quotaHeadroom
+      c.scoreWeights.quotaHeadroom !== d.scoreWeights.quotaHeadroom ||
+      c.scoreWeights.upstreamCost !== d.scoreWeights.upstreamCost ||
+      c.scoreWeights.previousResponse !== d.scoreWeights.previousResponse ||
+      c.scoreWeights.sessionSticky !== d.scoreWeights.sessionSticky
     );
   }, [schedulerConfig]);
 
@@ -2670,7 +2893,7 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
     }
     let active = true;
     void getPoolSchedulerConfig(provider.activePoolId).then((config) => {
-      if (active) setSchedulerConfig(config);
+      if (active) setSchedulerConfig(mergeSchedulerConfig(config));
     });
     return () => {
       active = false;
@@ -2776,7 +2999,7 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
                   <NumberField
                     help={SCHEDULER_FIELD_HELP.maxFailoverSwitches}
                     min={1}
-                    max={10}
+                    max={20}
                     value={schedulerConfig.maxFailoverSwitches}
                     onChange={(value) => setSchedulerConfig({ ...schedulerConfig, maxFailoverSwitches: value || 1 })}
                   />
@@ -2786,12 +3009,34 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
                     value={schedulerConfig.default429CooldownSecs}
                     onChange={(value) => setSchedulerConfig({ ...schedulerConfig, default429CooldownSecs: value || 1 })}
                   />
+                  <NumberField
+                    help={SCHEDULER_FIELD_HELP.overload529CooldownSecs}
+                    min={1}
+                    value={schedulerConfig.overload529CooldownSecs}
+                    onChange={(value) =>
+                      setSchedulerConfig({ ...schedulerConfig, overload529CooldownSecs: value || 1 })
+                    }
+                  />
                 </div>
                 <div className="scheduler-grid scheduler-grid--toggles">
                   <CheckField
                     help={SCHEDULER_FIELD_HELP.excludeZeroQuota}
                     checked={schedulerConfig.excludeZeroQuota}
                     onChange={(checked) => setSchedulerConfig({ ...schedulerConfig, excludeZeroQuota: checked })}
+                  />
+                  <CheckField
+                    help={SCHEDULER_FIELD_HELP.rateLimit429CooldownEnabled}
+                    checked={schedulerConfig.rateLimit429CooldownEnabled}
+                    onChange={(checked) =>
+                      setSchedulerConfig({ ...schedulerConfig, rateLimit429CooldownEnabled: checked })
+                    }
+                  />
+                  <CheckField
+                    help={SCHEDULER_FIELD_HELP.failoverOn400}
+                    checked={schedulerConfig.failoverOn400}
+                    onChange={(checked) =>
+                      setSchedulerConfig({ ...schedulerConfig, failoverOn400: checked })
+                    }
                   />
                 </div>
               </div>
@@ -2843,10 +3088,22 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
                         <NumberField
                           help={SCHEDULER_FIELD_HELP.stickyWaitTimeoutSecs}
                           min={0}
-                          max={120}
+                          max={300}
                           value={schedulerConfig.stickyWaitTimeoutSecs}
                           onChange={(value) =>
                             setSchedulerConfig({ ...schedulerConfig, stickyWaitTimeoutSecs: value || 0 })
+                          }
+                        />
+                        <NumberField
+                          help={SCHEDULER_FIELD_HELP.stickyWaitMaxWaiting}
+                          min={1}
+                          max={64}
+                          value={schedulerConfig.stickyWaitMaxWaiting}
+                          onChange={(value) =>
+                            setSchedulerConfig({
+                              ...schedulerConfig,
+                              stickyWaitMaxWaiting: value || 1,
+                            })
                           }
                         />
                       </div>
@@ -2858,6 +3115,68 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
                             setSchedulerConfig({ ...schedulerConfig, stickyWaitEnabled: checked })
                           }
                         />
+                        <CheckField
+                          help={SCHEDULER_FIELD_HELP.stickyWeightedEnabled}
+                          checked={schedulerConfig.stickyWeightedEnabled}
+                          onChange={(checked) =>
+                            setSchedulerConfig({ ...schedulerConfig, stickyWeightedEnabled: checked })
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <div className="settings-group">
+                      <h3 className="settings-group__title">兜底排队</h3>
+                      <div className="scheduler-grid scheduler-grid--toggles">
+                        <CheckField
+                          help={SCHEDULER_FIELD_HELP.fallbackWaitEnabled}
+                          checked={schedulerConfig.fallbackWaitEnabled}
+                          onChange={(checked) =>
+                            setSchedulerConfig({ ...schedulerConfig, fallbackWaitEnabled: checked })
+                          }
+                        />
+                      </div>
+                      <div className="scheduler-grid">
+                        <NumberField
+                          help={SCHEDULER_FIELD_HELP.fallbackWaitTimeoutSecs}
+                          min={0}
+                          max={300}
+                          value={schedulerConfig.fallbackWaitTimeoutSecs}
+                          onChange={(value) =>
+                            setSchedulerConfig({
+                              ...schedulerConfig,
+                              fallbackWaitTimeoutSecs: value || 0,
+                            })
+                          }
+                        />
+                        <NumberField
+                          help={SCHEDULER_FIELD_HELP.fallbackMaxWaiting}
+                          min={1}
+                          max={1000}
+                          value={schedulerConfig.fallbackMaxWaiting}
+                          onChange={(value) =>
+                            setSchedulerConfig({
+                              ...schedulerConfig,
+                              fallbackMaxWaiting: value || 1,
+                            })
+                          }
+                        />
+                        <label className="field">
+                          <FieldLabel help={SCHEDULER_FIELD_HELP.fallbackSelectionMode} />
+                          <select
+                            value={schedulerConfig.fallbackSelectionMode}
+                            onChange={(event) =>
+                              setSchedulerConfig({
+                                ...schedulerConfig,
+                                fallbackSelectionMode:
+                                  event.target.value === "random" ? "random" : "last_used",
+                              })
+                            }
+                          >
+                            <option value="last_used">last_used（最久未用）</option>
+                            <option value="random">random（随机）</option>
+                          </select>
+                        </label>
                       </div>
                     </div>
 
@@ -3011,6 +3330,51 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
                             setSchedulerConfig({
                               ...schedulerConfig,
                               scoreWeights: { ...schedulerConfig.scoreWeights, quotaHeadroom: value || 0 },
+                            })
+                          }
+                        />
+                        <NumberField
+                          help={SCHEDULER_FIELD_HELP.wUpstreamCost}
+                          min={0}
+                          step={0.1}
+                          value={schedulerConfig.scoreWeights.upstreamCost}
+                          onChange={(value) =>
+                            setSchedulerConfig({
+                              ...schedulerConfig,
+                              scoreWeights: {
+                                ...schedulerConfig.scoreWeights,
+                                upstreamCost: value || 0,
+                              },
+                            })
+                          }
+                        />
+                        <NumberField
+                          help={SCHEDULER_FIELD_HELP.wPreviousResponse}
+                          min={0}
+                          step={0.1}
+                          value={schedulerConfig.scoreWeights.previousResponse}
+                          onChange={(value) =>
+                            setSchedulerConfig({
+                              ...schedulerConfig,
+                              scoreWeights: {
+                                ...schedulerConfig.scoreWeights,
+                                previousResponse: value || 0,
+                              },
+                            })
+                          }
+                        />
+                        <NumberField
+                          help={SCHEDULER_FIELD_HELP.wSessionSticky}
+                          min={0}
+                          step={0.1}
+                          value={schedulerConfig.scoreWeights.sessionSticky}
+                          onChange={(value) =>
+                            setSchedulerConfig({
+                              ...schedulerConfig,
+                              scoreWeights: {
+                                ...schedulerConfig.scoreWeights,
+                                sessionSticky: value || 0,
+                              },
                             })
                           }
                         />

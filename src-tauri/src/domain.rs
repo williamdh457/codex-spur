@@ -176,12 +176,18 @@ pub struct PoolMemberDetail {
     pub priority: i64,
     pub enabled: bool,
     pub concurrency_limit: i64,
+    #[serde(default = "default_upstream_cost_rate")]
+    pub upstream_cost_rate: f64,
     pub label: Option<String>,
     pub masked_email: Option<String>,
     pub healthy: bool,
     pub schedule_state: String,
     pub cooldown_until: Option<i64>,
     pub last_error: Option<String>,
+}
+
+fn default_upstream_cost_rate() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

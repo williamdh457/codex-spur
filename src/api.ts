@@ -308,6 +308,11 @@ export async function renameProviderInstance(providerId: string, name: string): 
   return invoke<ProviderSummary>("rename_provider_instance", { providerId, name });
 }
 
+/** Display-only account rename (pool / fixed routing labels). Empty label clears to email/id fallback. */
+export async function renameCredential(credentialId: string, label: string): Promise<CredentialSummary> {
+  return invoke<CredentialSummary>("rename_credential", { credentialId, label });
+}
+
 export async function setActivePool(providerId: string, poolId: string): Promise<void> {
   return invoke<void>("set_active_pool", { providerId, poolId });
 }
@@ -373,6 +378,7 @@ export async function updatePoolMember(
   priority: number,
   enabled: boolean,
   concurrencyLimit: number,
+  upstreamCostRate?: number,
 ): Promise<void> {
   return invoke<void>("update_pool_member", {
     poolId,
@@ -381,6 +387,7 @@ export async function updatePoolMember(
     priority,
     enabled,
     concurrencyLimit,
+    upstreamCostRate: upstreamCostRate ?? 1,
   });
 }
 

@@ -97,6 +97,7 @@ impl Storage {
         storage.normalize_provider_kinds().await?;
         storage.normalize_credential_kinds().await?;
         storage.normalize_entry_categories().await?;
+        let _ = storage.repair_agent_identity_refreshable_flags().await;
         storage.cleanup_empty_seed_providers().await?;
         Ok(storage)
     }
@@ -645,7 +646,11 @@ impl Storage {
         .bind(&credential.account_id)
         .bind(credential.expires_at)
         .bind(&credential.fingerprint)
-        .bind((credential.refreshable && credential.secret.has_refresh_token()) as i64)
+        .bind(
+            (credential.kind == crate::credentials::CredentialKind::AgentIdentity
+                || (credential.refreshable && credential.secret.has_refresh_token()))
+                as i64,
+        )
         .bind(envelope_json)
         .execute(&self.pool)
         .await?;
@@ -724,7 +729,7 @@ impl Storage {
         let rows = request.fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
-            .map(|row| Self::map_credential_summary(row))
+            .map(Self::map_credential_summary)
             .collect())
     }
 
@@ -745,7 +750,7 @@ impl Storage {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|row| Self::map_credential_summary(row))
+            .map(Self::map_credential_summary)
             .collect())
     }
 
@@ -860,6 +865,119 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Find a credential in this provider instance by ChatGPT account_id or email.
+    /// Prefers exact account_id match, then case-insensitive email.
+    pub async fn find_credential_for_merge(
+        &self,
+        provider_id: &str,
+        account_id: Option<&str>,
+        email: Option<&str>,
+    ) -> Result<Option<StoredCredential>, sqlx::Error> {
+        if let Some(account_id) = account_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let row = sqlx::query(
+                "SELECT id FROM credentials WHERE provider_id = ? AND account_id = ?
+                 ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            )
+            .bind(provider_id)
+            .bind(account_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(row) = row {
+                return self.get_credential(row.get::<String, _>("id").as_str()).await;
+            }
+        }
+        if let Some(email) = email.map(str::trim).filter(|s| !s.is_empty()) {
+            let row = sqlx::query(
+                "SELECT id FROM credentials WHERE provider_id = ? AND lower(email) = lower(?)
+                 ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            )
+            .bind(provider_id)
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(row) = row {
+                return self.get_credential(row.get::<String, _>("id").as_str()).await;
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn set_credential_refreshable(
+        &self,
+        id: &str,
+        refreshable: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE credentials SET refreshable = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(refreshable as i64)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Set label only when currently NULL/empty (import must not overwrite user renames).
+    pub async fn fill_credential_label_if_empty(
+        &self,
+        id: &str,
+        label: &str,
+    ) -> Result<(), sqlx::Error> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE credentials SET label = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND (label IS NULL OR trim(label) = '')",
+        )
+        .bind(label)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Rename account display label. Empty string clears to NULL (fallback to email/id).
+    pub async fn rename_credential(
+        &self,
+        id: &str,
+        label: &str,
+    ) -> Result<(), sqlx::Error> {
+        let trimmed = label.trim();
+        let owned: Option<String> = if trimmed.is_empty() {
+            None
+        } else {
+            let mut out = String::new();
+            for ch in trimmed.chars().take(64) {
+                out.push(ch);
+            }
+            Some(out)
+        };
+        let result = sqlx::query(
+            "UPDATE credentials SET label = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(owned.as_deref())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::Protocol("账号不存在".into()));
+        }
+        Ok(())
+    }
+
+    /// One-shot repair: Agent Identity is durable without OAuth refresh_token.
+    pub async fn repair_agent_identity_refreshable_flags(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE credentials SET refreshable = 1, updated_at = CURRENT_TIMESTAMP
+             WHERE kind IN ('agent_identity', 'agentIdentity') AND refreshable = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn ensure_default_pool(&self, provider_id: &str) -> Result<String, sqlx::Error> {
@@ -996,6 +1114,7 @@ impl Storage {
     ) -> Result<Vec<PoolMemberDetail>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT pm.pool_id, pm.credential_id, pm.weight, pm.priority, pm.enabled, pm.concurrency_limit,
+                    COALESCE(pm.upstream_cost_rate, 1.0) AS upstream_cost_rate,
                     c.label, c.email, c.healthy, c.schedule_state, c.cooldown_until, c.last_error
              FROM pool_members pm
              JOIN credentials c ON c.id = pm.credential_id
@@ -1017,6 +1136,14 @@ impl Storage {
                     .try_get::<i64, _>("concurrency_limit")
                     .unwrap_or(1)
                     .max(1),
+                upstream_cost_rate: {
+                    let rate: f64 = row.try_get("upstream_cost_rate").unwrap_or(1.0);
+                    if rate.is_finite() && rate > 0.0 {
+                        rate
+                    } else {
+                        1.0
+                    }
+                },
                 label: row.get("label"),
                 masked_email: row
                     .get::<Option<String>, _>("email")
@@ -1032,6 +1159,7 @@ impl Storage {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_pool_member(
         &self,
         pool_id: &str,
@@ -1040,15 +1168,22 @@ impl Storage {
         priority: i64,
         enabled: bool,
         concurrency_limit: i64,
+        upstream_cost_rate: Option<f64>,
     ) -> Result<(), sqlx::Error> {
+        let rate = upstream_cost_rate
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+            .clamp(0.01, 100.0);
         sqlx::query(
-            "UPDATE pool_members SET weight = ?, priority = ?, enabled = ?, concurrency_limit = ?
+            "UPDATE pool_members SET weight = ?, priority = ?, enabled = ?, concurrency_limit = ?,
+                upstream_cost_rate = ?
              WHERE pool_id = ? AND credential_id = ?",
         )
         .bind(weight.max(1))
         .bind(priority)
         .bind(enabled as i64)
         .bind(concurrency_limit.max(1))
+        .bind(rate)
         .bind(pool_id)
         .bind(credential_id)
         .execute(&self.pool)
@@ -1141,7 +1276,9 @@ impl Storage {
     ) -> Result<Vec<CandidateAccount>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT pm.credential_id, pm.weight, pm.priority, pm.enabled, pm.concurrency_limit,
+                    COALESCE(pm.upstream_cost_rate, 1.0) AS upstream_cost_rate,
                     c.healthy, c.schedule_state, c.cooldown_until, c.error_rate_ewma, c.ttft_ewma_ms,
+                    c.last_used_at,
                     (SELECT COUNT(*) FROM account_leases l
                       WHERE l.credential_id = pm.credential_id
                         AND l.released_at IS NULL
@@ -1177,6 +1314,15 @@ impl Storage {
                 quota_remaining: None,
                 session_reset_at: None,
                 quota_fetched_at: None,
+                upstream_cost_rate: {
+                    let rate: f64 = row.try_get("upstream_cost_rate").unwrap_or(1.0);
+                    if rate.is_finite() && rate > 0.0 {
+                        rate
+                    } else {
+                        1.0
+                    }
+                },
+                last_used_at: row.try_get("last_used_at").unwrap_or(None),
             })
             .collect())
     }
@@ -1304,6 +1450,8 @@ impl Storage {
                             quota_remaining: None,
                             session_reset_at: None,
                             quota_fetched_at: None,
+                            upstream_cost_rate: 1.0,
+                            last_used_at: None,
                         });
                     }
                 }
@@ -1347,24 +1495,42 @@ impl Storage {
             SelectionLayer::PreviousResponse | SelectionLayer::Session
         ) && config.sticky_wait_enabled
             && config.sticky_wait_timeout_secs > 0
+            && !config.sticky_weighted_enabled
         {
             if let Some(candidate) = candidates
                 .iter()
                 .find(|c| c.credential_id == outcome.credential_id)
             {
                 if sticky_concurrency_full(candidate) {
-                    let waited = self
-                        .wait_for_credential_slot(
-                            &outcome.credential_id,
+                    let can_wait = self
+                        .try_begin_waiter(
+                            &pool_id,
+                            Some(&outcome.credential_id),
+                            "sticky",
+                            config.sticky_wait_max_waiting,
                             config.sticky_wait_timeout_secs,
                         )
                         .await?;
+                    let waited = if can_wait {
+                        let result = self
+                            .wait_for_credential_slot(
+                                &outcome.credential_id,
+                                config.sticky_wait_timeout_secs,
+                            )
+                            .await;
+                        let _ = self
+                            .end_waiter(&pool_id, Some(&outcome.credential_id), "sticky")
+                            .await;
+                        result?
+                    } else {
+                        false
+                    };
                     // Refresh lease counts after wait.
                     candidates = self.load_pool_candidates(&pool_id).await?;
                     self.hydrate_quota_fields(&mut candidates).await?;
                     request.now_unix = Self::now_unix();
                     if !waited {
-                        // Timed out: exclude sticky account from load-balance reselect.
+                        // Timed out or queue full: exclude sticky account from load-balance reselect.
                         if !request
                             .exclude_credential_ids
                             .iter()
@@ -1412,6 +1578,50 @@ impl Storage {
                                 return Ok(None);
                             };
                             outcome = next;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback wait: all healthy accounts concurrency-full — wait for any free slot.
+        if outcome.layer == SelectionLayer::LoadBalance
+            && config.fallback_wait_enabled
+            && config.fallback_wait_timeout_secs > 0
+        {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|c| c.credential_id == outcome.credential_id)
+            {
+                if sticky_concurrency_full(candidate) {
+                    let can_wait = self
+                        .try_begin_waiter(
+                            &pool_id,
+                            None,
+                            "fallback",
+                            config.fallback_max_waiting,
+                            config.fallback_wait_timeout_secs,
+                        )
+                        .await?;
+                    if can_wait {
+                        let waited = self
+                            .wait_for_any_pool_slot(&pool_id, config.fallback_wait_timeout_secs)
+                            .await;
+                        let _ = self.end_waiter(&pool_id, None, "fallback").await;
+                        candidates = self.load_pool_candidates(&pool_id).await?;
+                        self.hydrate_quota_fields(&mut candidates).await?;
+                        request.now_unix = Self::now_unix();
+                        if waited? {
+                            let reseed = uuid::Uuid::new_v4();
+                            let reseed_u64 = u64::from_le_bytes(
+                                reseed.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+                            );
+                            // Prefer free slots on reselect.
+                            if let Some(next) =
+                                select_account(&candidates, &config, &request, reseed_u64)
+                            {
+                                outcome = next;
+                            }
                         }
                     }
                 }
@@ -1471,6 +1681,137 @@ impl Storage {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Wait until any member of the pool has a free concurrency slot.
+    async fn wait_for_any_pool_slot(
+        &self,
+        pool_id: &str,
+        timeout_secs: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(0) as u64);
+        loop {
+            sqlx::query(
+                "UPDATE account_leases SET released_at = CURRENT_TIMESTAMP
+                 WHERE released_at IS NULL AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP",
+            )
+            .execute(&self.pool)
+            .await?;
+            let free: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pool_members pm
+                 WHERE pm.pool_id = ? AND pm.enabled = 1
+                   AND (
+                     SELECT COUNT(*) FROM account_leases l
+                     WHERE l.credential_id = pm.credential_id
+                       AND l.released_at IS NULL
+                       AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)
+                   ) < pm.concurrency_limit",
+            )
+            .bind(pool_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+            if free > 0 {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Register a waiter if under max; returns false when queue is full.
+    async fn try_begin_waiter(
+        &self,
+        pool_id: &str,
+        credential_id: Option<&str>,
+        kind: &str,
+        max_waiting: u32,
+        timeout_secs: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let now = Self::now_unix();
+        // Drop expired waiters.
+        sqlx::query("DELETE FROM schedule_waiters WHERE expires_at <= ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        let count: i64 = if let Some(cred) = credential_id {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM schedule_waiters
+                 WHERE pool_id = ? AND kind = ? AND credential_id = ? AND expires_at > ?",
+            )
+            .bind(pool_id)
+            .bind(kind)
+            .bind(cred)
+            .bind(now)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM schedule_waiters
+                 WHERE pool_id = ? AND kind = ? AND credential_id IS NULL AND expires_at > ?",
+            )
+            .bind(pool_id)
+            .bind(kind)
+            .bind(now)
+            .fetch_one(&self.pool)
+            .await?
+        };
+        if count >= max_waiting.max(1) as i64 {
+            return Ok(false);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let expires = now + timeout_secs.max(1);
+        sqlx::query(
+            "INSERT INTO schedule_waiters (id, pool_id, credential_id, kind, expires_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(pool_id)
+        .bind(credential_id)
+        .bind(kind)
+        .bind(expires)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    async fn end_waiter(
+        &self,
+        pool_id: &str,
+        credential_id: Option<&str>,
+        kind: &str,
+    ) -> Result<(), sqlx::Error> {
+        // Delete one matching waiter (best-effort; concurrent ends are fine).
+        if let Some(cred) = credential_id {
+            sqlx::query(
+                "DELETE FROM schedule_waiters WHERE id = (
+                   SELECT id FROM schedule_waiters
+                   WHERE pool_id = ? AND kind = ? AND credential_id = ?
+                   ORDER BY created_at LIMIT 1
+                 )",
+            )
+            .bind(pool_id)
+            .bind(kind)
+            .bind(cred)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "DELETE FROM schedule_waiters WHERE id = (
+                   SELECT id FROM schedule_waiters
+                   WHERE pool_id = ? AND kind = ? AND credential_id IS NULL
+                   ORDER BY created_at LIMIT 1
+                 )",
+            )
+            .bind(pool_id)
+            .bind(kind)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
     }
 
     async fn acquire_direct_lease(
@@ -1604,6 +1945,15 @@ impl Storage {
         .execute(&self.pool)
         .await?;
 
+        // Touch last_used for fallback last_used selection.
+        let _ = sqlx::query(
+            "UPDATE credentials SET last_used_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(now_unix)
+        .bind(&outcome.credential_id)
+        .execute(&self.pool)
+        .await;
+
         Ok(Some(Lease {
             id: lease_id,
             credential_id: outcome.credential_id.clone(),
@@ -1694,7 +2044,36 @@ impl Storage {
             let config = self.get_pool_scheduler_config(&pool_id).await?;
             return Ok(config.max_failover_switches.max(1));
         }
-        Ok(3)
+        Ok(PoolSchedulerConfig::default().max_failover_switches.max(1))
+    }
+
+    pub async fn failover_on_400(&self, provider_id: &str) -> Result<bool, sqlx::Error> {
+        if let Some(pool_id) = self.active_pool_id(provider_id).await? {
+            let config = self.get_pool_scheduler_config(&pool_id).await?;
+            return Ok(config.failover_on_400);
+        }
+        Ok(false)
+    }
+
+    pub async fn rate_limit_429_cooldown_enabled(
+        &self,
+        provider_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        if let Some(pool_id) = self.active_pool_id(provider_id).await? {
+            let config = self.get_pool_scheduler_config(&pool_id).await?;
+            return Ok(config.rate_limit_429_cooldown_enabled);
+        }
+        Ok(true)
+    }
+
+    pub async fn overload_529_cooldown_secs(&self, provider_id: &str) -> Result<i64, sqlx::Error> {
+        if let Some(pool_id) = self.active_pool_id(provider_id).await? {
+            let config = self.get_pool_scheduler_config(&pool_id).await?;
+            return Ok(config.overload_529_cooldown_secs.max(1));
+        }
+        Ok(PoolSchedulerConfig::default()
+            .overload_529_cooldown_secs
+            .max(1))
     }
 
     pub async fn default_429_cooldown_secs(&self, provider_id: &str) -> Result<i64, sqlx::Error> {

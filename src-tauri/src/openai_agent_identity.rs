@@ -270,12 +270,45 @@ pub fn authorization_header_for_agent_task(key: &AgentIdentityKey, task_id: &str
     ))
 }
 
+/// Optional OAuth / session tokens kept alongside Agent Identity so official
+/// ChatGPT usage APIs (`/backend-api/wham/usage`) can still be queried.
+/// Proxy traffic uses AgentAssertion; quota needs a Bearer access_token.
+#[derive(Clone, Debug, Default)]
+pub struct PreservedUsageTokens {
+    pub refresh_token: Option<String>,
+    pub id_token: Option<String>,
+    pub session_token: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
 /// Build a durable Agent Identity credential from a live ChatGPT access token.
+///
+/// Always keeps `access_token` (and any provided refresh/id/session tokens) in
+/// the secret envelope: Agent Identity alone cannot call `wham/usage`.
+#[allow(dead_code)] // Convenience entry; call sites pass PreservedUsageTokens explicitly.
 pub async fn upgrade_access_token_to_agent_identity(
     access_token: &str,
     email: Option<String>,
     account_id: Option<String>,
     label: Option<String>,
+) -> Result<CanonicalCredential> {
+    upgrade_access_token_to_agent_identity_with_tokens(
+        access_token,
+        email,
+        account_id,
+        label,
+        PreservedUsageTokens::default(),
+    )
+    .await
+}
+
+/// Same as [`upgrade_access_token_to_agent_identity`] but retains companion tokens.
+pub async fn upgrade_access_token_to_agent_identity_with_tokens(
+    access_token: &str,
+    email: Option<String>,
+    account_id: Option<String>,
+    label: Option<String>,
+    preserved: PreservedUsageTokens,
 ) -> Result<CanonicalCredential> {
     let access_token = access_token.trim();
     if access_token.is_empty() {
@@ -303,6 +336,11 @@ pub async fn upgrade_access_token_to_agent_identity(
     if let Ok(tid) = register_agent_task(&key).await {
         task_id = Some(tid);
     }
+    let non_empty = |value: Option<String>| {
+        value
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     let mut cred = CanonicalCredential {
         kind: CredentialKind::AgentIdentity,
         state: CredentialState::Refreshable,
@@ -310,10 +348,15 @@ pub async fn upgrade_access_token_to_agent_identity(
         label,
         email,
         account_id: Some(account_id),
-        expires_at: None,
+        expires_at: preserved.expires_at.or_else(|| jwt_exp_unix(access_token)),
         fingerprint: String::new(),
         refreshable: true,
         secret: SecretMaterial {
+            // Keep Bearer token for quota / usage; AgentAssertion for Codex proxy.
+            access_token: Some(access_token.to_string()),
+            refresh_token: non_empty(preserved.refresh_token),
+            id_token: non_empty(preserved.id_token),
+            session_token: non_empty(preserved.session_token),
             agent_runtime_id: Some(runtime_id),
             agent_private_key: Some(keys.private_key_pkcs8_base64),
             task_id,
@@ -392,5 +435,14 @@ mod tests {
         };
         let sig = sign_task_registration(&key, "2026-01-01T00:00:00Z").expect("sig");
         assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn preserved_usage_tokens_struct_defaults_empty() {
+        let preserved = PreservedUsageTokens::default();
+        assert!(preserved.refresh_token.is_none());
+        assert!(preserved.id_token.is_none());
+        assert!(preserved.session_token.is_none());
+        assert!(preserved.expires_at.is_none());
     }
 }

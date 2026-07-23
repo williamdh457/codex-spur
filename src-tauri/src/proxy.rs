@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,7 +31,8 @@ use crate::{
     scheduler::{ScheduleState, SelectionLayer},
     storage::{Lease, Storage, UsageDelta},
     upstream_errors::{
-        body_is_usage_or_rate_limit, content_session_seed, is_failover_status, now_unix,
+        body_is_usage_or_rate_limit, content_session_seed, is_failover_status_with_options,
+        now_unix,
         resolve_rate_limit_cooldown, status_category,
     },
     vault::SecretVault,
@@ -347,7 +348,12 @@ async fn forward_responses_compatible(
         };
         let status = response.status();
         let headers = response.headers().clone();
-        if is_failover_status(status) {
+        let failover_on_400 = state
+            .storage
+            .failover_on_400(&target.provider_id)
+            .await
+            .unwrap_or(false);
+        if is_failover_status_with_options(status, failover_on_400) {
             let Some(auth) = auth else {
                 return passthrough(
                     response,
@@ -582,7 +588,12 @@ async fn forward_chat_compatible(
         };
         let status = upstream.status();
         let headers = upstream.headers().clone();
-        if is_failover_status(status) {
+        let failover_on_400 = state
+            .storage
+            .failover_on_400(&target.provider_id)
+            .await
+            .unwrap_or(false);
+        if is_failover_status_with_options(status, failover_on_400) {
             let Some(auth) = auth else {
                 // No account context — surface upstream response as-is.
                 if wants_stream {
@@ -1541,9 +1552,28 @@ async fn handle_upstream_failure(
             .await;
         return false;
     }
+    // 529 overloaded: dedicated cooldown (Sub2API-like).
+    if status.as_u16() == 529 {
+        if let Ok(secs) = state.storage.overload_529_cooldown_secs(provider_id).await {
+            let until = now_unix() + secs.max(1);
+            let _ = state
+                .storage
+                .apply_rate_limit_until(&auth.credential_id, until, "上游过载 (529)")
+                .await;
+            return true;
+        }
+    }
     let is_rate = status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || body.is_some_and(body_is_usage_or_rate_limit);
     if is_rate {
+        let cooldown_enabled = state
+            .storage
+            .rate_limit_429_cooldown_enabled(provider_id)
+            .await
+            .unwrap_or(true);
+        if !cooldown_enabled {
+            return false;
+        }
         let default_secs = state
             .storage
             .default_429_cooldown_secs(provider_id)
@@ -3335,7 +3365,12 @@ async fn forward_native_chat_completions(
             }
         };
         let status = upstream.status();
-        if is_failover_status(status) {
+        let failover_on_400 = state
+            .storage
+            .failover_on_400(&target.provider_id)
+            .await
+            .unwrap_or(false);
+        if is_failover_status_with_options(status, failover_on_400) {
             if let Some(auth) = auth {
                 let body_bytes = upstream.bytes().await.unwrap_or_default();
                 let headers = Default::default();
@@ -3492,6 +3527,11 @@ pub async fn start_with_secret(
             .user_agent("Codex-Spur/0.1")
             .build()?,
     };
+    // Axum's default body buffer is 2 MiB. Codex Desktop long threads (tool
+    // outputs, multi-turn history, images) routinely exceed that and surface as
+    // HTTP 413 "Failed to buffer the request body: length limit exceeded".
+    // Localhost-only proxy: allow large agent payloads while still capping RAM.
+    const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024; // 64 MiB
     let router = Router::new()
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
@@ -3500,6 +3540,7 @@ pub async fn start_with_secret(
         .route("/coding/healthz", get(kimi_coding_health))
         .route("/coding/v1/chat/completions", post(kimi_coding_chat_completions))
         .route("/coding/v1/v1/chat/completions", post(kimi_coding_chat_completions_v1))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .with_state(state);
     let address: SocketAddr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

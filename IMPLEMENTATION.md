@@ -42,14 +42,16 @@ flowchart LR
   1. Fixed 模式 → 固定账号；
   2. 否则 `previous_response_id` sticky（命中后把 session 也绑到同账号，利于 prompt cache）；
   3. 否则 session-hash sticky（`session_id` / `conversation_id` / `prompt_cache_key` / 内容种子 fallback）；
-  4. sticky 账号仅并发满时优先**等待槽位**（默认 30s），超时再 escape；
-  5. 否则负载感知 Top-K（默认 K=7）；候选 min-max 归一化打分后，按 `(score−min)+1 × member_weight` 抽签。
-- 打分因子：priority / load / queue / error_rate / ttft / reset / quota_headroom（默认 `quota_headroom=1`）。
+  4. sticky 账号仅并发满时优先**等待槽位**（默认 **120s**，与 Sub2API 一致；max waiting 默认 3），超时再 escape；
+  5. 否则负载感知 Top-K（默认 K=7）；候选 min-max 归一化打分后，按 `(score−min)+1 × member_weight` 抽签；
+  6. 全池并发满时 **fallback 等待**（默认 30s / max 100 / last_used|random）；
+  7. 可选 **sticky weighted**（默认关）：粘性变为 previous_response/session 打分加分，而非硬命中。
+- 打分因子：priority / load / queue / error_rate / ttft / reset / quota_headroom（默认 1）/ upstream_cost（默认 0）/ sticky 软权重。
 - **额度接入**：候选水合缓存的 5h/7d 快照；新鲜快照 remaining≈0 硬过滤；可选 auto-pause 阈值；`quota_remaining` 参与 headroom / prefer_soonest_reset；快照 &gt;8h 视为中性。
 - sticky 表与 lease 分离；请求结束释放 lease；sticky 仅在冷却/鉴权/额度尽/错误率·TTFT 劣化时 escape（健康账号不因「更闲」而换号）。
-- **换号 / 冷却**：401 → `auth_invalid`；402/403 → entitlement；429/usage_limit → 解析 `x-codex-*` / body `resets_at` / `Retry-After` 写入**绝对** cooldown（可至数小时），同请求 exclude 后重选；5xx/传输错误也可换号。最后一次 attempt 同样落库冷却。
-- **日常 UI**（供应商编辑）：Pool|Fixed、账号 weight/priority/concurrency/参与。
-- **高级 UI**（设置 → 调度）：Top-K、sticky TTL、score weights、escape、429、lease。
+- **换号 / 冷却**：默认最多 **10** 次；401 → `auth_invalid`；402/403 → entitlement；429/usage_limit → 可开关冷却；529 → 默认 600s 冷却；可选 `failover_on_400`；5xx/传输错误也可换号。
+- **日常 UI**（供应商编辑）：Pool|Fixed、账号 weight/priority/concurrency/**成本倍率**/参与。
+- **高级 UI**（设置 → 调度）：Top-K、sticky TTL/wait/max waiting、fallback、sticky weighted、score weights、escape、429/529、lease、400 换号。
 - **诊断**：`proxy_request_events` 记录 selection layer、指纹、结果、换号与冷却（脱敏）；诊断页 split 列表 + 详情。
 - “发送 Hi”会使用用户选择的可用模型测试账号；失败会落库并在 UI 显示失效。
 

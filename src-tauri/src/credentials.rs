@@ -359,6 +359,41 @@ fn parse_agent_identity_object(
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(ToOwned::to_owned);
+    // Optional usage tokens (Sub2API dual-form exports / re-imports).
+    let pick = |map: &serde_json::Map<String, Value>, snake: &str, camel: &str| {
+        map.get(snake)
+            .or_else(|| map.get(camel))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let access_token = pick(surface, "access_token", "accessToken")
+        .or_else(|| pick(object, "access_token", "accessToken"))
+        .or_else(|| {
+            object
+                .get("tokens")
+                .and_then(Value::as_object)
+                .and_then(|t| pick(t, "access_token", "accessToken"))
+        });
+    let refresh_token = pick(surface, "refresh_token", "refreshToken")
+        .or_else(|| pick(object, "refresh_token", "refreshToken"))
+        .or_else(|| {
+            object
+                .get("tokens")
+                .and_then(Value::as_object)
+                .and_then(|t| pick(t, "refresh_token", "refreshToken"))
+        });
+    let id_token = pick(surface, "id_token", "idToken")
+        .or_else(|| pick(object, "id_token", "idToken"))
+        .or_else(|| {
+            object
+                .get("tokens")
+                .and_then(Value::as_object)
+                .and_then(|t| pick(t, "id_token", "idToken"))
+        });
+    let session_token = pick(surface, "session_token", "sessionToken")
+        .or_else(|| pick(object, "session_token", "sessionToken"));
     Some(Ok(CanonicalCredential {
         kind: CredentialKind::AgentIdentity,
         state: CredentialState::Refreshable,
@@ -370,6 +405,10 @@ fn parse_agent_identity_object(
         fingerprint: String::new(),
         refreshable: true,
         secret: SecretMaterial {
+            access_token,
+            refresh_token,
+            id_token,
+            session_token,
             agent_runtime_id: Some(runtime),
             agent_private_key: Some(private_key),
             task_id,
@@ -919,5 +958,31 @@ mod tests {
         assert_eq!(parsed[0].email.as_deref(), Some("a@example.com"));
         assert_eq!(parsed[0].account_id.as_deref(), Some("acct-1"));
         assert_eq!(parsed[0].label.as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn parses_agent_identity_with_usage_tokens() {
+        let material = crate::openai_agent_identity::generate_agent_key_material().expect("key");
+        let input = format!(
+            r#"{{
+                "auth_mode": "agentIdentity",
+                "email": "user@example.com",
+                "account_id": "acct-agent-1",
+                "label": "Primary",
+                "agent_runtime_id": "runtime-xyz",
+                "agent_private_key": "{}",
+                "access_token": "usage-access",
+                "refresh_token": "usage-refresh"
+            }}"#,
+            material.private_key_pkcs8_base64
+        );
+        let parsed = parse_json_import(&input).expect("agent + tokens");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, CredentialKind::AgentIdentity);
+        assert_eq!(parsed[0].account_id.as_deref(), Some("acct-agent-1"));
+        assert_eq!(parsed[0].secret.access_token.as_deref(), Some("usage-access"));
+        assert_eq!(parsed[0].secret.refresh_token.as_deref(), Some("usage-refresh"));
+        assert_eq!(parsed[0].secret.agent_runtime_id.as_deref(), Some("runtime-xyz"));
+        assert!(parsed[0].secret.is_agent_identity());
     }
 }

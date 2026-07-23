@@ -215,6 +215,27 @@ impl AppState {
     }
 }
 
+/// Encrypt and persist a full secret envelope (tokens + agent identity fields).
+async fn persist_credential_secret(
+    state: &AppState,
+    credential_id: &str,
+    secret: &SecretMaterial,
+    expires_at: Option<i64>,
+    account_id: Option<&str>,
+) -> Result<(), String> {
+    let json = providers::secret_material_json(secret).map_err(|error| error.to_string())?;
+    let envelope = state
+        .vault
+        .encrypt(credential_id, 1, json.as_slice())
+        .map_err(|error| error.to_string())?;
+    let envelope_json = serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
+    state
+        .storage
+        .update_credential_secret(credential_id, &envelope_json, expires_at, account_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn quota_access(state: &AppState, credential_id: &str) -> Result<(String, String), String> {
     let credential = state
         .storage
@@ -292,28 +313,15 @@ async fn quota_access(state: &AppState, credential_id: &str) -> Result<(String, 
                             openai_oauth::chatgpt_account_id_from_token(&refreshed.access_token)
                         });
                     }
-                    if let Ok(json) = serde_json::to_vec(&serde_json::json!({
-                        "access_token": secret.access_token,
-                        "refresh_token": secret.refresh_token,
-                        "id_token": secret.id_token,
-                        "session_token": secret.session_token,
-                    })) {
-                        if let Ok(envelope) =
-                            state.vault.encrypt(&credential.id, 1, json.as_slice())
-                        {
-                            if let Ok(envelope_json) = serde_json::to_string(&envelope) {
-                                let _ = state
-                                    .storage
-                                    .update_credential_secret(
-                                        &credential.id,
-                                        &envelope_json,
-                                        refreshed.expires_at,
-                                        account_id.as_deref(),
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
+                    // Full secret writeback — never drop agent_* fields.
+                    let _ = persist_credential_secret(
+                        state,
+                        &credential.id,
+                        &secret,
+                        refreshed.expires_at,
+                        account_id.as_deref(),
+                    )
+                    .await;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -331,7 +339,13 @@ async fn quota_access(state: &AppState, credential_id: &str) -> Result<(String, 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "账号没有 access_token，无法查询官方订阅额度".to_string())?;
+        .ok_or_else(|| {
+            if secret.is_agent_identity() {
+                "此账号为 Agent Identity，本地未保留 access_token，无法查官方 5h/7d。请重新导入带 accessToken 的 session / 账号 JSON（将自动合并到本账号）。代理调用不受影响。".to_string()
+            } else {
+                "账号没有 access_token，无法查询官方订阅额度".to_string()
+            }
+        })?;
     // JWT first, then network recover (accounts/check / whoami) — Sub2API-style
     // so partial JSON imports can still pull 5h/7d usage without re-login.
     let account_id = openai_oauth::ensure_chatgpt_account_id(
@@ -348,26 +362,14 @@ async fn quota_access(state: &AppState, credential_id: &str) -> Result<(String, 
 
     // Persist recovered account_id so later refreshes and pool routing see it.
     if credential.account_id.as_deref() != Some(account_id.as_str()) {
-        if let Ok(json) = serde_json::to_vec(&serde_json::json!({
-            "access_token": secret.access_token,
-            "refresh_token": secret.refresh_token,
-            "id_token": secret.id_token,
-            "session_token": secret.session_token,
-        })) {
-            if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
-                if let Ok(envelope_json) = serde_json::to_string(&envelope) {
-                    let _ = state
-                        .storage
-                        .update_credential_secret(
-                            &credential.id,
-                            &envelope_json,
-                            None,
-                            Some(account_id.as_str()),
-                        )
-                        .await;
-                }
-            }
-        }
+        let _ = persist_credential_secret(
+            state,
+            &credential.id,
+            &secret,
+            None,
+            Some(account_id.as_str()),
+        )
+        .await;
     }
     Ok((access_token, account_id))
 }
@@ -1015,17 +1017,7 @@ async fn discover_provider_models(
     // Stamp entry channel before/alongside discovery so Overview badges stay accurate.
     // Do not overwrite an explicit JSON import (file) with "official" when re-fetching
     // via empty base_url (same path as official model discovery).
-    if official_openai {
-        let existing = provider.entry_category.as_deref();
-        let is_json_import =
-            existing == Some("json") || existing == Some("pool") || existing == Some("config");
-        if !is_json_import {
-            let _ = state
-                .storage
-                .set_provider_entry_category(&provider_id, "official")
-                .await;
-        }
-    } else if official_xai {
+    if official_openai || official_xai {
         let existing = provider.entry_category.as_deref();
         let is_json_import =
             existing == Some("json") || existing == Some("pool") || existing == Some("config");
@@ -1968,6 +1960,27 @@ async fn rename_provider_instance(
 }
 
 #[tauri::command]
+async fn rename_credential(
+    state: State<'_, AppState>,
+    credential_id: String,
+    label: String,
+) -> Result<CredentialSummary, String> {
+    state
+        .storage
+        .rename_credential(&credential_id, &label)
+        .await
+        .map_err(|error| error.to_string())?;
+    state
+        .storage
+        .list_credentials(None)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|item| item.id == credential_id)
+        .ok_or_else(|| "账号不存在".to_string())
+}
+
+#[tauri::command]
 async fn set_active_pool(
     state: State<'_, AppState>,
     provider_id: String,
@@ -2052,6 +2065,7 @@ async fn insert_canonical_credential(
 }
 
 /// Upgrade ChatGPT access/session credentials to durable Agent Identity when possible.
+/// Preserves access/refresh/id/session tokens so official 5h/7d quota can still be queried.
 async fn maybe_upgrade_to_agent_identity(
     credential: credentials::CanonicalCredential,
 ) -> Result<credentials::CanonicalCredential, String> {
@@ -2077,11 +2091,18 @@ async fn maybe_upgrade_to_agent_identity(
     else {
         return Ok(credential);
     };
-    match openai_agent_identity::upgrade_access_token_to_agent_identity(
+    let preserved = openai_agent_identity::PreservedUsageTokens {
+        refresh_token: credential.secret.refresh_token.clone(),
+        id_token: credential.secret.id_token.clone(),
+        session_token: credential.secret.session_token.clone(),
+        expires_at: credential.expires_at,
+    };
+    match openai_agent_identity::upgrade_access_token_to_agent_identity_with_tokens(
         &access,
         credential.email.clone(),
         credential.account_id.clone(),
         credential.label.clone(),
+        preserved,
     )
     .await
     {
@@ -2097,6 +2118,105 @@ async fn maybe_upgrade_to_agent_identity(
     }
 }
 
+/// Merge usage tokens into an existing credential when account_id/email matches.
+/// Keeps agent_runtime_id / private_key when present so re-import repairs quota only.
+async fn try_merge_usage_tokens_into_existing(
+    state: &AppState,
+    provider_id: &str,
+    incoming: &credentials::CanonicalCredential,
+) -> Result<bool, String> {
+    let account_id = incoming
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let email = incoming
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if account_id.is_none() && email.is_none() {
+        return Ok(false);
+    }
+    let Some(existing) = state
+        .storage
+        .find_credential_for_merge(provider_id, account_id, email)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    let plaintext = state
+        .vault
+        .decrypt(&existing.id, &existing.secret_envelope)
+        .map_err(|error| error.to_string())?;
+    let mut secret = SecretMaterial::from_json_bytes(plaintext.as_slice())
+        .map_err(|error| format!("凭据数据损坏：{error}"))?;
+
+    let mut changed = false;
+    let take = |dst: &mut Option<String>, src: &Option<String>| {
+        if let Some(value) = src
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+        {
+            if dst.as_deref() != Some(value.as_str()) {
+                *dst = Some(value);
+                return true;
+            }
+        }
+        false
+    };
+    changed |= take(&mut secret.access_token, &incoming.secret.access_token);
+    changed |= take(&mut secret.refresh_token, &incoming.secret.refresh_token);
+    changed |= take(&mut secret.id_token, &incoming.secret.id_token);
+    changed |= take(&mut secret.session_token, &incoming.secret.session_token);
+    // Only fill agent fields if the existing row has none (do not rotate keys on re-import).
+    if !secret.is_agent_identity() {
+        changed |= take(&mut secret.agent_runtime_id, &incoming.secret.agent_runtime_id);
+        changed |= take(&mut secret.agent_private_key, &incoming.secret.agent_private_key);
+        changed |= take(&mut secret.task_id, &incoming.secret.task_id);
+    }
+
+    if !changed && existing.account_id.as_deref() == account_id {
+        // Still count as handled so we do not insert a duplicate fingerprint-less row.
+        return Ok(true);
+    }
+
+    let next_account = account_id
+        .map(ToOwned::to_owned)
+        .or(existing.account_id.clone());
+    persist_credential_secret(
+        state,
+        &existing.id,
+        &secret,
+        incoming.expires_at.or(existing.expires_at),
+        next_account.as_deref(),
+    )
+    .await?;
+    if let Some(label) = incoming
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Only fill empty labels from import; never overwrite a user rename.
+        let _ = state
+            .storage
+            .fill_credential_label_if_empty(&existing.id, label)
+            .await;
+    }
+    // Mark agent_identity rows refreshable so UI no longer shows「仅访问」.
+    if secret.is_agent_identity() {
+        let _ = state
+            .storage
+            .set_credential_refreshable(&existing.id, true)
+            .await;
+    }
+    Ok(true)
+}
+
 #[tauri::command]
 async fn import_credentials_json(
     state: State<'_, AppState>,
@@ -2104,14 +2224,20 @@ async fn import_credentials_json(
     input: String,
 ) -> Result<Vec<CredentialSummary>, String> {
     let credentials = credentials::parse_json_import(&input).map_err(|error| error.to_string())?;
-    let mut any_inserted = false;
+    let mut any_changed = false;
     for credential in credentials {
+        // Merge usage tokens into an existing same-account row first so re-import
+        // repairs quota without registering a second Agent Identity.
+        if try_merge_usage_tokens_into_existing(&state, &provider_id, &credential).await? {
+            any_changed = true;
+            continue;
+        }
         let credential = maybe_upgrade_to_agent_identity(credential).await?;
         if insert_canonical_credential(&state, &provider_id, credential).await? {
-            any_inserted = true;
+            any_changed = true;
         }
     }
-    if any_inserted {
+    if any_changed {
         // Account credentials file import → JSON badge (not browser 官方订阅).
         state
             .storage
@@ -2144,16 +2270,37 @@ async fn import_session_json(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "session 缺少 accessToken".to_string())?;
-    let upgraded = openai_agent_identity::upgrade_access_token_to_agent_identity(
+    // Repair existing agent_identity / oauth rows by account_id without re-registering.
+    if try_merge_usage_tokens_into_existing(&state, &provider_id, &session).await? {
+        state
+            .storage
+            .set_provider_entry_category(&provider_id, "json")
+            .await
+            .map_err(|error| error.to_string())?;
+        let official_base = "https://chatgpt.com/backend-api/codex";
+        let _ = state
+            .storage
+            .set_provider_base_url(&provider_id, Some(official_base))
+            .await;
+        return list_credentials(state, Some(provider_id)).await;
+    }
+    let preserved = openai_agent_identity::PreservedUsageTokens {
+        refresh_token: session.secret.refresh_token.clone(),
+        id_token: session.secret.id_token.clone(),
+        session_token: session.secret.session_token.clone(),
+        expires_at: session.expires_at,
+    };
+    let upgraded = openai_agent_identity::upgrade_access_token_to_agent_identity_with_tokens(
         access,
         session.email.clone(),
         session.account_id.clone(),
         session.label.clone(),
+        preserved,
     )
     .await
     .map_err(|error| format!("Agent Identity 注册失败：{error}"))?;
-    let inserted = insert_canonical_credential(&state, &provider_id, upgraded).await?;
-    if inserted {
+    let changed = insert_canonical_credential(&state, &provider_id, upgraded).await?;
+    if changed {
         state
             .storage
             .set_provider_entry_category(&provider_id, "json")
@@ -2378,6 +2525,7 @@ async fn list_pool_members_detailed(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn update_pool_member(
     state: State<'_, AppState>,
     pool_id: String,
@@ -2386,6 +2534,7 @@ async fn update_pool_member(
     priority: i64,
     enabled: bool,
     concurrency_limit: i64,
+    upstream_cost_rate: Option<f64>,
 ) -> Result<(), String> {
     state
         .storage
@@ -2396,6 +2545,7 @@ async fn update_pool_member(
             priority,
             enabled,
             concurrency_limit,
+            upstream_cost_rate,
         )
         .await
         .map_err(|error| error.to_string())
@@ -2675,6 +2825,7 @@ pub fn run() {
             create_provider_instance,
             delete_provider_instance,
             rename_provider_instance,
+            rename_credential,
             start_openai_device_login,
             poll_openai_device_login,
             cancel_openai_device_login,

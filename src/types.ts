@@ -117,6 +117,7 @@ export type PoolMemberDetail = {
   priority: number;
   enabled: boolean;
   concurrencyLimit: number;
+  upstreamCostRate: number;
   label: string | null;
   maskedEmail: string | null;
   healthy: boolean;
@@ -133,6 +134,9 @@ export type ScoreWeights = {
   ttft: number;
   reset: number;
   quotaHeadroom: number;
+  upstreamCost: number;
+  previousResponse: number;
+  sessionSticky: number;
 };
 
 export type StickyEscapeConfig = {
@@ -140,6 +144,8 @@ export type StickyEscapeConfig = {
   ttftMs: number;
   errorRate: number;
 };
+
+export type FallbackSelectionMode = "last_used" | "random";
 
 export type PoolSchedulerConfig = {
   lbTopK: number;
@@ -160,6 +166,20 @@ export type PoolSchedulerConfig = {
   /** Wait for sticky account concurrency instead of switching. */
   stickyWaitEnabled: boolean;
   stickyWaitTimeoutSecs: number;
+  /** Max concurrent waiters for one sticky account (Sub2API=3). */
+  stickyWaitMaxWaiting: number;
+  /** When all accounts are full, wait for any free slot. */
+  fallbackWaitEnabled: boolean;
+  fallbackWaitTimeoutSecs: number;
+  fallbackMaxWaiting: number;
+  fallbackSelectionMode: FallbackSelectionMode;
+  /** Soft sticky via score bonuses instead of hard affinity. */
+  stickyWeightedEnabled: boolean;
+  rateLimit429CooldownEnabled: boolean;
+  /** Cooldown after 529 overloaded (seconds; Sub2API default 10 min). */
+  overload529CooldownSecs: number;
+  /** Allow failover on selected 400 errors. */
+  failoverOn400: boolean;
 };
 
 export type ProxyRequestEvent = {

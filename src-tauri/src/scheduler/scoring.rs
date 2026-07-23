@@ -37,6 +37,7 @@ pub fn score_among_peers(
     let ttft_factor = ttft_factor(candidate, peers);
     let reset_factor = reset_factor(candidate, peers, &weights, now_unix);
     let quota_factor = quota_headroom_factor(candidate, &weights, now_unix);
+    let upstream_cost_factor = upstream_cost_factor(candidate, peers, &weights);
 
     weights.priority * priority_factor
         + weights.load * load_factor
@@ -45,6 +46,7 @@ pub fn score_among_peers(
         + weights.ttft * ttft_factor
         + weights.reset * reset_factor
         + weights.quota_headroom * quota_factor
+        + weights.upstream_cost * upstream_cost_factor
 }
 
 fn effective_weights(config: &PoolSchedulerConfig) -> ScoreWeights {
@@ -146,6 +148,63 @@ pub fn quota_headroom_factor(
     }
 }
 
+/// Lower upstream cost rate → higher factor (min-max among peers).
+fn upstream_cost_factor(
+    candidate: &CandidateAccount,
+    peers: &[CandidateAccount],
+    weights: &ScoreWeights,
+) -> f64 {
+    if weights.upstream_cost <= 0.0 {
+        return 0.0;
+    }
+    let rates: Vec<f64> = peers
+        .iter()
+        .map(|p| {
+            let rate = p.upstream_cost_rate;
+            if rate.is_finite() && rate > 0.0 {
+                rate
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    if rates.is_empty() {
+        return 0.5;
+    }
+    let min_r = rates.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_r = rates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let rate = if candidate.upstream_cost_rate.is_finite() && candidate.upstream_cost_rate > 0.0 {
+        candidate.upstream_cost_rate
+    } else {
+        1.0
+    };
+    if max_r > min_r {
+        1.0 - clamp01((rate - min_r) / (max_r - min_r))
+    } else {
+        0.5
+    }
+}
+
+/// Soft sticky bonus applied in sticky-weighted mode.
+pub fn sticky_soft_bonus(
+    candidate: &CandidateAccount,
+    config: &PoolSchedulerConfig,
+    previous_response_binding: Option<&str>,
+    session_binding: Option<&str>,
+) -> f64 {
+    if !config.sticky_weighted_enabled {
+        return 0.0;
+    }
+    let mut bonus = 0.0;
+    if previous_response_binding == Some(candidate.credential_id.as_str()) {
+        bonus += config.score_weights.previous_response.max(0.0);
+    }
+    if session_binding == Some(candidate.credential_id.as_str()) {
+        bonus += config.score_weights.session_sticky.max(0.0);
+    }
+    bonus
+}
+
 /// Lottery weight among top-K: (score - min_score) + 1, times member weight.
 pub fn lottery_weights(scores: &[f64], member_weights: &[i64]) -> Vec<f64> {
     assert_eq!(scores.len(), member_weights.len());
@@ -189,6 +248,8 @@ mod tests {
             quota_remaining: Some(1.0),
             session_reset_at: None,
             quota_fetched_at: Some(0),
+            upstream_cost_rate: 1.0,
+            last_used_at: None,
         }
     }
 

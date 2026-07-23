@@ -12,4 +12,10 @@ pub use scoring::{lottery_weights, score_among_peers, score_candidate, QUOTA_SNA
 pub use select::select_account;
 #[allow(unused_imports)]
 pub use select::{quota_blocks, sticky_concurrency_full, sticky_eligible};
-pub use types::*;
+pub use types::{
+    BindingKind, CandidateAccount, PoolSchedulerConfig, RoutingMode, ScheduleState, SelectOutcome,
+    SelectRequest, SelectionLayer,
+};
+// Re-export optional types used by storage/proxy without requiring every consumer to name them.
+#[allow(unused_imports)]
+pub use types::{FallbackSelectionMode, ScoreWeights, StickyEscapeConfig};

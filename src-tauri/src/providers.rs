@@ -980,19 +980,25 @@ pub fn slugify(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+pub fn secret_material_json(
+    secret: &crate::credentials::SecretMaterial,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "access_token": secret.access_token,
+        "refresh_token": secret.refresh_token,
+        "id_token": secret.id_token,
+        "session_token": secret.session_token,
+        "api_key": secret.api_key,
+        "agent_runtime_id": secret.agent_runtime_id,
+        "agent_private_key": secret.agent_private_key,
+        "task_id": secret.task_id,
+    }))?)
+}
+
 pub fn credential_secret_json(
     credential: &crate::credentials::CanonicalCredential,
 ) -> anyhow::Result<Vec<u8>> {
-    Ok(serde_json::to_vec(&serde_json::json!({
-        "access_token": credential.secret.access_token,
-        "refresh_token": credential.secret.refresh_token,
-        "id_token": credential.secret.id_token,
-        "session_token": credential.secret.session_token,
-        "api_key": credential.secret.api_key,
-        "agent_runtime_id": credential.secret.agent_runtime_id,
-        "agent_private_key": credential.secret.agent_private_key,
-        "task_id": credential.secret.task_id,
-    }))?)
+    secret_material_json(&credential.secret)
 }
 
 pub async fn test_credential(
@@ -1280,6 +1286,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("账号"));
+    }
+
+    #[test]
+    fn secret_material_json_keeps_agent_and_usage_tokens() {
+        let secret = crate::credentials::SecretMaterial {
+            access_token: Some("access".into()),
+            refresh_token: Some("refresh".into()),
+            agent_runtime_id: Some("runtime".into()),
+            agent_private_key: Some("pk".into()),
+            task_id: Some("task".into()),
+            ..Default::default()
+        };
+        let bytes = secret_material_json(&secret).expect("json");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(value["access_token"], "access");
+        assert_eq!(value["refresh_token"], "refresh");
+        assert_eq!(value["agent_runtime_id"], "runtime");
+        assert_eq!(value["agent_private_key"], "pk");
+        assert_eq!(value["task_id"], "task");
     }
 
     #[test]

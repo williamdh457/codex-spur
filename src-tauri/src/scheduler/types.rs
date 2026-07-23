@@ -113,6 +113,23 @@ pub struct ScoreWeights {
     /// Prefer accounts whose session window resets soonest (use-it-or-lose-it).
     pub reset: f64,
     pub quota_headroom: f64,
+    /// Prefer lower upstream billing multiplier (Sub2API-like; default off).
+    #[serde(default)]
+    pub upstream_cost: f64,
+    /// Soft sticky bonus for previous_response_id binding (sticky-weighted mode only).
+    #[serde(default = "default_weight_previous_response")]
+    pub previous_response: f64,
+    /// Soft sticky bonus for session-hash binding (sticky-weighted mode only).
+    #[serde(default = "default_weight_session_sticky")]
+    pub session_sticky: f64,
+}
+
+fn default_weight_previous_response() -> f64 {
+    5.0
+}
+
+fn default_weight_session_sticky() -> f64 {
+    3.0
 }
 
 impl Default for ScoreWeights {
@@ -124,8 +141,36 @@ impl Default for ScoreWeights {
             error_rate: 0.8,
             ttft: 0.5,
             reset: 0.0,
-            // Prefer accounts with remaining quota when snapshots are fresh.
+            // Prefer accounts with remaining quota when snapshots are fresh (Spur desktop default).
             quota_headroom: 1.0,
+            upstream_cost: 0.0,
+            previous_response: default_weight_previous_response(),
+            session_sticky: default_weight_session_sticky(),
+        }
+    }
+}
+
+/// Fallback account selection after a concurrency wait (Sub2API-like).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackSelectionMode {
+    #[default]
+    LastUsed,
+    Random,
+}
+
+impl FallbackSelectionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LastUsed => "last_used",
+            Self::Random => "random",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "random" => Self::Random,
+            _ => Self::LastUsed,
         }
     }
 }
@@ -173,9 +218,36 @@ pub struct PoolSchedulerConfig {
     /// Prefer waiting for a sticky account's concurrency slot instead of switching.
     #[serde(default = "default_true")]
     pub sticky_wait_enabled: bool,
-    /// Max seconds to wait for sticky concurrency (desktop default shorter than Sub2API 120s).
+    /// Max seconds to wait for sticky concurrency (Sub2API default 120s).
     #[serde(default = "default_sticky_wait_timeout")]
     pub sticky_wait_timeout_secs: i64,
+    /// Max concurrent waiters for one sticky account (Sub2API sticky_session_max_waiting=3).
+    #[serde(default = "default_sticky_wait_max_waiting")]
+    pub sticky_wait_max_waiting: u32,
+    /// When every eligible account is concurrency-full, wait for any slot.
+    #[serde(default = "default_true")]
+    pub fallback_wait_enabled: bool,
+    /// Max seconds for fallback concurrency wait (Sub2API 30s).
+    #[serde(default = "default_fallback_wait_timeout")]
+    pub fallback_wait_timeout_secs: i64,
+    /// Max concurrent fallback waiters (Sub2API 100).
+    #[serde(default = "default_fallback_max_waiting")]
+    pub fallback_max_waiting: u32,
+    /// How to pick after fallback wait (Sub2API last_used | random).
+    #[serde(default)]
+    pub fallback_selection_mode: FallbackSelectionMode,
+    /// Soft sticky: affinity becomes score bonuses instead of hard hits (default off).
+    #[serde(default)]
+    pub sticky_weighted_enabled: bool,
+    /// Apply cooldown after 429 / usage_limit (default on).
+    #[serde(default = "default_true")]
+    pub rate_limit_429_cooldown_enabled: bool,
+    /// Cooldown after 529 overloaded (Sub2API default 10 minutes).
+    #[serde(default = "default_overload_529_cooldown")]
+    pub overload_529_cooldown_secs: i64,
+    /// Allow failover on selected 400 errors (default off; Sub2API failover_on_400).
+    #[serde(default)]
+    pub failover_on_400: bool,
 }
 
 fn default_true() -> bool {
@@ -187,7 +259,23 @@ fn default_quota_pause_threshold() -> f64 {
 }
 
 fn default_sticky_wait_timeout() -> i64 {
+    120
+}
+
+fn default_sticky_wait_max_waiting() -> u32 {
+    3
+}
+
+fn default_fallback_wait_timeout() -> i64 {
     30
+}
+
+fn default_fallback_max_waiting() -> u32 {
+    100
+}
+
+fn default_overload_529_cooldown() -> i64 {
+    600
 }
 
 impl Default for PoolSchedulerConfig {
@@ -200,13 +288,22 @@ impl Default for PoolSchedulerConfig {
             sticky_escape: StickyEscapeConfig::default(),
             prefer_soonest_reset: false,
             default_429_cooldown_secs: 30,
-            max_failover_switches: 3,
+            max_failover_switches: 10,
             lease_ttl_secs: 900,
             exclude_zero_quota: true,
             quota_auto_pause_5h: 1.0,
             quota_auto_pause_7d: 1.0,
             sticky_wait_enabled: true,
-            sticky_wait_timeout_secs: 30,
+            sticky_wait_timeout_secs: 120,
+            sticky_wait_max_waiting: 3,
+            fallback_wait_enabled: true,
+            fallback_wait_timeout_secs: 30,
+            fallback_max_waiting: 100,
+            fallback_selection_mode: FallbackSelectionMode::LastUsed,
+            sticky_weighted_enabled: false,
+            rate_limit_429_cooldown_enabled: true,
+            overload_529_cooldown_secs: 600,
+            failover_on_400: false,
         }
     }
 }
@@ -248,13 +345,28 @@ impl PoolSchedulerConfig {
         if self.max_failover_switches == 0 {
             self.max_failover_switches = 1;
         }
-        if self.max_failover_switches > 10 {
-            self.max_failover_switches = 10;
+        if self.max_failover_switches > 20 {
+            self.max_failover_switches = 20;
         }
         if self.lease_ttl_secs < 60 {
             self.lease_ttl_secs = 60;
         }
-        self.sticky_wait_timeout_secs = self.sticky_wait_timeout_secs.clamp(0, 120);
+        // Sub2API sticky wait is 120s; allow up to 300s for power users.
+        self.sticky_wait_timeout_secs = self.sticky_wait_timeout_secs.clamp(0, 300);
+        if self.sticky_wait_max_waiting == 0 {
+            self.sticky_wait_max_waiting = 1;
+        }
+        if self.sticky_wait_max_waiting > 64 {
+            self.sticky_wait_max_waiting = 64;
+        }
+        self.fallback_wait_timeout_secs = self.fallback_wait_timeout_secs.clamp(0, 300);
+        if self.fallback_max_waiting == 0 {
+            self.fallback_max_waiting = 1;
+        }
+        if self.fallback_max_waiting > 1000 {
+            self.fallback_max_waiting = 1000;
+        }
+        self.overload_529_cooldown_secs = self.overload_529_cooldown_secs.clamp(1, 86_400);
         for value in [
             &mut self.quota_auto_pause_5h,
             &mut self.quota_auto_pause_7d,
@@ -274,6 +386,9 @@ impl PoolSchedulerConfig {
             &mut self.score_weights.ttft,
             &mut self.score_weights.reset,
             &mut self.score_weights.quota_headroom,
+            &mut self.score_weights.upstream_cost,
+            &mut self.score_weights.previous_response,
+            &mut self.score_weights.session_sticky,
         ] {
             if !value.is_finite() || *value < 0.0 {
                 *value = 0.0;
@@ -313,6 +428,10 @@ pub struct CandidateAccount {
     pub session_reset_at: Option<i64>,
     /// When the quota snapshot was fetched (unix); used for staleness.
     pub quota_fetched_at: Option<i64>,
+    /// Relative upstream cost multiplier (1.0 neutral). Lower is preferred when weight > 0.
+    pub upstream_cost_rate: f64,
+    /// Last successful use unix (for fallback last_used selection).
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
