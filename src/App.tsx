@@ -786,10 +786,15 @@ function AddProviderWizard({
     }
   };
 
-  const finishCreate = async (created: ProviderSummary, modelCount: number, warning?: string) => {
+  const finishCreate = (created: ProviderSummary, modelCount: number, warning?: string) => {
     setMessage(warning ?? `已添加 ${created.name}，拉取 ${modelCount} 个模型候选。`);
-    await onCreated();
     if (!warning) onClose();
+    // Import/discovery is already committed at this point. Refreshing Overview is
+    // best-effort UI work and must never keep the wizard spinning or roll back a
+    // successfully created provider when a snapshot refresh stalls/fails.
+    void onCreated().catch((error) => {
+      console.error("Failed to refresh provider snapshot after create", error);
+    });
   };
 
   const submitOpenCodeGoImport = async () => {
@@ -802,7 +807,7 @@ function AddProviderWizard({
       await importOpenCodeGoCredential(created.id);
       const routes = await discoverProviderModels(created.id, DEFAULT_BASE_URL["opencode-go"], undefined);
       const count = routes.filter((route) => route.providerId === created.id).length;
-      await finishCreate(created, count);
+      finishCreate(created, count);
     } catch (error) {
       if (createdId) await rollback(createdId);
       setMessage(error instanceof Error ? error.message : String(error));
@@ -824,7 +829,7 @@ function AddProviderWizard({
       createdId = created.id;
       const routes = await discoverProviderModels(created.id, baseUrl, apiKey || undefined);
       const count = routes.filter((route) => route.providerId === created.id).length;
-      await finishCreate(created, count);
+      finishCreate(created, count);
     } catch (error) {
       if (createdId) await rollback(createdId);
       setMessage(error instanceof Error ? error.message : String(error));
@@ -842,7 +847,7 @@ function AddProviderWizard({
       createdId = created.id;
       const routes = await importProviderConfigJson(created.id, await file.text());
       const count = routes.filter((route) => route.providerId === created.id).length;
-      await finishCreate(created, count);
+      finishCreate(created, count);
     } catch (error) {
       if (createdId) await rollback(createdId);
       setMessage(error instanceof Error ? error.message : String(error));
@@ -877,7 +882,7 @@ function AddProviderWizard({
         // Empty base_url → official ChatGPT Codex discovery path.
         const routes = await discoverProviderModels(created.id, "", undefined);
         const count = routes.filter((route) => route.providerId === created.id).length;
-        await finishCreate(created, count);
+        finishCreate(created, count);
       } catch (modelError) {
         await onCreated();
         setMessage(

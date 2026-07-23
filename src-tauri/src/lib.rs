@@ -976,7 +976,20 @@ async fn publish_discovered_models(
         .replace_discovered_models(&provider.id, normalized_base, &records)
         .await
         .map_err(|error| error.to_string())?;
-    state.rebuild_runtime().await?;
+    // Discovery is already committed above. Runtime/snapshot refresh is secondary
+    // work and must not keep the import wizard spinning forever. Newly discovered
+    // routes are disabled by default, so a delayed refresh cannot route traffic to
+    // stale entries; enabling/publishing a model rebuilds the runtime again.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.rebuild_runtime(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, provider_id = %provider.id, "runtime refresh after model discovery failed"),
+        Err(_) => tracing::warn!(provider_id = %provider.id, "runtime refresh after model discovery timed out"),
+    }
     state
         .storage
         .route_summaries()

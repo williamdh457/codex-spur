@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, Context};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
@@ -543,6 +545,8 @@ pub async fn discover_models(
     };
     let client = reqwest::Client::builder()
         .user_agent("Codex-Spur/0.1")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()?;
     let mut headers = HeaderMap::new();
     if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {

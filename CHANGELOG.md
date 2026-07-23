@@ -4,6 +4,14 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-23
+
+### Fixed
+
+- Prevent provider imports from spinning forever after credentials and models were already committed.
+- Decouple successful provider creation from the best-effort Overview snapshot refresh so refresh failures cannot roll back imported data.
+- Add bounded model-discovery network timeouts and a five-second runtime-refresh timeout.
+
 ## [0.1.3] - 2026-07-23
 
 ### Features
