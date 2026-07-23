@@ -1,21 +1,21 @@
 {
-  "version": "v0.1.2",
-  "releaseUrl": "https://github.com/williamdh457/codex-spur/releases/tag/v0.1.2",
+  "version": "v0.1.4",
+  "releaseUrl": "https://github.com/williamdh457/codex-spur/releases/tag/v0.1.4",
   "assets": [
     {
       "id": "macos-aarch64-dmg",
       "platform": "macOS",
       "architecture": "Apple Silicon",
       "format": "DMG",
-      "assetUrl": "https://github.com/williamdh457/codex-spur/releases/download/v0.1.2/Codex.Spur_0.1.2_aarch64.dmg",
-      "sha256": "f122bdb6dad3c74f86ca7fb0b946c78cbc086ca13079bd5f293ff9549dba3df3"
+      "assetUrl": "https://github.com/williamdh457/codex-spur/releases/download/v0.1.4/Codex.Spur_0.1.4_aarch64.dmg",
+      "sha256": "6058b4454848823629c5fb7d34cbc2e2de0c6b0db2cbc08312d10600a8a3c9c3"
     },
     {
       "id": "windows-x64-nsis",
       "platform": "Windows",
       "architecture": "x64",
       "format": "NSIS",
-      "assetUrl": "https://github.com/williamdh457/codex-spur/releases/download/v0.1.2/Codex.Spur_0.1.2_x64-setup.exe",
+      "assetUrl": "https://github.com/williamdh457/codex-spur/releases/download/v0.1.4/Codex.Spur_0.1.4_x64-setup.exe",
       "sha256": "pending-windows-build"
     }
   ]
