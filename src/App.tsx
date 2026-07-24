@@ -357,7 +357,7 @@ const ADD_METHODS: AddMethod[] = [
     id: "openai-session",
     kind: "openai",
     title: "OpenAI · 导入 session 文件",
-    hint: "ChatGPT session dump → 尽力 Agent Identity，失败则 access-only",
+    hint: "ChatGPT session → Agent Identity（与 Sub2API 同路径）；失败则不可用 Codex",
     mode: "session",
     category: "json",
   },
@@ -583,7 +583,7 @@ function importAuthNote(accounts: CredentialSummary[]): string {
         k === "access_only",
     )
   ) {
-    return "（access-only：Agent Identity 未启用或注册失败，token 过期需重新导出 session）";
+    return "（access-only：Agent Identity 注册失败，Web Session 不能直连 Codex；请重试 session、导入 agent_identity JSON 或官方 OAuth）";
   }
   return "";
 }
@@ -1327,7 +1327,7 @@ function AddProviderWizard({
                     <span className="method-badge method-badge--json">Session</span>
                   </strong>
                   <p>
-                    从浏览器打开 <code>https://chatgpt.com/api/auth/session</code>，复制整页 JSON
+                    从浏览器打开 <code>https://chatgpt.com/api/auth/session</code>，复制整页 JSON。与 Sub2API 相同：必须成功注册 Agent Identity 才能调 Codex；裸 Web accessToken 会被 backend 401。
                     （含 <code>WARNING_BANNER</code> 也可）。优先注册 <strong>Agent Identity</strong>；
                     若 OpenAI 返回 registry 不可用，则按 <strong>access-only</strong> 入库（与「导入账号 JSON」一致），
                     无需在本应用内接码。无 refresh_token 时过期需重新导出。导入后立刻拉取官方模型。

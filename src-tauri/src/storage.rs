@@ -657,7 +657,6 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-
     /// Hard-delete a credential and clear dependent routing/quota state.
     ///
     /// FK CASCADE covers pool_members, leases, sticky bindings, usage_snapshots,
@@ -701,12 +700,11 @@ impl Storage {
             return Err(sqlx::Error::Protocol("账号不存在".into()));
         }
 
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM credentials WHERE provider_id = ?",
-        )
-        .bind(&provider_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM credentials WHERE provider_id = ?")
+                .bind(&provider_id)
+                .fetch_one(&self.pool)
+                .await?;
 
         Ok(DeleteCredentialResult {
             provider_id,
@@ -727,10 +725,7 @@ impl Storage {
             request = request.bind(provider_id.unwrap_or_default());
         }
         let rows = request.fetch_all(&self.pool).await?;
-        Ok(rows
-            .into_iter()
-            .map(Self::map_credential_summary)
-            .collect())
+        Ok(rows.into_iter().map(Self::map_credential_summary).collect())
     }
 
     /// Credentials whose parent provider instance has the given `providers.kind` (e.g. `"openai"`).
@@ -748,10 +743,7 @@ impl Storage {
         .bind(kind)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(Self::map_credential_summary)
-            .collect())
+        Ok(rows.into_iter().map(Self::map_credential_summary).collect())
     }
 
     fn map_credential_summary(row: sqlx::sqlite::SqliteRow) -> CredentialSummary {
@@ -841,7 +833,10 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some(row) => self.get_credential(row.get::<String, _>("id").as_str()).await,
+            Some(row) => {
+                self.get_credential(row.get::<String, _>("id").as_str())
+                    .await
+            }
             None => Ok(None),
         }
     }
@@ -885,7 +880,9 @@ impl Storage {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return self.get_credential(row.get::<String, _>("id").as_str()).await;
+                return self
+                    .get_credential(row.get::<String, _>("id").as_str())
+                    .await;
             }
         }
         if let Some(email) = email.map(str::trim).filter(|s| !s.is_empty()) {
@@ -898,7 +895,9 @@ impl Storage {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return self.get_credential(row.get::<String, _>("id").as_str()).await;
+                return self
+                    .get_credential(row.get::<String, _>("id").as_str())
+                    .await;
             }
         }
         Ok(None)
@@ -917,6 +916,66 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// After a successful secret re-import / agent upgrade: clear sticky auth_invalid
+    /// so the scheduler can select the account again.
+    pub async fn heal_credential_after_import(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE credentials SET schedule_state = 'ready', healthy = 1, last_error = NULL,
+             cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist kind/state/refreshable when access-only is upgraded to Agent Identity
+    /// (or when import intentionally leaves access-only for Codex).
+    pub async fn update_credential_auth_meta(
+        &self,
+        id: &str,
+        kind: &str,
+        state: &str,
+        refreshable: bool,
+        email: Option<&str>,
+        label: Option<&str>,
+        expires_at: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE credentials SET kind = ?, state = ?, refreshable = ?,
+             email = COALESCE(?, email),
+             label = CASE WHEN (label IS NULL OR trim(label) = '') THEN COALESCE(?, label) ELSE label END,
+             expires_at = COALESCE(?, expires_at),
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(kind)
+        .bind(state)
+        .bind(refreshable as i64)
+        .bind(email)
+        .bind(label)
+        .bind(expires_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Best diagnostic string for proxy 401 when no healthy credential remains.
+    pub async fn latest_credential_error_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT last_error FROM credentials
+             WHERE provider_id = ? AND last_error IS NOT NULL AND trim(last_error) != ''
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(provider_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<String, _>("last_error")))
     }
 
     /// Set label only when currently NULL/empty (import must not overwrite user renames).
@@ -941,11 +1000,7 @@ impl Storage {
     }
 
     /// Rename account display label. Empty string clears to NULL (fallback to email/id).
-    pub async fn rename_credential(
-        &self,
-        id: &str,
-        label: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn rename_credential(&self, id: &str, label: &str) -> Result<(), sqlx::Error> {
         let trimmed = label.trim();
         let owned: Option<String> = if trimmed.is_empty() {
             None
@@ -3191,12 +3246,11 @@ mod delete_credential_tests {
         assert_eq!(routing.routing_mode, "pool");
         assert!(routing.fixed_credential_id.is_none());
 
-        let quota_left: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM app_settings WHERE key = 'quota:c1'",
-        )
-        .fetch_one(&storage.pool)
-        .await
-        .expect("quota count");
+        let quota_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM app_settings WHERE key = 'quota:c1'")
+                .fetch_one(&storage.pool)
+                .await
+                .expect("quota count");
         assert_eq!(quota_left, 0);
     }
 
@@ -3273,15 +3327,17 @@ mod delete_credential_tests {
         assert!(!providers.iter().any(|p| p.id == "p1"));
         let creds = storage.list_credentials(Some("p1")).await.expect("creds");
         assert!(creds.is_empty());
-        let pools: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_pools WHERE provider_id = 'p1'")
-            .fetch_one(&storage.pool)
-            .await
-            .expect("pools");
+        let pools: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_pools WHERE provider_id = 'p1'")
+                .fetch_one(&storage.pool)
+                .await
+                .expect("pools");
         assert_eq!(pools, 0);
-        let routes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE provider_id = 'p1'")
-            .fetch_one(&storage.pool)
-            .await
-            .expect("routes");
+        let routes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE provider_id = 'p1'")
+                .fetch_one(&storage.pool)
+                .await
+                .expect("routes");
         assert_eq!(routes, 0);
     }
 

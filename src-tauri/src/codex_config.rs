@@ -260,10 +260,7 @@ pub fn inspect_desktop_visibility(
             } else {
                 match serde_json::from_str::<ModelsResponse>(&raw) {
                     Ok(parsed) => match crate::catalog::validate_catalog(&parsed) {
-                        Ok(()) => (
-                            true,
-                            format!("{} 个模型，形状合法", parsed.models.len()),
-                        ),
+                        Ok(()) => (true, format!("{} 个模型，形状合法", parsed.models.len())),
                         Err(error) => (false, format!("catalog 校验失败：{error}")),
                     },
                     Err(error) => (false, format!("catalog JSON 无法解析：{error}")),
@@ -591,13 +588,21 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
         .map(|value| hash_bytes(value.as_bytes()));
     let backup_path = if config_path.exists() {
         let path = backup_dir.join(format!("config-{timestamp}.toml"));
-        atomic_write(&path, original_config.as_deref().unwrap_or_default().as_bytes())?;
+        atomic_write(
+            &path,
+            original_config.as_deref().unwrap_or_default().as_bytes(),
+        )?;
         Some(path)
     } else {
         None
     };
 
-    let mut document = if original_config.as_deref().unwrap_or_default().trim().is_empty() {
+    let mut document = if original_config
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
         DocumentMut::new()
     } else {
         original_config
@@ -663,13 +668,11 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
         Ok(())
     })();
     if let Err(error) = write_result {
-        let rollback_result = rollback_file(&catalog_path, original_catalog.as_deref())
-            .and(rollback_file(
-                &config_path,
-                original_config.as_ref().map(String::as_bytes),
-            ));
+        let rollback_result = rollback_file(&catalog_path, original_catalog.as_deref()).and(
+            rollback_file(&config_path, original_config.as_ref().map(String::as_bytes)),
+        );
         return match rollback_result {
-            Ok(()) => Err(error).context("Codex catalog/config 写入失败，已回滚") ,
+            Ok(()) => Err(error).context("Codex catalog/config 写入失败，已回滚"),
             Err(rollback_error) => Err(error).context(format!(
                 "Codex catalog/config 写入失败，且回滚失败：{rollback_error}"
             )),
@@ -754,9 +757,9 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
             );
             return match rollback_result {
                 Ok(()) => Err(error).context("应用后校验失败，已回滚"),
-                Err(rollback_error) => Err(error).context(format!(
-                    "应用后校验失败，且回滚失败：{rollback_error}"
-                )),
+                Err(rollback_error) => {
+                    Err(error).context(format!("应用后校验失败，且回滚失败：{rollback_error}"))
+                }
             };
         }
     };
@@ -844,10 +847,10 @@ fn choose_selected_model(document: &DocumentMut, catalog: &ModelsResponse) -> Op
                     .display_name
                     .to_ascii_lowercase()
                     .contains(&bare.to_ascii_lowercase())
-                || model
-                    .description
-                    .as_ref()
-                    .is_some_and(|text| text.to_ascii_lowercase().contains(&bare.to_ascii_lowercase()))
+                || model.description.as_ref().is_some_and(|text| {
+                    text.to_ascii_lowercase()
+                        .contains(&bare.to_ascii_lowercase())
+                })
         }) {
             return Some(model.slug.clone());
         }
@@ -859,11 +862,14 @@ fn atomic_write(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(&temp, bytes).with_context(|| format!("写入临时文件失败：{}", temp.display()))?;
     let file = fs::OpenOptions::new().read(true).open(&temp)?;
-    file.sync_all().with_context(|| format!("刷新临时文件失败：{}", temp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("刷新临时文件失败：{}", temp.display()))?;
     fs::rename(&temp, path).with_context(|| format!("原子替换文件失败：{}", path.display()))?;
     if let Some(parent) = path.parent() {
         let directory = fs::File::open(parent)?;
-        directory.sync_all().with_context(|| format!("刷新目录失败：{}", parent.display()))?;
+        directory
+            .sync_all()
+            .with_context(|| format!("刷新目录失败：{}", parent.display()))?;
     }
     Ok(())
 }
@@ -907,7 +913,10 @@ mod tests {
         assert_eq!(user_codex_home(), PathBuf::from("/tmp/spur-home-a/.codex"));
 
         env::remove_var("HOME");
-        assert_eq!(user_codex_home(), PathBuf::from(r"C:\Users\spur").join(".codex"));
+        assert_eq!(
+            user_codex_home(),
+            PathBuf::from(r"C:\Users\spur").join(".codex")
+        );
 
         env::remove_var("USERPROFILE");
         assert_eq!(user_codex_home(), PathBuf::from(".codex"));
@@ -929,7 +938,6 @@ mod tests {
             None => env::remove_var("CODEX_SPUR_PUBLISH_HOME"),
         }
     }
-
 
     /// Minimal valid ChatGPT Desktop identity for apply hard-block tests (no real secrets).
     fn write_test_chatgpt_auth(home: &Path) {
@@ -982,7 +990,8 @@ mod tests {
             max_context_window: Some(128_000),
             auto_compact_token_limit: Some(115_200),
             comp_hash: None,
-            effective_context_window_percent: 95,
+            effective_context_window_percent:
+                crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
             experimental_supported_tools: Vec::new(),
             input_modalities: vec!["text".into()],
             supports_search_tool: false,
@@ -995,7 +1004,9 @@ mod tests {
 
     #[test]
     fn apply_writes_to_publish_home_not_env_codex_home() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1005,11 +1016,8 @@ mod tests {
             std::process::id(),
             stamp
         ));
-        let orca_dir = std::env::temp_dir().join(format!(
-            "codex-spur-orca-{}-{}",
-            std::process::id(),
-            stamp
-        ));
+        let orca_dir =
+            std::env::temp_dir().join(format!("codex-spur-orca-{}-{}", std::process::id(), stamp));
         fs::create_dir_all(&publish_dir).expect("publish dir");
         fs::create_dir_all(&orca_dir).expect("orca dir");
         write_test_chatgpt_auth(&publish_dir);
@@ -1041,9 +1049,7 @@ mod tests {
 
         let config_raw = fs::read_to_string(&result.config_path).expect("config");
         assert!(config_raw.contains("model_provider = \"codex_select\""));
-        assert!(config_raw.contains(
-            "model_catalog_json = \"codex-select/model-catalog.json\""
-        ));
+        assert!(config_raw.contains("model_catalog_json = \"codex-select/model-catalog.json\""));
         assert!(config_raw.contains("[model_providers.codex_select]"));
         assert!(config_raw.contains("model = \"spur-route-k3deadbeef001\""));
         // Desktop gate: OpenAI name + requires_openai_auth so custom models show in GUI.
@@ -1069,7 +1075,9 @@ mod tests {
 
     #[test]
     fn apply_writes_web_search_disabled_for_minimax_catalog() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-websearch-{}-{}",
             std::process::id(),
@@ -1106,7 +1114,9 @@ mod tests {
 
     #[test]
     fn apply_writes_snake_case_catalog_and_codex_select_provider() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-apply-test-{}-{}",
             std::process::id(),
@@ -1166,7 +1176,9 @@ mod tests {
 
     #[test]
     fn apply_rejects_slash_slugs() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-slash-slug-{}-{}",
             std::process::id(),
@@ -1189,7 +1201,9 @@ mod tests {
 
     #[test]
     fn apply_does_not_treat_config_read_errors_as_empty() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-read-error-{}-{}",
             std::process::id(),
@@ -1216,7 +1230,9 @@ mod tests {
 
     #[test]
     fn apply_blocks_custom_catalog_without_chatgpt_auth() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-auth-block-{}-{}",
             std::process::id(),
@@ -1244,7 +1260,9 @@ mod tests {
 
     #[test]
     fn apply_allows_official_only_catalog_without_auth() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-official-only-{}-{}",
             std::process::id(),
@@ -1266,7 +1284,9 @@ mod tests {
 
     #[test]
     fn inspect_desktop_visibility_reports_missing_auth() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-vis-{}-{}",
             std::process::id(),
@@ -1290,7 +1310,9 @@ mod tests {
 
     #[test]
     fn inspect_desktop_visibility_ready_after_apply_with_auth() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-vis-ready-{}-{}",
             std::process::id(),

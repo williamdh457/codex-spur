@@ -17,9 +17,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
-use crate::credentials::{
-    CanonicalCredential, CredentialKind, CredentialState, SecretMaterial,
-};
+use crate::credentials::{CanonicalCredential, CredentialKind, CredentialState, SecretMaterial};
 use crate::openai_oauth::{chatgpt_account_id_from_token, jwt_exp_unix};
 
 const AUTH_API_BASE: &str = "https://auth.openai.com/api/accounts";
@@ -57,7 +55,29 @@ struct AgentBillOfMaterials {
 
 #[derive(Deserialize)]
 struct RegisterAgentResponse {
+    /// Sub2API / Codex use snake_case; some gateways return camelCase.
+    #[serde(alias = "agentRuntimeId")]
     agent_runtime_id: String,
+}
+
+/// Match Sub2API / Codex CLI abom.running_location (`cli-darwin`, not `cli-macos`).
+fn agent_running_location() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "cli-darwin".to_string()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "cli-linux".to_string()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "cli-windows".to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        format!("cli-{}", std::env::consts::OS)
+    }
 }
 
 #[derive(Serialize)]
@@ -130,20 +150,22 @@ fn append_ssh_string(buf: &mut Vec<u8>, value: &[u8]) {
 }
 
 /// Register a new agent runtime using a live ChatGPT access token.
-pub async fn register_agent_runtime(
-    access_token: &str,
-    public_key_ssh: &str,
-) -> Result<String> {
+///
+/// Protocol aligned with Sub2API's `import_agent_identity.py` observable contract:
+/// same URL, abom shape, User-Agent, and `cli-darwin` running_location on macOS.
+pub async fn register_agent_runtime(access_token: &str, public_key_ssh: &str) -> Result<String> {
     let client = reqwest::Client::builder()
-        .user_agent("Codex-Spur/0.1")
+        // Sub2API uses codex-cli UA; some accounts reject unknown clients.
+        .user_agent("codex-cli/0.1.0")
         .timeout(REGISTER_TIMEOUT)
         .build()
         .context("build http client")?;
     let body = RegisterAgentRequest {
         abom: AgentBillOfMaterials {
-            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            // Keep stable with Sub2API reference script (not Spur package version).
+            agent_version: "0.1.0".to_string(),
             agent_harness_id: "codex-cli".to_string(),
-            running_location: format!("cli-{}", std::env::consts::OS),
+            running_location: agent_running_location(),
         },
         agent_public_key: public_key_ssh.to_string(),
         capabilities: Vec::new(),
@@ -153,6 +175,8 @@ pub async fn register_agent_runtime(
     let response = client
         .post(&url)
         .bearer_auth(access_token.trim())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&body)
         .send()
         .await
@@ -245,7 +269,10 @@ fn decrypt_task_id(key: &AgentIdentityKey, encrypted_b64: &str) -> Result<String
     Ok(task_id)
 }
 
-pub fn authorization_header_for_agent_task(key: &AgentIdentityKey, task_id: &str) -> Result<String> {
+pub fn authorization_header_for_agent_task(
+    key: &AgentIdentityKey,
+    task_id: &str,
+) -> Result<String> {
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let signing_key = signing_key_from_pkcs8_b64(&key.private_key_pkcs8_base64)?;
     let payload = format!("{}:{task_id}:{timestamp}", key.agent_runtime_id);

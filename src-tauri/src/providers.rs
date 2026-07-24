@@ -37,7 +37,14 @@ pub fn normalize_base_url(value: &str) -> anyhow::Result<String> {
 }
 
 /// Template metadata for a provider kind (not a single instance).
-pub fn kind_meta(kind: &str) -> Option<(&'static str, &'static str, &'static str, Option<&'static str>)> {
+pub fn kind_meta(
+    kind: &str,
+) -> Option<(
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+)> {
     match kind {
         "openai" => Some((
             "OpenAI",
@@ -69,25 +76,21 @@ pub fn kind_meta(kind: &str) -> Option<(&'static str, &'static str, &'static str
             "Responses preferred",
             Some("https://api.minimaxi.com/v1"),
         )),
-        "xai" => Some((
-            "Grok",
-            "Global",
-            "Responses",
-            Some("https://api.x.ai/v1"),
-        )),
+        "xai" => Some(("Grok", "Global", "Responses", Some("https://api.x.ai/v1"))),
         "custom" => Some(("自定义供应商", "Custom", "OpenAI-compatible", None)),
         _ => None,
     }
 }
 
 pub fn default_base_url_for_kind(kind: &str) -> Option<String> {
-    kind_meta(kind)
-        .and_then(|(_, _, _, url)| url.map(str::to_string))
+    kind_meta(kind).and_then(|(_, _, _, url)| url.map(str::to_string))
 }
 
 #[allow(dead_code)]
 pub fn kind_display_name(kind: &str) -> &'static str {
-    kind_meta(kind).map(|(name, _, _, _)| name).unwrap_or("Custom")
+    kind_meta(kind)
+        .map(|(name, _, _, _)| name)
+        .unwrap_or("Custom")
 }
 
 /// Codex official catalog requires client_version; keep aligned with gated model min versions.
@@ -123,7 +126,10 @@ pub fn is_xai_official_host(base_url: &str) -> bool {
 /// - **Subscription / OAuth (`official` or `subscription_oauth`)**: CLI proxy when the
 ///   stored base is empty or an official host; keep true custom hosts.
 /// - **API key / other**: `api.x.ai` default, or the stored base when set.
-pub fn resolve_xai_upstream_base(entry_category: Option<&str>, stored_base: Option<&str>) -> String {
+pub fn resolve_xai_upstream_base(
+    entry_category: Option<&str>,
+    stored_base: Option<&str>,
+) -> String {
     let stored = stored_base.map(str::trim).filter(|s| !s.is_empty());
     let is_subscription = matches!(
         entry_category.map(str::to_ascii_lowercase).as_deref(),
@@ -189,7 +195,12 @@ fn looks_like_account_json(value: &Value) -> bool {
 
 fn string_field_from_map(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
-        if let Some(value) = map.get(*key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(value) = map
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             return Some(value.to_string());
         }
     }
@@ -241,7 +252,10 @@ fn extract_base_url_from_object(map: &serde_json::Map<String, Value>) -> Option<
 }
 
 fn extract_api_key_from_object(map: &serde_json::Map<String, Value>) -> Option<String> {
-    if let Some(key) = string_field_from_map(map, &["api_key", "apiKey", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]) {
+    if let Some(key) = string_field_from_map(
+        map,
+        &["api_key", "apiKey", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+    ) {
         return Some(key);
     }
     if let Some(env) = map
@@ -250,7 +264,10 @@ fn extract_api_key_from_object(map: &serde_json::Map<String, Value>) -> Option<S
         .and_then(Value::as_object)
         .or_else(|| map.get("env").and_then(Value::as_object))
     {
-        if let Some(key) = string_field_from_map(env, &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "api_key", "apiKey"]) {
+        if let Some(key) = string_field_from_map(
+            env,
+            &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "api_key", "apiKey"],
+        ) {
             return Some(key);
         }
     }
@@ -371,7 +388,9 @@ pub fn parse_provider_config_json_with_fallback(
             }
             Err(anyhow!("供应商配置 JSON 数组里没有可用的 base_url 对象"))
         }
-        _ => Err(anyhow!("不是有效的供应商配置 JSON（根节点必须是对象或数组）")),
+        _ => Err(anyhow!(
+            "不是有效的供应商配置 JSON（根节点必须是对象或数组）"
+        )),
     }
 }
 
@@ -379,11 +398,7 @@ pub async fn discover_official_models(
     access_token: &str,
     account_id: &str,
 ) -> anyhow::Result<Vec<DiscoveredProviderModel>> {
-    discover_official_models_with_authorization(
-        &format!("Bearer {access_token}"),
-        account_id,
-    )
-    .await
+    discover_official_models_with_authorization(&format!("Bearer {access_token}"), account_id).await
 }
 
 /// Discover ChatGPT Codex models with a full Authorization header value
@@ -577,11 +592,7 @@ pub async fn discover_models(
                 detail
             ));
         }
-        return Err(anyhow!(
-            "模型列表请求失败（{}）：{}",
-            status,
-            detail
-        ));
+        return Err(anyhow!("模型列表请求失败（{}）：{}", status, detail));
     }
     let body = body.ok_or_else(|| anyhow!("模型列表返回不是 JSON（{}）。Kimi for Coding 请使用 https://api.kimi.com/coding/v1，而不是 www.kimi.com/code/v1。", status))?;
     let values = body
@@ -660,7 +671,9 @@ pub fn reasoning_profile(kind: &str, model_id: &str) -> ReasoningProfile {
             // Grok 4.x exposes low/medium/high; higher Codex rungs clamp to high.
             // none/minimal still map to low rather than inventing a disable switch.
             "xAI Grok 三档推理映射",
-            ["low", "low", "low", "medium", "high", "high", "high", "high"],
+            [
+                "low", "low", "low", "medium", "high", "high", "high", "high",
+            ],
         ),
         _ => (
             "OpenAI 兼容推理映射",
@@ -732,9 +745,11 @@ pub fn normalize_catalog_model_for_codex_with_kind(
         mode: "bytes".into(),
         limit: 10_000,
     };
-    if model.effective_context_window_percent <= 0 || model.effective_context_window_percent < 95 {
-        model.effective_context_window_percent = 95;
-    }
+    // This is a Codex-facing safety boundary, not provider metadata. Rewrite
+    // persisted legacy rows too, so a pre-existing 95% catalog cannot keep
+    // postponing compaction after an app update.
+    model.effective_context_window_percent =
+        crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT;
     // Product ladder (CC Switch heal): no minimal; max/ultra keep official English copy.
     model.supported_reasoning_levels = ReasoningEffort::ALL
         .into_iter()
@@ -744,7 +759,10 @@ pub fn normalize_catalog_model_for_codex_with_kind(
         })
         .collect();
     if model.default_reasoning_level.is_none()
-        || matches!(model.default_reasoning_level, Some(ReasoningEffort::Minimal))
+        || matches!(
+            model.default_reasoning_level,
+            Some(ReasoningEffort::Minimal)
+        )
     {
         model.default_reasoning_level = Some(ReasoningEffort::Medium);
     }
@@ -822,10 +840,7 @@ pub fn opaque_route_slug(provider_id: &str, upstream_model: &str) -> String {
 pub fn desktop_native_model_slug(upstream_model: &str) -> Option<&'static str> {
     let normalized = upstream_model.trim().to_ascii_lowercase();
     // Strip common provider prefixes: "openai/gpt-5.6-terra", "models/gpt-5.6-sol".
-    let tail = normalized
-        .rsplit(['/', ':'])
-        .next()
-        .unwrap_or(&normalized);
+    let tail = normalized.rsplit(['/', ':']).next().unwrap_or(&normalized);
     match tail {
         "gpt-5.6-terra" | "gpt-5-6-terra" => Some("gpt-5.6-terra"),
         "gpt-5.6-sol" | "gpt-5-6-sol" => Some("gpt-5.6-sol"),
@@ -879,9 +894,8 @@ pub fn catalog_model(
         })
         .collect();
     // GPT-class models used with ChatGPT backend expect larger windows; others keep 128k default.
-    let is_openai_family = kind == "openai"
-        || model.id.contains("gpt-5")
-        || model.id.contains("gpt-4");
+    let is_openai_family =
+        kind == "openai" || model.id.contains("gpt-5") || model.id.contains("gpt-4");
     let (context_window, max_context_window) = if is_openai_family {
         (Some(272_000), Some(272_000))
     } else if kind == "kimi" {
@@ -939,7 +953,7 @@ pub fn catalog_model(
         max_context_window,
         auto_compact_token_limit: auto_compact,
         comp_hash: None,
-        effective_context_window_percent: 95,
+        effective_context_window_percent: crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         experimental_supported_tools: Vec::new(),
         input_modalities: if is_openai_family || kind == "kimi" || kind == "xai" {
             vec!["text".into(), "image".into()]
@@ -1070,7 +1084,14 @@ mod tests {
 
     #[test]
     fn every_codex_level_has_a_mapping() {
-        for provider in ["kimi", "deepseek", "minimax", "opencode-go", "custom", "xai"] {
+        for provider in [
+            "kimi",
+            "deepseek",
+            "minimax",
+            "opencode-go",
+            "custom",
+            "xai",
+        ] {
             assert_eq!(reasoning_profile(provider, "model").mappings.len(), 8);
         }
     }
@@ -1128,10 +1149,7 @@ mod tests {
 
     #[test]
     fn xai_api_key_base_stays_on_api_x_ai() {
-        assert_eq!(
-            resolve_xai_upstream_base(Some("api"), None),
-            XAI_API_BASE
-        );
+        assert_eq!(resolve_xai_upstream_base(Some("api"), None), XAI_API_BASE);
         assert_eq!(
             resolve_xai_upstream_base(Some("api"), Some(XAI_API_BASE)),
             XAI_API_BASE
@@ -1163,8 +1181,14 @@ mod tests {
             },
         );
         let json = serde_json::to_value(&model).expect("serialize");
-        assert!(json.get("display_name").is_some(), "expected snake_case display_name");
-        assert!(json.get("displayName").is_none(), "must not emit camelCase displayName");
+        assert!(
+            json.get("display_name").is_some(),
+            "expected snake_case display_name"
+        );
+        assert!(
+            json.get("displayName").is_none(),
+            "must not emit camelCase displayName"
+        );
         assert!(json.get("supported_reasoning_levels").is_some());
         assert!(json.get("supportedReasoningLevels").is_none());
         assert!(json.get("default_reasoning_level").is_some());
@@ -1179,20 +1203,18 @@ mod tests {
             .collect();
         assert_eq!(
             efforts,
-            vec![
-                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
-            ]
+            vec!["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
         );
         let max_desc = levels
             .iter()
             .find(|level| level.get("effort").and_then(|v| v.as_str()) == Some("max"))
             .and_then(|level| level.get("description").and_then(|v| v.as_str()))
             .unwrap_or_default();
+        assert_eq!(max_desc, "Maximum reasoning depth for the hardest problems");
         assert_eq!(
-            max_desc,
-            "Maximum reasoning depth for the hardest problems"
+            json.get("shell_type").and_then(|v| v.as_str()),
+            Some("shell_command")
         );
-        assert_eq!(json.get("shell_type").and_then(|v| v.as_str()), Some("shell_command"));
         assert!(
             json.get("base_instructions")
                 .and_then(|v| v.as_str())
@@ -1200,17 +1222,58 @@ mod tests {
                 .contains("You are Codex"),
             "base_instructions should match Codex agent blurb"
         );
-        let slug = json.get("slug").and_then(|v| v.as_str()).unwrap_or_default();
-        assert!(slug.starts_with("spur-route-"), "expected opaque slug, got {slug}");
+        let slug = json
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            slug.starts_with("spur-route-"),
+            "expected opaque slug, got {slug}"
+        );
         assert!(!slug.contains('/'), "opaque slug must not contain '/'");
         // ChatGPT's GUI expects the complete ModelInfo shape even for empty values.
-        assert_eq!(json.get("additional_speed_tiers"), Some(&serde_json::json!([])));
+        assert_eq!(
+            json.get("additional_speed_tiers"),
+            Some(&serde_json::json!([]))
+        );
         assert_eq!(json.get("service_tiers"), Some(&serde_json::json!([])));
         assert_eq!(json.get("upgrade"), Some(&serde_json::Value::Null));
         assert_eq!(json.get("availability_nux"), Some(&serde_json::Value::Null));
         assert!(json.get("model_messages").is_none());
         // Codex requires bool fields present even when false.
-        assert_eq!(json.get("support_verbosity"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            json.get("support_verbosity"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            json.get("effective_context_window_percent"),
+            Some(&serde_json::json!(
+                crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT
+            ))
+        );
+    }
+
+    #[test]
+    fn normalizing_legacy_catalog_rows_resets_compaction_threshold_to_ninety_percent() {
+        let mut model = catalog_model(
+            "kimi-instance",
+            "kimi",
+            "Kimi",
+            &DiscoveredProviderModel {
+                id: "k3".into(),
+                display_name: "K3".into(),
+                owned_by: None,
+                created_at: None,
+            },
+        );
+        model.effective_context_window_percent = 95;
+
+        normalize_catalog_model_for_codex_with_kind(&mut model, 1000, Some("kimi"));
+
+        assert_eq!(
+            model.effective_context_window_percent,
+            crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT
+        );
     }
 
     #[test]
@@ -1231,9 +1294,15 @@ mod tests {
         let second = catalog_publish_slug("p2", "gpt-5.6-terra", &mut claimed);
         let kimi = catalog_publish_slug("p3", "k3", &mut claimed);
         assert_eq!(first, "gpt-5.6-terra");
-        assert!(second.starts_with("spur-route-"), "second claim stays opaque: {second}");
+        assert!(
+            second.starts_with("spur-route-"),
+            "second claim stays opaque: {second}"
+        );
         assert!(kimi.starts_with("spur-route-"));
-        assert_eq!(desktop_native_model_slug("openai/gpt-5.6-sol"), Some("gpt-5.6-sol"));
+        assert_eq!(
+            desktop_native_model_slug("openai/gpt-5.6-sol"),
+            Some("gpt-5.6-sol")
+        );
     }
 
     #[test]

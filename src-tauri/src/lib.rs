@@ -3,10 +3,10 @@
 pub mod catalog;
 pub mod codex_config;
 mod content_encoding;
-mod kimi_list_shield;
-mod kimi_target;
 mod credentials;
 mod domain;
+mod kimi_list_shield;
+mod kimi_target;
 mod media_sanitizer;
 mod openai_agent_identity;
 mod openai_oauth;
@@ -27,8 +27,9 @@ use std::sync::Arc;
 use credentials::{CredentialImportSummary, SecretMaterial};
 use domain::{
     AccountPoolSummary, AppSnapshot, ApplyPreview, CodexApplyOutcome, CodexBindingStatus,
-    CredentialSummary, DeleteCredentialResult, ModelRouteSummary, OpenAiQuotaSnapshot, OpenCodeGoCredentialStatus, PoolMemberDetail, ProviderRouting,
-    ProviderSummary, ProxyRequestEvent, ProxyStatus,
+    CredentialSummary, DeleteCredentialResult, ModelRouteSummary, OpenAiQuotaSnapshot,
+    OpenCodeGoCredentialStatus, PoolMemberDetail, ProviderRouting, ProviderSummary,
+    ProxyRequestEvent, ProxyStatus,
 };
 use scheduler::PoolSchedulerConfig;
 use tauri::{
@@ -567,9 +568,7 @@ async fn preview_kimi_publish(
 }
 
 /// Write-only publish (方案 B): no system proxy, no whole-host shield.
-async fn kimi_publish_core(
-    state: &AppState,
-) -> Result<kimi_target::KimiPublishOutcome, String> {
+async fn kimi_publish_core(state: &AppState) -> Result<kimi_target::KimiPublishOutcome, String> {
     let snapshot = state.snapshot.read().await;
     let base_url = snapshot
         .proxy
@@ -589,9 +588,9 @@ async fn kimi_publish_core(
     {
         if proxy_points_at_spur_shield() {
             let _ = disable_macos_https_proxy();
-            outcome.warnings.push(
-                "已关闭残留的系统代理（旧版整站拦截会弄挂 Kimi，方案 B 不再使用）。".into(),
-            );
+            outcome
+                .warnings
+                .push("已关闭残留的系统代理（旧版整站拦截会弄挂 Kimi，方案 B 不再使用）。".into());
         }
     }
     outcome.warnings.push(
@@ -609,9 +608,7 @@ async fn apply_kimi_publish(
 }
 
 #[tauri::command]
-async fn restore_kimi_publish(
-    state: State<'_, AppState>,
-) -> Result<Option<String>, String> {
+async fn restore_kimi_publish(state: State<'_, AppState>) -> Result<Option<String>, String> {
     let result = disable_kimi_publish(state).await?;
     Ok(if result.message.contains("备份") {
         Some(result.message)
@@ -710,9 +707,9 @@ async fn disable_kimi_publish(
     }
 
     let message = match restored {
-        Some(path) => format!(
-            "已关闭发布：已恢复备份并清理残留代理。请完全退出并重开 Kimi。\n备份：{path}"
-        ),
+        Some(path) => {
+            format!("已关闭发布：已恢复备份并清理残留代理。请完全退出并重开 Kimi。\n备份：{path}")
+        }
         None => "已关闭发布：已清理 Spur 注入与残留代理。请完全退出并重开 Kimi。".into(),
     };
 
@@ -837,7 +834,10 @@ fn primary_network_services() -> Vec<String> {
             continue;
         }
         // Prefer common active interfaces first
-        if line == "Wi-Fi" || line == "Ethernet" || line.contains("USB") || line.contains("Thunderbolt")
+        if line == "Wi-Fi"
+            || line == "Ethernet"
+            || line.contains("USB")
+            || line.contains("Thunderbolt")
         {
             services.push(line.to_string());
         }
@@ -980,15 +980,14 @@ async fn publish_discovered_models(
     // work and must not keep the import wizard spinning forever. Newly discovered
     // routes are disabled by default, so a delayed refresh cannot route traffic to
     // stale entries; enabling/publishing a model rebuilds the runtime again.
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        state.rebuild_runtime(),
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), state.rebuild_runtime()).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, provider_id = %provider.id, "runtime refresh after model discovery failed"),
-        Err(_) => tracing::warn!(provider_id = %provider.id, "runtime refresh after model discovery timed out"),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, provider_id = %provider.id, "runtime refresh after model discovery failed")
+        }
+        Err(_) => {
+            tracing::warn!(provider_id = %provider.id, "runtime refresh after model discovery timed out")
+        }
     }
     state
         .storage
@@ -1125,14 +1124,20 @@ async fn discover_provider_models(
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "Agent Identity 账号缺少 account_id".to_string())?
                 .to_string();
-            if agent_key.task_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            if agent_key
+                .task_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
                 let task_id = openai_agent_identity::register_agent_task(&agent_key)
                     .await
                     .map_err(|e| e.to_string())?;
                 agent_key.task_id = Some(task_id.clone());
                 secret.task_id = Some(task_id);
-                if let Ok(json) = providers::credential_secret_json(
-                    &credentials::CanonicalCredential {
+                if let Ok(json) =
+                    providers::credential_secret_json(&credentials::CanonicalCredential {
                         kind: credentials::CredentialKind::AgentIdentity,
                         state: credentials::CredentialState::Refreshable,
                         provider_id: provider_id.clone(),
@@ -1143,8 +1148,8 @@ async fn discover_provider_models(
                         fingerprint: String::new(),
                         refreshable: true,
                         secret: secret.clone(),
-                    },
-                ) {
+                    })
+                {
                     if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
                         if let Ok(envelope_json) = serde_json::to_string(&envelope) {
                             let _ = state
@@ -1161,10 +1166,9 @@ async fn discover_provider_models(
                 }
             }
             let task_id = agent_key.task_id.clone().unwrap_or_default();
-            let authorization = openai_agent_identity::authorization_header_for_agent_task(
-                &agent_key, &task_id,
-            )
-            .map_err(|e| e.to_string())?;
+            let authorization =
+                openai_agent_identity::authorization_header_for_agent_task(&agent_key, &task_id)
+                    .map_err(|e| e.to_string())?;
             (
                 providers::discover_official_models_with_authorization(&authorization, &account_id)
                     .await
@@ -1172,51 +1176,51 @@ async fn discover_provider_models(
                 "https://chatgpt.com/backend-api/codex".to_string(),
             )
         } else {
-        let access_token = secret
-            .access_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "OpenAI 官方账号缺少 access_token".to_string())?;
-        let account_id = openai_oauth::ensure_chatgpt_account_id(
-            access_token,
-            secret.id_token.as_deref(),
-            credential.account_id.as_deref(),
-        )
-        .await
-        .map_err(|error| format!("OpenAI 官方账号缺少 account_id：{error}"))?;
-        if credential.account_id.as_deref() != Some(account_id.as_str()) {
-            if let Ok(json) = serde_json::to_vec(&serde_json::json!({
-                "access_token": secret.access_token,
-                "refresh_token": secret.refresh_token,
-                "id_token": secret.id_token,
-                "session_token": secret.session_token,
-                "api_key": secret.api_key,
-                "agent_runtime_id": secret.agent_runtime_id,
-                "agent_private_key": secret.agent_private_key,
-                "task_id": secret.task_id,
-            })) {
-                if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
-                    if let Ok(envelope_json) = serde_json::to_string(&envelope) {
-                        let _ = state
-                            .storage
-                            .update_credential_secret(
-                                &credential.id,
-                                &envelope_json,
-                                None,
-                                Some(account_id.as_str()),
-                            )
-                            .await;
+            let access_token = secret
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "OpenAI 官方账号缺少 access_token".to_string())?;
+            let account_id = openai_oauth::ensure_chatgpt_account_id(
+                access_token,
+                secret.id_token.as_deref(),
+                credential.account_id.as_deref(),
+            )
+            .await
+            .map_err(|error| format!("OpenAI 官方账号缺少 account_id：{error}"))?;
+            if credential.account_id.as_deref() != Some(account_id.as_str()) {
+                if let Ok(json) = serde_json::to_vec(&serde_json::json!({
+                    "access_token": secret.access_token,
+                    "refresh_token": secret.refresh_token,
+                    "id_token": secret.id_token,
+                    "session_token": secret.session_token,
+                    "api_key": secret.api_key,
+                    "agent_runtime_id": secret.agent_runtime_id,
+                    "agent_private_key": secret.agent_private_key,
+                    "task_id": secret.task_id,
+                })) {
+                    if let Ok(envelope) = state.vault.encrypt(&credential.id, 1, json.as_slice()) {
+                        if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                            let _ = state
+                                .storage
+                                .update_credential_secret(
+                                    &credential.id,
+                                    &envelope_json,
+                                    None,
+                                    Some(account_id.as_str()),
+                                )
+                                .await;
+                        }
                     }
                 }
             }
-        }
-        (
-            providers::discover_official_models(access_token, &account_id)
-                .await
-                .map_err(|error| error.to_string())?,
-            "https://chatgpt.com/backend-api/codex".to_string(),
-        )
+            (
+                providers::discover_official_models(access_token, &account_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                "https://chatgpt.com/backend-api/codex".to_string(),
+            )
         }
     } else if official_xai {
         // Subscription OAuth: CLI chat proxy (not api.x.ai).
@@ -2131,11 +2135,12 @@ async fn set_model_enabled(
     list_model_routes(state).await
 }
 
+/// Insert credential; returns `Some(id)` when a new row was written.
 async fn insert_canonical_credential(
     state: &AppState,
     provider_id: &str,
     credential: credentials::CanonicalCredential,
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     let credential = credential.assign_provider(provider_id);
     let id = Uuid::new_v4().to_string();
     let plaintext = Zeroizing::new(
@@ -2163,26 +2168,46 @@ async fn insert_canonical_credential(
             .await
             .map_err(|error| error.to_string())?;
         let _ = state.storage.set_active_pool(provider_id, &pool_id).await;
+        return Ok(Some(id));
     }
-    Ok(inserted)
+    Ok(None)
+}
+
+/// Result of best-effort Agent Identity upgrade (Sub2API-style session→agent path).
+struct AgentUpgradeOutcome {
+    credential: credentials::CanonicalCredential,
+    /// Present when stored as access-only because agent/register failed.
+    access_only_reason: Option<String>,
 }
 
 /// Upgrade ChatGPT access/session credentials to durable Agent Identity when possible.
 /// Preserves access/refresh/id/session tokens so official 5h/7d quota can still be queried.
+///
+/// Soft-fallback keeps the access token for re-export / quota, but Codex inference
+/// requires Agent Identity (or real OAuth) — callers must not treat access-only as healthy.
 async fn maybe_upgrade_to_agent_identity(
     credential: credentials::CanonicalCredential,
-) -> Result<credentials::CanonicalCredential, String> {
+) -> Result<AgentUpgradeOutcome, String> {
     use credentials::CredentialKind;
     if credential.kind == CredentialKind::AgentIdentity {
-        return Ok(credential);
+        return Ok(AgentUpgradeOutcome {
+            credential,
+            access_only_reason: None,
+        });
     }
-    // Keep real OAuth (with refresh) as-is.
+    // Keep real OAuth (with refresh) as-is — Codex backend accepts these Bearer tokens.
     if credential.kind == CredentialKind::OAuth && credential.secret.has_refresh_token() {
-        return Ok(credential);
+        return Ok(AgentUpgradeOutcome {
+            credential,
+            access_only_reason: None,
+        });
     }
     // API keys stay API keys.
     if credential.kind == CredentialKind::ApiKey {
-        return Ok(credential);
+        return Ok(AgentUpgradeOutcome {
+            credential,
+            access_only_reason: None,
+        });
     }
     let Some(access) = credential
         .secret
@@ -2192,7 +2217,10 @@ async fn maybe_upgrade_to_agent_identity(
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
     else {
-        return Ok(credential);
+        return Ok(AgentUpgradeOutcome {
+            credential,
+            access_only_reason: Some("session 缺少 accessToken，无法注册 Agent Identity".into()),
+        });
     };
     let preserved = openai_agent_identity::PreservedUsageTokens {
         refresh_token: credential.secret.refresh_token.clone(),
@@ -2211,22 +2239,98 @@ async fn maybe_upgrade_to_agent_identity(
     {
         Ok(mut upgraded) => {
             upgraded.provider_id = credential.provider_id;
-            Ok(upgraded)
+            Ok(AgentUpgradeOutcome {
+                credential: upgraded,
+                access_only_reason: None,
+            })
         }
         Err(error) => {
             // Fall back to storing the original access-only credential.
+            // Codex backend rejects bare ChatGPT web accessTokens (401 Unauthorized);
+            // Sub2API requires agent/register for the same reason.
             tracing::warn!(%error, "agent identity upgrade failed; storing access credential");
-            Ok(credential)
+            let reason = format!(
+                "Agent Identity 注册失败：{error}。ChatGPT Web Session 的 accessToken 不能直接调用 Codex backend；请重试 session、导入已有 agent_identity JSON，或使用官方 OAuth。"
+            );
+            Ok(AgentUpgradeOutcome {
+                credential,
+                access_only_reason: Some(reason),
+            })
         }
     }
 }
 
+/// Apply post-import health/meta for a credential id.
+async fn finalize_imported_credential(
+    state: &AppState,
+    credential_id: &str,
+    credential: &credentials::CanonicalCredential,
+    access_only_reason: Option<&str>,
+) -> Result<(), String> {
+    use credentials::CredentialKind;
+    let kind = credential.kind.as_db_str();
+    let state_str = match credential.state {
+        credentials::CredentialState::Refreshable => "refreshable",
+        credentials::CredentialState::AccessOnly => "access_only",
+        credentials::CredentialState::Expired => "expired",
+        credentials::CredentialState::ReauthRequired => "reauth_required",
+        credentials::CredentialState::Disabled => "disabled",
+        credentials::CredentialState::Unknown => "unknown",
+    };
+    let refreshable = credential.kind == CredentialKind::AgentIdentity
+        || (credential.refreshable && credential.secret.has_refresh_token());
+    state
+        .storage
+        .update_credential_auth_meta(
+            credential_id,
+            kind,
+            state_str,
+            refreshable,
+            credential.email.as_deref(),
+            credential.label.as_deref(),
+            credential.expires_at,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if credential.kind == CredentialKind::AgentIdentity
+        || (credential.kind == CredentialKind::OAuth && credential.secret.has_refresh_token())
+        || credential.kind == CredentialKind::ApiKey
+    {
+        state
+            .storage
+            .heal_credential_after_import(credential_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    // Web session / access-only: keep visible but not selectable for Codex proxy.
+    let msg = access_only_reason.unwrap_or(
+        "ChatGPT Web Session 为 access-only：无法直连 Codex，需 Agent Identity 或官方 OAuth",
+    );
+    state
+        .storage
+        .mark_schedule_state(
+            credential_id,
+            scheduler::ScheduleState::AuthInvalid,
+            false,
+            Some(msg),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Merge usage tokens into an existing credential when account_id/email matches.
-/// Keeps agent_runtime_id / private_key when present so re-import repairs quota only.
+/// Re-import always retries Agent Identity upgrade when the row is still access-only
+/// (previous soft-fallback left auth_invalid and never recovered — root of stuck 401).
 async fn try_merge_usage_tokens_into_existing(
     state: &AppState,
     provider_id: &str,
     incoming: &credentials::CanonicalCredential,
+    access_only_reason: Option<&str>,
 ) -> Result<bool, String> {
     let account_id = incoming
         .account_id
@@ -2275,48 +2379,63 @@ async fn try_merge_usage_tokens_into_existing(
     changed |= take(&mut secret.refresh_token, &incoming.secret.refresh_token);
     changed |= take(&mut secret.id_token, &incoming.secret.id_token);
     changed |= take(&mut secret.session_token, &incoming.secret.session_token);
-    // Only fill agent fields if the existing row has none (do not rotate keys on re-import).
+    // Prefer incoming agent fields when existing row has none (do not rotate keys).
     if !secret.is_agent_identity() {
-        changed |= take(&mut secret.agent_runtime_id, &incoming.secret.agent_runtime_id);
-        changed |= take(&mut secret.agent_private_key, &incoming.secret.agent_private_key);
+        changed |= take(
+            &mut secret.agent_runtime_id,
+            &incoming.secret.agent_runtime_id,
+        );
+        changed |= take(
+            &mut secret.agent_private_key,
+            &incoming.secret.agent_private_key,
+        );
         changed |= take(&mut secret.task_id, &incoming.secret.task_id);
     }
 
-    if !changed && existing.account_id.as_deref() == account_id {
-        // Still count as handled so we do not insert a duplicate fingerprint-less row.
-        return Ok(true);
-    }
-
+    // Even if tokens look identical, re-import must re-apply meta/health (auth_invalid stuck).
     let next_account = account_id
         .map(ToOwned::to_owned)
         .or(existing.account_id.clone());
-    persist_credential_secret(
+    if changed || existing.account_id.as_deref() != account_id {
+        persist_credential_secret(
+            state,
+            &existing.id,
+            &secret,
+            incoming.expires_at.or(existing.expires_at),
+            next_account.as_deref(),
+        )
+        .await?;
+    } else {
+        // Tokens unchanged: still rewrite secret so expires/account stay current.
+        persist_credential_secret(
+            state,
+            &existing.id,
+            &secret,
+            incoming.expires_at.or(existing.expires_at),
+            next_account.as_deref(),
+        )
+        .await?;
+    }
+
+    // Build a view of the post-merge credential for finalize (kind/state from incoming).
+    let mut merged = incoming.clone();
+    merged.secret = secret;
+    if merged.secret.is_agent_identity() {
+        merged.kind = credentials::CredentialKind::AgentIdentity;
+        merged.state = credentials::CredentialState::Refreshable;
+        merged.refreshable = true;
+    }
+    finalize_imported_credential(
         state,
         &existing.id,
-        &secret,
-        incoming.expires_at.or(existing.expires_at),
-        next_account.as_deref(),
+        &merged,
+        if merged.secret.is_agent_identity() {
+            None
+        } else {
+            access_only_reason
+        },
     )
     .await?;
-    if let Some(label) = incoming
-        .label
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        // Only fill empty labels from import; never overwrite a user rename.
-        let _ = state
-            .storage
-            .fill_credential_label_if_empty(&existing.id, label)
-            .await;
-    }
-    // Mark agent_identity rows refreshable so UI no longer shows「仅访问」.
-    if secret.is_agent_identity() {
-        let _ = state
-            .storage
-            .set_credential_refreshable(&existing.id, true)
-            .await;
-    }
     Ok(true)
 }
 
@@ -2329,14 +2448,43 @@ async fn import_credentials_json(
     let credentials = credentials::parse_json_import(&input).map_err(|error| error.to_string())?;
     let mut any_changed = false;
     for credential in credentials {
+        // Upgrade first so merge can write Agent Identity into an access-only row.
+        let outcome = if credential.kind == credentials::CredentialKind::AgentIdentity
+            || credential.kind == credentials::CredentialKind::ApiKey
+            || (credential.kind == credentials::CredentialKind::OAuth
+                && credential.secret.has_refresh_token())
+        {
+            AgentUpgradeOutcome {
+                credential,
+                access_only_reason: None,
+            }
+        } else {
+            maybe_upgrade_to_agent_identity(credential).await?
+        };
         // Merge usage tokens into an existing same-account row first so re-import
         // repairs quota without registering a second Agent Identity.
-        if try_merge_usage_tokens_into_existing(&state, &provider_id, &credential).await? {
+        if try_merge_usage_tokens_into_existing(
+            &state,
+            &provider_id,
+            &outcome.credential,
+            outcome.access_only_reason.as_deref(),
+        )
+        .await?
+        {
             any_changed = true;
             continue;
         }
-        let credential = maybe_upgrade_to_agent_identity(credential).await?;
-        if insert_canonical_credential(&state, &provider_id, credential).await? {
+        if let Some(id) =
+            insert_canonical_credential(&state, &provider_id, outcome.credential.clone()).await?
+        {
+            let assigned = outcome.credential.clone().assign_provider(&provider_id);
+            finalize_imported_credential(
+                &state,
+                &id,
+                &assigned,
+                outcome.access_only_reason.as_deref(),
+            )
+            .await?;
             any_changed = true;
         }
     }
@@ -2359,16 +2507,16 @@ async fn import_credentials_json(
 
 /// Import a ChatGPT `/api/auth/session` dump.
 ///
-/// Same policy as account-JSON import (Sub2API-style access-only session is valid):
-/// best-effort Agent Identity upgrade; on `agent/register` failure keep access-only.
+/// Sub2API path: session accessToken → agent/register → Agent Identity.
+/// Soft-fallback keeps access-only for visibility, but marks it unhealthy for Codex
+/// (web accessToken alone gets `{"detail":"Unauthorized"}` from backend-api/codex).
 #[tauri::command]
 async fn import_session_json(
     state: State<'_, AppState>,
     provider_id: String,
     input: String,
 ) -> Result<Vec<CredentialSummary>, String> {
-    let session =
-        credentials::parse_session_import(&input).map_err(|error| error.to_string())?;
+    let session = credentials::parse_session_import(&input).map_err(|error| error.to_string())?;
     if session
         .secret
         .access_token
@@ -2379,8 +2527,17 @@ async fn import_session_json(
     {
         return Err("session 缺少 accessToken".to_string());
     }
-    // Repair existing agent_identity / oauth rows by account_id without re-registering.
-    if try_merge_usage_tokens_into_existing(&state, &provider_id, &session).await? {
+    // Always attempt Agent Identity first (including re-import of stuck access-only rows).
+    let outcome = maybe_upgrade_to_agent_identity(session).await?;
+    // Repair existing agent_identity / oauth / access-only rows by account_id.
+    if try_merge_usage_tokens_into_existing(
+        &state,
+        &provider_id,
+        &outcome.credential,
+        outcome.access_only_reason.as_deref(),
+    )
+    .await?
+    {
         state
             .storage
             .set_provider_entry_category(&provider_id, "json")
@@ -2393,11 +2550,17 @@ async fn import_session_json(
             .await;
         return list_credentials(state, Some(provider_id)).await;
     }
-    // Soft-fallback on agent registry errors (e.g. agent_registry_not_enabled).
-    // Hard-fail only for missing/expired tokens handled inside parse + upgrade helpers.
-    let credential = maybe_upgrade_to_agent_identity(session).await?;
-    let changed = insert_canonical_credential(&state, &provider_id, credential).await?;
-    if changed {
+    if let Some(id) =
+        insert_canonical_credential(&state, &provider_id, outcome.credential.clone()).await?
+    {
+        let assigned = outcome.credential.clone().assign_provider(&provider_id);
+        finalize_imported_credential(
+            &state,
+            &id,
+            &assigned,
+            outcome.access_only_reason.as_deref(),
+        )
+        .await?;
         state
             .storage
             .set_provider_entry_category(&provider_id, "json")
@@ -2411,7 +2574,6 @@ async fn import_session_json(
     }
     list_credentials(state, Some(provider_id)).await
 }
-
 
 #[tauri::command]
 async fn delete_credential(
@@ -2993,11 +3155,10 @@ mod ops_import {
             eprintln!("SPUR_DATA_DIR required with SPUR_IMPORT_JSON");
             return;
         };
-        let name = std::env::var("SPUR_PROVIDER_NAME")
-            .unwrap_or_else(|_| "OpenAI · Web Session".into());
+        let name =
+            std::env::var("SPUR_PROVIDER_NAME").unwrap_or_else(|_| "OpenAI · Web Session".into());
         let input = std::fs::read_to_string(&json_path).expect("read import json");
-        let credentials =
-            credentials::parse_json_import(&input).expect("parse import json");
+        let credentials = credentials::parse_json_import(&input).expect("parse import json");
         assert!(
             !credentials.is_empty(),
             "no credentials parsed from import file"

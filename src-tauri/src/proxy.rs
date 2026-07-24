@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use axum::{
@@ -19,6 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
     sync::{oneshot, Mutex},
+    time::sleep,
 };
 use uuid::Uuid;
 
@@ -32,8 +34,7 @@ use crate::{
     storage::{Lease, Storage, UsageDelta},
     upstream_errors::{
         body_is_usage_or_rate_limit, content_session_seed, is_failover_status_with_options,
-        now_unix,
-        resolve_rate_limit_cooldown, status_category,
+        now_unix, resolve_rate_limit_cooldown, status_category,
     },
     vault::SecretVault,
 };
@@ -284,6 +285,53 @@ async fn responses(
     }
 }
 
+/// Retry transient upstream failures with bounded exponential backoff.
+///
+/// Codex Desktop waits for the Responses stream to complete, so immediate
+/// ten-attempt failover turns a temporary 503 into a busy loop that looks like
+/// a hung `/compact`.  Respect a server-provided Retry-After delay; otherwise
+/// use a small jittered backoff and let cancellation drop this future.
+fn retry_delay(headers: &HeaderMap, attempt: usize) -> Duration {
+    if let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.clamp(1, 60));
+    }
+
+    // 500ms, 1s, 2s, 4s, 8s … plus at most 250ms jitter.  A bounded delay
+    // gives the upstream time to recover without making manual compaction
+    // appear permanently stuck.
+    let exponent = attempt.min(4) as u32;
+    let base_ms = 500u64.saturating_mul(1u64 << exponent);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(base_ms + u64::from(nanos % 251))
+}
+
+async fn wait_before_transient_retry(headers: &HeaderMap, failed_attempt: usize) {
+    sleep(retry_delay(headers, failed_attempt)).await;
+}
+
+fn upstream_retry_exhausted_response(
+    status: reqwest::StatusCode,
+    attempts: usize,
+    summary: &str,
+) -> Response {
+    let category = status_category(status);
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        "upstream_retry_exhausted",
+        &format!(
+            "Upstream failed after {attempts} attempts (HTTP {} / {category}): {summary}",
+            status.as_u16()
+        ),
+    )
+}
+
 async fn forward_responses_compatible(
     state: &ProxyState,
     target: &RouteTarget,
@@ -309,11 +357,7 @@ async fn forward_responses_compatible(
                 Some(auth)
             }
             Ok(None) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "no_upstream_credential",
-                    "No healthy upstream credential for this route; re-login the account in Codex Spur",
-                );
+                return no_healthy_upstream_response(state, &target.provider_id).await;
             }
             Err(response) => return response,
         };
@@ -336,13 +380,16 @@ async fn forward_responses_compatible(
                     attempt += 1;
                     if attempt < max_switches {
                         exclude.push(auth.credential_id);
+                        // Network errors have no response headers, but still need
+                        // a pause so a compact task does not spin on a broken path.
+                        wait_before_transient_retry(&HeaderMap::new(), attempt - 1).await;
                         continue;
                     }
                 }
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "upstream_transport_error",
-                    &format!("Upstream request failed: {error}"),
+                    &format!("Upstream transport failed after {attempt} attempts: {error}"),
                 );
             }
         };
@@ -405,24 +452,18 @@ async fn forward_responses_compatible(
             attempt += 1;
             if attempt < max_switches {
                 exclude.push(auth.credential_id);
+                // 5xx/529/429 are transient; wait before selecting again. The
+                // delay is cancellation-aware, honors Retry-After, and prevents
+                // the tight ten-request loop observed during `/compact`.
+                if status.is_server_error() || matches!(status.as_u16(), 429 | 529) {
+                    wait_before_transient_retry(&headers, attempt - 1).await;
+                }
                 continue;
             }
-            // Last attempt: surface upstream error body.
-            let mut builder = Response::builder()
-                .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
-            if let Some(ct) = headers
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-            {
-                builder = builder.header(header::CONTENT_TYPE, ct);
-            }
-            return builder.body(Body::from(body_bytes)).unwrap_or_else(|_| {
-                error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "proxy_response_error",
-                    "Failed to build proxy response",
-                )
-            });
+            // Do not forward an opaque upstream body after retry exhaustion.
+            // Desktop otherwise reports a misleading stream disconnect. Return
+            // a safe, actionable error that retains HTTP category and attempts.
+            return upstream_retry_exhausted_response(status, attempt, &summary);
         }
         if let Some(auth) = &auth {
             let category = if status.is_success() {
@@ -550,11 +591,7 @@ async fn forward_chat_compatible(
                 Some(auth)
             }
             Ok(None) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "no_upstream_credential",
-                    "No healthy upstream credential for this route; re-login the account in Codex Spur",
-                );
+                return no_healthy_upstream_response(state, &target.provider_id).await;
             }
             Err(response) => return response,
         };
@@ -739,8 +776,7 @@ async fn forward_chat_compatible(
         // Align with CC Switch `response_id_from_chat_id` + type-prefixed item ids.
         let response_id = response_id_from_chat_id(payload.get("id").and_then(Value::as_str));
         let usage = chat_usage_to_responses_usage(payload.get("usage"));
-        let output =
-            chat_parts_to_responses_output(&response_id, text, reasoning, &tool_calls);
+        let output = chat_parts_to_responses_output(&response_id, text, reasoning, &tool_calls);
         return Json(json!({
             "id": response_id,
             "object": "response",
@@ -980,10 +1016,7 @@ fn merge_chat_tool_call_deltas(
         return;
     };
     for tc in deltas {
-        let index = tc
-            .get("index")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         let entry = tool_by_index.entry(index).or_default();
         if let Some(id) = tc.get("id").and_then(Value::as_str) {
             if !id.is_empty() {
@@ -1176,7 +1209,15 @@ fn chat_text_to_responses_sse(
     reasoning: &str,
     raw_usage: Option<&Value>,
 ) -> String {
-    chat_parsed_to_responses_sse(response_id, model, created_at, text, reasoning, &[], raw_usage)
+    chat_parsed_to_responses_sse(
+        response_id,
+        model,
+        created_at,
+        text,
+        reasoning,
+        &[],
+        raw_usage,
+    )
 }
 
 fn chat_parsed_to_responses_sse(
@@ -1590,6 +1631,24 @@ async fn handle_upstream_failure(
     false
 }
 
+async fn no_healthy_upstream_response(state: &ProxyState, provider_id: &str) -> Response {
+    let detail = state
+        .storage
+        .latest_credential_error_for_provider(provider_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            "re-login the account in Codex Spur (Agent Identity / OAuth / API key)".into()
+        });
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "no_upstream_credential",
+        &format!("No healthy upstream credential for this route: {detail}"),
+    )
+}
+
 async fn upstream_auth(
     state: &ProxyState,
     target: &RouteTarget,
@@ -1726,10 +1785,9 @@ async fn decrypt_auth(
     if secret.api_key.is_none() {
         if let Some(refresh) = secret.refresh_token.clone() {
             let needs = match secret.access_token.as_deref() {
-                Some(access) => crate::openai_oauth::access_token_needs_refresh(
-                    access,
-                    credential.expires_at,
-                ),
+                Some(access) => {
+                    crate::openai_oauth::access_token_needs_refresh(access, credential.expires_at)
+                }
                 // Missing access token — must refresh when we still have refresh_token.
                 None => true,
             };
@@ -1750,17 +1808,20 @@ async fn decrypt_auth(
                     || target.base_url.contains("chatgpt.com")
                     || target.base_url.contains("openai.com")
                 {
-                    crate::openai_oauth::refresh_chatgpt_tokens(&refresh, secret.id_token.as_deref())
-                        .await
-                        .map(|t| {
-                            (
-                                t.access_token,
-                                t.refresh_token,
-                                t.id_token,
-                                t.account_id,
-                                t.expires_at,
-                            )
-                        })
+                    crate::openai_oauth::refresh_chatgpt_tokens(
+                        &refresh,
+                        secret.id_token.as_deref(),
+                    )
+                    .await
+                    .map(|t| {
+                        (
+                            t.access_token,
+                            t.refresh_token,
+                            t.id_token,
+                            t.account_id,
+                            t.expires_at,
+                        )
+                    })
                 } else {
                     // Unknown oauth upstream — do not call ChatGPT refresh by default.
                     Err("unsupported oauth refresh for this provider kind".into())
@@ -1838,7 +1899,13 @@ async fn decrypt_auth(
 
     // Agent Identity: register/sign a task and use AgentAssertion (no OAuth bearer).
     if let Some(mut agent_key) = crate::openai_agent_identity::agent_key_from_secret(&secret) {
-        if agent_key.task_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if agent_key
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             match crate::openai_agent_identity::register_agent_task(&agent_key).await {
                 Ok(task_id) => {
                     agent_key.task_id = Some(task_id.clone());
@@ -1855,19 +1922,18 @@ async fn decrypt_auth(
             }
         }
         let task_id = agent_key.task_id.clone().unwrap_or_default();
-        let authorization =
-            match crate::openai_agent_identity::authorization_header_for_agent_task(
-                &agent_key, &task_id,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    return Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "agent_assertion_failed",
-                        &error.to_string(),
-                    ));
-                }
-            };
+        let authorization = match crate::openai_agent_identity::authorization_header_for_agent_task(
+            &agent_key, &task_id,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "agent_assertion_failed",
+                    &error.to_string(),
+                ));
+            }
+        };
         if secret_dirty {
             if let Ok(json) = serde_json::to_vec(&serde_json::json!({
                 "access_token": secret.access_token,
@@ -1946,13 +2012,7 @@ async fn decrypt_auth(
     if refreshed_ok {
         let _ = state
             .storage
-            .mark_schedule_state(
-                &credential.id,
-                ScheduleState::Ready,
-                true,
-                None,
-                None,
-            )
+            .mark_schedule_state(&credential.id, ScheduleState::Ready, true, None, None)
             .await;
     }
 
@@ -2399,14 +2459,11 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
 /// - `additional_tools`: Responses Lite private carrier (xAI ModelInput fails)
 /// - **all** `reasoning` and `compaction` items: their encrypted state is not portable
 ///   across providers (official GPT → Grok fails with "Could not decrypt encrypted_content")
-/// - unknown history carriers with top-level `encrypted_content` (fail closed)
-/// - `item_reference` when `store` is not true (unresolvable on foreign hosts)
+/// - unknown history carriers are dropped via a portable allow-list (fail closed)
+/// - `item_reference` is never portable to a third-party host
 /// - If anything was dropped, strip `previous_response_id` so affinity does not chase
 ///   an OpenAI (or other foreign) response id on xAI/MiniMax/etc.
 fn sanitize_responses_input_for_upstream(request: &mut Value) {
-    let store_is_true = request.get("store").and_then(Value::as_bool) == Some(true);
-    let drop_item_references = !store_is_true;
-
     let mut dropped_any = false;
     let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
         return;
@@ -2414,31 +2471,37 @@ fn sanitize_responses_input_for_upstream(request: &mut Value) {
     let mut next = Vec::with_capacity(items.len());
     for item in items.drain(..) {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        // Third-party Responses implementations deserialize `input` through a
+        // closed enum (xAI calls it ModelInput). Keep only portable conversation
+        // carriers. This is deliberately an allow-list: a new Codex-only item
+        // must not make a remote `/compact` fail with an opaque 422.
+        let portable = matches!(
+            item_type,
+            "message" | "function_call" | "function_call_output"
+        ) || (item_type.is_empty() && item.get("role").is_some());
         match item_type {
-            "additional_tools" => {
-                dropped_any = true;
-            }
-            // Symmetric with sanitize_openai_responses_input: foreign encrypted
-            // reasoning/compaction cannot be decrypted by the current upstream
-            // (e.g. OpenAI gAAAAA… blobs on xAI → invalid-argument decrypt error).
-            "reasoning" | "compaction" => {
+            "additional_tools" | "reasoning" | "compaction" => {
                 dropped_any = true;
             }
             _ if item.get("encrypted_content").is_some() => {
-                // Future/unknown encrypted history carriers must fail closed.
                 dropped_any = true;
             }
-            "item_reference" if drop_item_references => {
+            "item_reference" => {
+                // References are scoped to the original upstream response store,
+                // not to the foreign provider selected for this turn.
                 dropped_any = true;
             }
-            _ => {
-                next.push(item);
+            _ if !portable => {
+                dropped_any = true;
             }
+            _ => next.push(item),
         }
     }
     if let Some(object) = request.as_object_mut() {
         object.insert("input".into(), Value::Array(next));
         if dropped_any {
+            // A response id can refer to the history we just rewrote. Retaining
+            // it makes remote compaction use an incompatible upstream state.
             object.remove("previous_response_id");
         }
     }
@@ -2843,9 +2906,10 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         "content": content,
                     });
                     if has_tools {
-                        msg.as_object_mut()
-                            .expect("assistant object")
-                            .insert("tool_calls".into(), Value::Array(std::mem::take(pending_tools)));
+                        msg.as_object_mut().expect("assistant object").insert(
+                            "tool_calls".into(),
+                            Value::Array(std::mem::take(pending_tools)),
+                        );
                     }
                     messages.push(msg);
                 };
@@ -2932,8 +2996,7 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         }));
                     }
                     _ => {
-                        let raw_role =
-                            item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let raw_role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                         let role = responses_role_to_chat_role(raw_role);
                         let text = if let Some(content) = item.get("content") {
                             content_text(content)
@@ -3226,7 +3289,6 @@ async fn passthrough(
     }
 }
 
-
 /// Kimi Desktop agent-gw compatible entry (experimental).
 /// Maps model aliases (`spur-…`) → Spur route slugs via alias map, then reuses
 /// the Chat Completions upstream path. Binds only on the existing localhost proxy.
@@ -3275,7 +3337,11 @@ async fn kimi_coding_chat_completions_inner(
         .unwrap_or("")
         .to_string();
     if model.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "missing_model", "model is required");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing_model",
+            "model is required",
+        );
     }
     let route_slug = resolve_kimi_model_to_route(&model);
     let target = state.routes.read().await.get(&route_slug).cloned();
@@ -3349,11 +3415,7 @@ async fn forward_native_chat_completions(
                 Some(auth)
             }
             Ok(None) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "no_upstream_credential",
-                    "No healthy upstream credential for this route; re-login the account in Codex Spur",
-                );
+                return no_healthy_upstream_response(state, &target.provider_id).await;
             }
             Err(response) => return response,
         };
@@ -3431,9 +3493,9 @@ async fn forward_native_chat_completions(
         }
         let status_code =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let payload = upstream.json::<Value>().await.unwrap_or_else(|_| {
-            json!({"error":{"type":"upstream_error","message":"Upstream request failed"}})
-        });
+        let payload = upstream.json::<Value>().await.unwrap_or_else(
+            |_| json!({"error":{"type":"upstream_error","message":"Upstream request failed"}}),
+        );
         return (status_code, Json(payload)).into_response();
     }
     error_response(
@@ -3452,7 +3514,6 @@ async fn kimi_coding_health(State(state): State<ProxyState>) -> Response {
     }))
     .into_response()
 }
-
 
 fn error_response(status: StatusCode, kind: &str, message: &str) -> Response {
     (
@@ -3548,8 +3609,14 @@ pub async fn start_with_secret(
         .route("/v1/responses", post(responses))
         // Experimental Kimi Desktop agent-gw compatible surface (config injection path).
         .route("/coding/healthz", get(kimi_coding_health))
-        .route("/coding/v1/chat/completions", post(kimi_coding_chat_completions))
-        .route("/coding/v1/v1/chat/completions", post(kimi_coding_chat_completions_v1))
+        .route(
+            "/coding/v1/chat/completions",
+            post(kimi_coding_chat_completions),
+        )
+        .route(
+            "/coding/v1/v1/chat/completions",
+            post(kimi_coding_chat_completions_v1),
+        )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .with_state(state);
     let address: SocketAddr = listener.local_addr()?;
@@ -4016,7 +4083,9 @@ data: [DONE]
         // Tool-only turn: no empty assistant message required.
         // Reasoning should still appear before the tool call.
         let reasoning_pos = stream.find("\"type\":\"reasoning\"").expect("reasoning");
-        let fc_pos = stream.find("\"type\":\"function_call\"").expect("function_call");
+        let fc_pos = stream
+            .find("\"type\":\"function_call\"")
+            .expect("function_call");
         assert!(reasoning_pos < fc_pos);
     }
 
@@ -4130,10 +4199,7 @@ data: [DONE]
             "tool_Y58P6C3PYwSwKzXPpd1gMJ3g"
         );
         assert_eq!(messages[2]["role"], "tool");
-        assert_eq!(
-            messages[2]["tool_call_id"],
-            "tool_Y58P6C3PYwSwKzXPpd1gMJ3g"
-        );
+        assert_eq!(messages[2]["tool_call_id"], "tool_Y58P6C3PYwSwKzXPpd1gMJ3g");
         // No intervening assistant-only message between tool_calls and tool result.
         assert!(
             messages
@@ -4467,13 +4533,14 @@ data: [DONE]
             "item_reference must be dropped under store=false"
         );
         // Tool history + messages kept so Grok can continue the card-game work.
-        assert!(input.iter().any(|i| i.get("type") == Some(&json!("function_call"))));
+        assert!(input
+            .iter()
+            .any(|i| i.get("type") == Some(&json!("function_call"))));
         assert!(input
             .iter()
             .any(|i| i.get("type") == Some(&json!("function_call_output"))));
         assert!(input.iter().any(|i| {
-            i.get("type") == Some(&json!("message"))
-                && i.get("id") == Some(&json!("msg_continue"))
+            i.get("type") == Some(&json!("message")) && i.get("id") == Some(&json!("msg_continue"))
         }));
         assert!(
             body.get("previous_response_id").is_none(),
@@ -4486,6 +4553,65 @@ data: [DONE]
             "ciphertext must not appear in xAI request"
         );
         assert!(!serialized.contains("gAAAAA"));
+    }
+
+    #[test]
+    fn remote_compact_input_uses_portable_allow_list_and_strips_sticky_id() {
+        // Real compact calls carry a mix of recorded model state, a synthetic
+        // compaction item, tool trail, and Desktop-only carriers. xAI parses
+        // input as a closed ModelInput enum, so all unknown rows must go.
+        let mut body = json!({
+            "model": "grok-4.5",
+            "previous_response_id": "resp_from_another_provider",
+            "input": [
+                {"type":"message", "role":"user", "content":[{"type":"input_text","text":"summarize"}]},
+                {"type":"compaction", "encrypted_content":"gAAAAA-private"},
+                {"type":"reasoning", "encrypted_content":"foreign-cipher"},
+                {"type":"additional_tools", "tools":[]},
+                {"type":"item_reference", "id":"item_1"},
+                {"type":"future_codex_carrier", "payload":{"secret":"nope"}},
+                {"type":"function_call", "call_id":"call_1", "name":"exec_command", "arguments":"{}"},
+                {"type":"function_call_output", "call_id":"call_1", "output":"ok"}
+            ]
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            3,
+            "message plus tool-call trail must remain"
+        );
+        assert!(body.get("previous_response_id").is_none());
+        let serialized = body.to_string();
+        assert!(!serialized.contains("compaction"));
+        assert!(!serialized.contains("encrypted_content"));
+        assert!(!serialized.contains("future_codex_carrier"));
+        assert!(!serialized.contains("gAAAAA-private"));
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_and_is_bounded_without_it() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(retry_delay(&headers, 0), Duration::from_secs(7));
+        assert_eq!(retry_delay(&headers, 99), Duration::from_secs(7));
+
+        let no_headers = HeaderMap::new();
+        let first = retry_delay(&no_headers, 0);
+        let later = retry_delay(&no_headers, 99);
+        assert!(first >= Duration::from_millis(500));
+        assert!(first <= Duration::from_millis(750));
+        assert!(later >= Duration::from_secs(8));
+        assert!(later <= Duration::from_millis(8_250));
+    }
+
+    #[test]
+    fn exhausted_upstream_error_includes_status_category_and_attempts() {
+        let response = upstream_retry_exhausted_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            3,
+            "Service temporarily unavailable",
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]

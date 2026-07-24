@@ -80,7 +80,10 @@ pub fn validate_catalog(catalog: &ModelsResponse) -> Result<()> {
     let mut slugs = std::collections::HashSet::new();
     for (index, model) in catalog.models.iter().enumerate() {
         if model.slug.trim().is_empty() || model.slug.contains('/') {
-            bail!("catalog 第 {} 个模型 slug 无效（禁止空值或含 /）", index + 1);
+            bail!(
+                "catalog 第 {} 个模型 slug 无效（禁止空值或含 /）",
+                index + 1
+            );
         }
         if !slugs.insert(&model.slug) {
             bail!("catalog 存在重复 slug：{}", model.slug);
@@ -115,10 +118,16 @@ pub fn validate_catalog(catalog: &ModelsResponse) -> Result<()> {
             bail!("catalog 第 {} 个模型存在空 reasoning 描述", index + 1);
         }
         let Some(default) = model.default_reasoning_level else {
-            bail!("catalog 第 {} 个模型缺少 default_reasoning_level", index + 1);
+            bail!(
+                "catalog 第 {} 个模型缺少 default_reasoning_level",
+                index + 1
+            );
         };
         if !efforts.contains(&default) {
-            bail!("catalog 第 {} 个模型默认 reasoning 不在支持列表中", index + 1);
+            bail!(
+                "catalog 第 {} 个模型默认 reasoning 不在支持列表中",
+                index + 1
+            );
         }
 
         let value = serde_json::to_value(model)?;
@@ -175,11 +184,7 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
     let mut model = match serde_json::from_str::<RouteCatalogPayload>(&route.catalog_json) {
         Ok(payload) => payload.model,
         Err(_) => serde_json::from_str::<CatalogModel>(&route.catalog_json).map_err(|error| {
-            anyhow::anyhow!(
-                "模型路由 {} 的 catalog_json 无法解析：{}",
-                route.id,
-                error
-            )
+            anyhow::anyhow!("模型路由 {} 的 catalog_json 无法解析：{}", route.id, error)
         })?,
     };
     crate::providers::normalize_catalog_model_for_codex_with_kind(
@@ -264,16 +269,15 @@ pub fn build_from_routes(
         let enabled_index = enabled_index as i32;
         let model = match serde_json::from_str::<RouteCatalogPayload>(&route.catalog_json) {
             Ok(payload) => payload.model,
-            Err(payload_error) => {
-                serde_json::from_str::<CatalogModel>(&route.catalog_json).map_err(|model_error| {
+            Err(payload_error) => serde_json::from_str::<CatalogModel>(&route.catalog_json)
+                .map_err(|model_error| {
                     anyhow::anyhow!(
                         "模型路由 {} 的 catalog_json 无法解析：{}；{}",
                         route.id,
                         payload_error,
                         model_error
                     )
-                })?
-            }
+                })?,
         };
         {
             let mut model = model;
@@ -286,26 +290,24 @@ pub fn build_from_routes(
             );
             // Desktop power picker only lists gpt-5.6-terra/sol (CC Switch style). Prefer
             // those public slugs when unique; otherwise keep opaque spur-route-*.
-            let opaque = crate::providers::opaque_route_slug(
-                &route.provider_id,
-                &route.upstream_model,
-            );
+            let opaque =
+                crate::providers::opaque_route_slug(&route.provider_id, &route.upstream_model);
             let published = crate::providers::catalog_publish_slug(
                 &route.provider_id,
                 &route.upstream_model,
                 &mut claimed_public_slugs,
             );
-            let legacy = crate::providers::legacy_route_slug(
-                &route.provider_id,
-                &route.upstream_model,
-            );
+            let legacy =
+                crate::providers::legacy_route_slug(&route.provider_id, &route.upstream_model);
             let previous_slug = model.slug.clone();
             model.slug = published.clone();
             // Always publish "供应商 · 模型" — including OpenAI official subscription
             // and account-pool instances that previously lost their prefix for native
             // terra/sol/luna public slugs.
-            let label =
-                format_catalog_display_name(&route.provider_name, &catalog_model_label(route, &model));
+            let label = format_catalog_display_name(
+                &route.provider_name,
+                &catalog_model_label(route, &model),
+            );
             model.display_name = label.clone();
             model.description = Some(label);
             let base_url = if route.kind.eq_ignore_ascii_case("xai") {
@@ -409,7 +411,7 @@ pub fn placeholder_model(slug: String, display_name: String) -> CatalogModel {
         max_context_window: Some(128_000),
         auto_compact_token_limit: Some(115_200),
         comp_hash: None,
-        effective_context_window_percent: 95,
+        effective_context_window_percent: crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         experimental_supported_tools: Vec::new(),
         input_modalities: vec!["text".into()],
         supports_search_tool: false,
@@ -512,7 +514,10 @@ mod tests {
 
         // Kimi should sort before GPT for picker scanning.
         assert!(
-            catalog.models[0].display_name.to_ascii_lowercase().contains("kimi")
+            catalog.models[0]
+                .display_name
+                .to_ascii_lowercase()
+                .contains("kimi")
                 || !catalog.models[0]
                     .display_name
                     .to_ascii_lowercase()
@@ -520,7 +525,11 @@ mod tests {
         );
 
         for model in &catalog.models {
-            assert!(!model.slug.contains('/'), "slug must not contain /, got {}", model.slug);
+            assert!(
+                !model.slug.contains('/'),
+                "slug must not contain /, got {}",
+                model.slug
+            );
             let efforts: Vec<_> = model
                 .supported_reasoning_levels
                 .iter()
@@ -528,9 +537,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 efforts,
-                vec![
-                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
-                ]
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
             );
             assert!(targets.contains_key(&model.slug));
             // Custom-provider rows never advertise shell/apply_patch (CC Switch shape).
@@ -581,7 +588,9 @@ mod tests {
         );
         // Public luna slug + opaque alias both route.
         assert_eq!(
-            targets.get("gpt-5.6-luna").map(|t| t.upstream_model.as_str()),
+            targets
+                .get("gpt-5.6-luna")
+                .map(|t| t.upstream_model.as_str()),
             Some("gpt-5.6-luna")
         );
         let opaque_luna = opaque_route_slug("c99e00b6-b386-4980-af2c-8b4be927e34a", "gpt-5.6-luna");
@@ -680,7 +689,10 @@ mod tests {
         model
             .supported_reasoning_levels
             .retain(|level| level.effort != ReasoningEffort::Minimal);
-        let error = validate_catalog(&ModelsResponse { models: vec![model] }).unwrap_err();
+        let error = validate_catalog(&ModelsResponse {
+            models: vec![model],
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("minimal"));
     }
 
@@ -714,6 +726,10 @@ mod tests {
         assert!(payload.model.apply_patch_tool_type.is_none());
         assert!(payload.model.web_search_tool_type.is_none());
         assert_eq!(payload.model.shell_type, "shell_command");
+        assert_eq!(
+            payload.model.effective_context_window_percent,
+            crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT
+        );
     }
 
     #[test]
