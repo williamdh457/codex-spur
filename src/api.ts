@@ -476,3 +476,53 @@ export async function getCachedOpenAiQuota(credentialId: string): Promise<OpenAi
 export async function consumeOpenAiResetCredit(credentialId: string, idempotencyKey: string, confirmed: boolean): Promise<OpenAiQuotaSnapshot> {
   return invoke<OpenAiQuotaSnapshot>("consume_openai_reset_credit", { credentialId, idempotencyKey, confirmed });
 }
+
+export type AppUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  releaseName: string;
+  releaseUrl: string;
+  releaseNotes: string | null;
+  assetName: string | null;
+  assetUrl: string | null;
+  assetSize: number | null;
+  publishedAt: string | null;
+  platform: string;
+  architecture: string;
+};
+
+export type AppUpdateInstallResult = {
+  message: string;
+  installPath: string;
+  version: string;
+  willRelaunch: boolean;
+};
+
+export async function getAppVersion(): Promise<string> {
+  return isTauriRuntime() ? invoke<string>("get_app_version") : "0.0.0-browser";
+}
+
+export async function checkForAppUpdate(): Promise<AppUpdateInfo> {
+  if (!isTauriRuntime()) {
+    return {
+      currentVersion: "0.0.0-browser",
+      latestVersion: "0.0.0-browser",
+      updateAvailable: false,
+      releaseName: "浏览器预览",
+      releaseUrl: "https://github.com/williamdh457/codex-spur/releases",
+      releaseNotes: "浏览器预览无法检查 GitHub Release。",
+      assetName: null,
+      assetUrl: null,
+      assetSize: null,
+      publishedAt: null,
+      platform: "browser",
+      architecture: "unknown",
+    };
+  }
+  return invoke<AppUpdateInfo>("check_for_app_update");
+}
+
+export async function installAppUpdate(): Promise<AppUpdateInstallResult> {
+  return invoke<AppUpdateInstallResult>("install_app_update");
+}

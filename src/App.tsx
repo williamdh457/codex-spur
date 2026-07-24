@@ -5,6 +5,7 @@ import modelPickerShot from "./assets/codex-model-picker.png";
 import {
   applyCodexConfig,
   cancelOpenAiBrowserLogin,
+  checkForAppUpdate,
   disableKimiPublish,
   enableKimiPublish,
   cancelXaiDeviceLogin,
@@ -16,6 +17,7 @@ import {
   deleteProviderInstance,
   discoverProviderModels,
   getAppSnapshot,
+  getAppVersion,
   getCachedOpenAiQuota,
   getDiagnosticsMaxEvents,
   getPoolSchedulerConfig,
@@ -25,6 +27,7 @@ import {
   inspectOpenCodeGoCredential,
   importSessionJson,
   importProviderConfigJson,
+  installAppUpdate,
   kimiTargetStatus,
   listCredentials,
   listModelRoutes,
@@ -45,7 +48,12 @@ import {
   updatePoolMember,
   updatePoolSchedulerConfig,
 } from "./api";
-import type { BrowserLoginStart, DeviceLoginStart, OpenAiOAuthFinishedEvent } from "./api";
+import type {
+  AppUpdateInfo,
+  BrowserLoginStart,
+  DeviceLoginStart,
+  OpenAiOAuthFinishedEvent,
+} from "./api";
 import type {
   AppSnapshot,
   CredentialSummary,
@@ -2907,6 +2915,148 @@ function KimiPublishPanel() {
   );
 }
 
+function formatBytes(size: number | null | undefined): string {
+  if (size == null || size <= 0) return "未知大小";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function AppUpdatePanel() {
+  const [currentVersion, setCurrentVersion] = useState<string>("…");
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void getAppVersion().then((version) => {
+      if (active) setCurrentVersion(version);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const check = async () => {
+    setChecking(true);
+    setMessage(null);
+    try {
+      const info = await checkForAppUpdate();
+      setUpdateInfo(info);
+      setCurrentVersion(info.currentVersion);
+      if (info.updateAvailable) {
+        setMessage(`发现新版本 v${info.latestVersion}。`);
+      } else {
+        setMessage(`已是最新版本 v${info.currentVersion}。`);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const install = async () => {
+    if (!updateInfo?.updateAvailable) {
+      setMessage("请先检查更新。");
+      return;
+    }
+    if (!window.confirm(`将从 GitHub 下载并安装 v${updateInfo.latestVersion}，应用会自动重启。继续？`)) {
+      return;
+    }
+    setInstalling(true);
+    setMessage("正在下载并安装更新…");
+    try {
+      const result = await installAppUpdate();
+      setMessage(result.message);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+      setInstalling(false);
+    }
+  };
+
+  const openRelease = async () => {
+    const url =
+      updateInfo?.releaseUrl ?? "https://github.com/williamdh457/codex-spur/releases/latest";
+    try {
+      await openExternalUrl(url);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  return (
+    <section className="panel" aria-label="应用更新">
+      <div className="panel__header">
+        <div>
+          <h2>应用更新</h2>
+          <p>
+            当前版本 <strong>v{currentVersion}</strong>
+            {updateInfo ? ` · GitHub 最新 v${updateInfo.latestVersion}` : ""}
+            。从公开 Release 拉取 macOS DMG（未公证）。
+          </p>
+        </div>
+        <div className="toolbar__actions">
+          <button
+            type="button"
+            className="button button--secondary"
+            disabled={checking || installing}
+            onClick={() => void check()}
+          >
+            {checking ? "检查中…" : "检查更新"}
+          </button>
+          <button
+            type="button"
+            className="button button--primary"
+            disabled={installing || checking || !updateInfo?.updateAvailable}
+            onClick={() => void install()}
+          >
+            {installing ? "安装中…" : "一键更新"}
+          </button>
+        </div>
+      </div>
+      <div className="settings-body">
+        {updateInfo?.updateAvailable ? (
+          <div className="readiness-list" role="list">
+            <div className="readiness-item readiness-item--ok" role="listitem">
+              <span aria-hidden="true">↑</span>
+              <div>
+                <strong>
+                  {updateInfo.releaseName}
+                  {updateInfo.assetName ? ` · ${updateInfo.assetName}` : ""}
+                </strong>
+                <p>
+                  {formatBytes(updateInfo.assetSize)}
+                  {updateInfo.publishedAt ? ` · ${new Date(updateInfo.publishedAt).toLocaleString()}` : ""}
+                  {updateInfo.assetUrl ? "" : " · 无匹配安装包"}
+                </p>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {updateInfo?.releaseNotes ? (
+          <pre className="update-notes" tabIndex={0}>
+            {updateInfo.releaseNotes.slice(0, 1200)}
+            {updateInfo.releaseNotes.length > 1200 ? "…" : ""}
+          </pre>
+        ) : null}
+        <div className="settings-body--inline">
+          <button type="button" className="button button--ghost" onClick={() => void openRelease()}>
+            打开 GitHub Release
+          </button>
+          <span className="field__hint">
+            若 macOS 提示「已损坏」，多半是未公证 + 隔离属性，不是文件坏了；安装后可执行{" "}
+            <code>xattr -cr &quot;/Applications/Codex Spur.app&quot;</code>，或从源码构建。
+          </span>
+        </div>
+        {message ? <p className="inline-message">{message}</p> : null}
+      </div>
+    </section>
+  );
+}
+
 function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -3027,6 +3177,8 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
 
   return (
     <div className="page-stack">
+      <AppUpdatePanel />
+
       <section className="panel">
         <div className="panel__header">
           <div>
@@ -3523,7 +3675,7 @@ function SettingsPage({ providers }: { providers: ProviderSummary[] }) {
             <img className="about-panel__icon" src={brandIcon} alt="" width={56} height={56} />
             <div>
               <h2>About</h2>
-              <p>Codex Spur v0.1.0 · local-first</p>
+              <p>Codex Spur · local-first · 版本见上方「应用更新」</p>
             </div>
           </div>
         </div>
@@ -3586,6 +3738,7 @@ export default function App() {
   const [editProvider, setEditProvider] = useState<ProviderSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>("…");
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const toastIdRef = useRef(0);
 
@@ -3626,6 +3779,9 @@ export default function App() {
         setSnapshot(value);
         setLoading(false);
       }
+    });
+    void getAppVersion().then((version) => {
+      if (active) setAppVersion(version);
     });
     return () => {
       active = false;
@@ -3736,7 +3892,7 @@ export default function App() {
               <small>{snapshot.proxy.baseUrl ?? "未绑定"}</small>
             </span>
           </div>
-          <small className="version">v0.1.0 · local only</small>
+          <small className="version">v{appVersion} · local only</small>
         </div>
       </aside>
       <main className="workspace">

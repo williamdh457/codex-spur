@@ -4,6 +4,21 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-24
+
+### Features
+
+- **Settings → 应用更新 / one-click update**: check the latest GitHub Release and download the matching macOS DMG, replace the installed app, and relaunch. No Apple Developer ID / notarization required for the check itself; Gatekeeper workarounds still apply after install.
+
+### Fixed
+
+- Harden context compaction across catalog, proxy, storage, and provider paths (carry-forward from unreleased work on `main`).
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.6**.
+- GitHub Release notes include Gatekeeper “app is damaged” workarounds (`xattr -cr`) and build-from-source guidance.
+
 ## [0.1.5] - 2026-07-23
 
 ### Fixed

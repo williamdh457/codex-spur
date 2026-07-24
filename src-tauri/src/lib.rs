@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_update;
 pub mod catalog;
 pub mod codex_config;
 mod content_encoding;
@@ -1432,6 +1433,23 @@ async fn complete_openai_oauth_callback_url(
 #[tauri::command]
 async fn open_external_url(url: String) -> Result<(), String> {
     open_url_in_browser(&url)
+}
+
+#[tauri::command]
+fn get_app_version() -> String {
+    app_update::current_version()
+}
+
+#[tauri::command]
+async fn check_for_app_update() -> Result<app_update::AppUpdateInfo, String> {
+    app_update::check_for_app_update().await
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: AppHandle,
+) -> Result<app_update::AppUpdateInstallResult, String> {
+    app_update::install_app_update(app).await
 }
 
 async fn stop_openai_oauth_listener(state: &AppState) {
@@ -3099,6 +3117,9 @@ pub fn run() {
             cancel_xai_device_login,
             complete_xai_device_login,
             open_external_url,
+            get_app_version,
+            check_for_app_update,
+            install_app_update,
             set_active_pool,
             set_model_enabled,
             import_credentials_json,
