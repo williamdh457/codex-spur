@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     catalog::{RouteTarget, SharedCatalog, SharedRoutes},
+    compact_shim,
     content_encoding::{decode_request_body, get_content_encoding},
     credentials::SecretMaterial,
     domain::ProxyRequestEvent,
@@ -266,6 +267,14 @@ async fn responses(
     if let Some(object) = parsed.as_object_mut() {
         object.insert("model".into(), Value::String(target.upstream_model.clone()));
     }
+    // Non-native routes cannot mint OpenAI Compact V2 ciphertext. Run the current
+    // model as a summarizer and return a portable spur1: compaction item so
+    // Desktop does not fatal mid-thread. Official OpenAI keeps native compact.
+    if is_remote_compaction_request(&parsed)
+        && !compact_shim::uses_native_remote_compaction(&target.kind)
+    {
+        return local_compact_v2_shim(&state, &target, parsed, &affinity).await;
+    }
     if target.protocol.to_ascii_lowercase().contains("chat") {
         // Chat Completions conversion maps reasoning itself; do not pre-mutate
         // reasoning.effort into provider-internal tokens like "disabled"/"enabled".
@@ -283,6 +292,172 @@ async fn responses(
         }
         forward_responses_compatible(&state, &target, parsed, &affinity).await
     }
+}
+
+/// Local Remote Compaction V2 for non-OpenAI routes: summarize with the current
+/// model and return exactly one portable `spur1:` compaction item.
+async fn local_compact_v2_shim(
+    state: &ProxyState,
+    target: &RouteTarget,
+    request_body: Value,
+    affinity: &AffinityInputs,
+) -> Response {
+    let wants_stream = request_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let transcript = compact_shim::portable_transcript_for_compact(&request_body);
+    let user_prompt = compact_shim::build_compact_user_prompt(&transcript, None);
+
+    let auth = match upstream_auth(state, target, affinity, &[]).await {
+        Ok(Some(auth)) => auth,
+        Ok(None) => return no_healthy_upstream_response(state, &target.provider_id).await,
+        Err(response) => return response,
+    };
+
+    let summary = match summarize_for_local_compact(state, target, &auth, &user_prompt).await {
+        Ok(text) => text,
+        Err(message) => {
+            let _ = state.storage.release_lease(&auth.lease_id).await;
+            // Still return a valid Compact V2 shape so Desktop does not fatal;
+            // content is an honest degradation note.
+            let fallback = format!(
+                "(local compact summarizer failed: {message})\n\n{}",
+                compact_shim::OPAQUE_COMPACTION_NOTE
+            );
+            return respond_local_compact(target, &fallback, wants_stream);
+        }
+    };
+    let _ = state.storage.release_lease(&auth.lease_id).await;
+    let summary = if summary.trim().is_empty() {
+        compact_shim::OPAQUE_COMPACTION_NOTE.to_string()
+    } else {
+        summary
+    };
+    respond_local_compact(target, &summary, wants_stream)
+}
+
+fn respond_local_compact(target: &RouteTarget, summary: &str, wants_stream: bool) -> Response {
+    if wants_stream {
+        let sse = compact_shim::synthetic_compaction_sse(&target.upstream_model, summary);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(sse))
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "proxy_response_error",
+                    "Failed to build local compact SSE",
+                )
+            });
+    }
+    let body = compact_shim::synthetic_compaction_response(&target.upstream_model, summary);
+    Json(body).into_response()
+}
+
+async fn summarize_for_local_compact(
+    state: &ProxyState,
+    target: &RouteTarget,
+    auth: &UpstreamAuth,
+    user_prompt: &str,
+) -> Result<String, String> {
+    let use_chat = target.protocol.to_ascii_lowercase().contains("chat");
+    if use_chat {
+        let chat_body = json!({
+            "model": target.upstream_model,
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": user_prompt}
+            ]
+        });
+        let endpoint = endpoint(&target.base_url, &target.kind, "chat/completions");
+        let request = apply_upstream_headers(state.client.post(&endpoint).json(&chat_body), auth, target);
+        let response = request
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|error| format!("chat transport: {error}"))?;
+        let status = response.status();
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("chat json: {error}"))?;
+        if !status.is_success() {
+            let detail = payload
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("chat completions failed");
+            return Err(format!("HTTP {} {detail}", status.as_u16()));
+        }
+        let text = payload
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return Ok(text);
+    }
+
+    // Responses path: plain user message only — no tools, no live compaction carrier.
+    let responses_body = json!({
+        "model": target.upstream_model,
+        "store": false,
+        "stream": false,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": user_prompt}]
+        }]
+    });
+    let endpoint = endpoint(&target.base_url, &target.kind, "responses");
+    let request =
+        apply_upstream_headers(state.client.post(&endpoint).json(&responses_body), auth, target);
+    let response = request
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|error| format!("responses transport: {error}"))?;
+    let status = response.status();
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("responses json: {error}"))?;
+    if !status.is_success() {
+        let detail = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("responses failed");
+        return Err(format!("HTTP {} {detail}", status.as_u16()));
+    }
+    Ok(extract_responses_output_text(&payload))
+}
+
+fn extract_responses_output_text(payload: &Value) -> String {
+    let mut chunks = Vec::new();
+    if let Some(items) = payload.get("output").and_then(Value::as_array) {
+        for item in items {
+            let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if ty == "message" {
+                if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    for part in content {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                chunks.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if chunks.is_empty() {
+        if let Some(text) = payload.pointer("/output_text").and_then(Value::as_str) {
+            return text.trim().to_string();
+        }
+    }
+    chunks.join("\n").trim().to_string()
 }
 
 /// Retry transient upstream failures with bounded exponential backoff.
@@ -2325,7 +2500,29 @@ fn sanitize_openai_responses_input(request: &mut Value) {
                     // Live Remote Compaction V2 control carrier — must reach OpenAI.
                     next.push(item);
                 }
-                "reasoning" | "compaction" => {
+                "compaction" | "compaction_summary" | "context_compaction" => {
+                    // Portable spur1:/ocx1: → plain user message (OpenAI cannot
+                    // decrypt our envelope). Foreign gAAAAA… ciphertext → drop.
+                    let encrypted = item.get("encrypted_content").and_then(Value::as_str);
+                    if item_type == "context_compaction" && encrypted.is_none() {
+                        dropped_any = true;
+                        continue;
+                    }
+                    if let Some(enc) = encrypted {
+                        if compact_shim::decode_portable_compaction_summary(enc).is_some() {
+                            let text = compact_shim::compaction_item_to_text(Some(enc));
+                            next.push(json!({
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": text}]
+                            }));
+                            dropped_any = true;
+                            continue;
+                        }
+                    }
+                    dropped_any = true;
+                }
+                "reasoning" => {
                     // Provider-private encrypted state is never portable across
                     // Grok/DeepSeek/Kimi ↔ OpenAI.
                     dropped_any = true;
@@ -2490,18 +2687,34 @@ fn sanitize_responses_input_for_upstream(request: &mut Value) {
         // closed enum (xAI calls it ModelInput). Keep only portable conversation
         // carriers. This is deliberately an allow-list: a new Codex-only item
         // must not make a remote `/compact` fail with an opaque 422.
+        //
+        // Live compact is intercepted by local_compact_v2_shim for non-OpenAI
+        // kinds before this runs; if we still see a live carrier here (native
+        // path edge), keep it. Historical spur1:/ocx1: expand to messages.
         let portable = matches!(
             item_type,
             "message" | "function_call" | "function_call_output"
         ) || (item_type.is_empty() && item.get("role").is_some());
         match item_type {
             "compaction" if live_compaction == Some(index) => {
-                // This is the live Remote Compaction V2 control carrier, not
-                // replayed provider-private state. It must reach an upstream
-                // unchanged or the terminal response cannot contain a compact output.
                 next.push(item);
             }
-            "additional_tools" | "reasoning" | "compaction" => {
+            "compaction" | "compaction_summary" | "context_compaction" => {
+                let encrypted = item.get("encrypted_content").and_then(Value::as_str);
+                if item_type == "context_compaction" && encrypted.is_none() {
+                    dropped_any = true;
+                    continue;
+                }
+                // Portable envelopes → readable user text; foreign ciphertext → note.
+                let text = compact_shim::compaction_item_to_text(encrypted);
+                next.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }));
+                dropped_any = true;
+            }
+            "additional_tools" | "reasoning" => {
                 dropped_any = true;
             }
             _ if item.get("encrypted_content").is_some() => {
@@ -2958,6 +3171,26 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                 match item_type {
                     // Encrypted / foreign reasoning is not meaningful on Chat Completions.
                     "reasoning" | "web_search_call" | "item_reference" => continue,
+                    // Live compact is handled by local_compact_v2_shim before chat
+                    // conversion. Historical portable spur1:/ocx1: → user text;
+                    // foreign ciphertext → honest opaque note.
+                    "compaction" | "compaction_summary" | "context_compaction" => {
+                        flush_assistant_turn(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_assistant_text,
+                        );
+                        let encrypted = item.get("encrypted_content").and_then(Value::as_str);
+                        if item_type == "context_compaction" && encrypted.is_none() {
+                            continue;
+                        }
+                        // Skip empty live control carrier if it ever reaches here.
+                        if item_type == "compaction" && encrypted.is_none() {
+                            continue;
+                        }
+                        let text = compact_shim::compaction_item_to_text(encrypted);
+                        messages.push(json!({"role": "user", "content": text}));
+                    }
                     "custom_tool_call" | "custom_tool_call_output" => {
                         // Not mapped in v1; drop rather than poison history.
                         continue;
@@ -4721,8 +4954,8 @@ data: [DONE]
         let input = body["input"].as_array().unwrap();
         assert_eq!(
             input.len(),
-            4,
-            "message, tool trail, and live compaction carrier must remain: {input:?}"
+            5,
+            "message, opaque-compact note, tool trail, and live compaction carrier must remain: {input:?}"
         );
         assert_eq!(input.last().unwrap()["type"], "compaction");
         assert!(input.last().unwrap().get("encrypted_content").is_none());
@@ -4732,6 +4965,16 @@ data: [DONE]
         assert!(!serialized.contains("gAAAAA-historical"));
         assert!(!serialized.contains("foreign-cipher"));
         assert!(!serialized.contains("future_codex_carrier"));
+        // Historical foreign compact becomes a readable opaque note message.
+        assert!(
+            input.iter().any(|item| {
+                item.get("type") == Some(&json!("message"))
+                    && item
+                        .to_string()
+                        .contains("cannot read")
+            }),
+            "foreign compact should expand to opaque note: {input:?}"
+        );
     }
 
     #[test]
@@ -4769,6 +5012,28 @@ data: [DONE]
         let serialized = body.to_string();
         assert!(!serialized.contains("gAAAAA-old-compact"));
         assert!(!serialized.contains("foreign-cipher"));
+    }
+
+    #[test]
+    fn openai_path_expands_portable_spur1_compaction_to_message() {
+        let enc = crate::compact_shim::encode_spur_compaction_summary("portable checkpoint");
+        let mut body = json!({
+            "store": false,
+            "input": [
+                {"type":"message","role":"user","id":"msg_1","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"compaction","encrypted_content": enc},
+                {"type":"compaction"}
+            ]
+        });
+        sanitize_responses_request_for_upstream("openai", &mut body);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3, "{input:?}");
+        assert_eq!(input[1]["type"], "message");
+        assert!(input[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("portable checkpoint"));
+        assert_eq!(input[2]["type"], "compaction");
     }
 
     #[test]

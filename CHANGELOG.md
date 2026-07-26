@@ -4,6 +4,19 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-26
+
+### Fixed
+
+- **Custom / 中转站 enable no longer fail-closed on native Compact V2**: third-party Responses and Chat routes can be enabled without an upstream Compact V2 probe. Mid-thread compact is handled by a **local proxy shim** on the **current** model (no cross-vendor handoff / same-vendor matching).
+- **Local Remote Compaction V2 shim (`spur1:`)**: for non-OpenAI routes, compact turns summarize on the current model and return exactly one portable `{type:compaction, encrypted_content:"spur1:…"}` item so Codex Desktop does not fatal. Replay decodes `spur1:` (and `ocx1:` interop) into plain text; foreign OpenAI ciphertext becomes an honest opaque note (no fake decrypt).
+- **Models page enable switches**: WKWebView-safe `role="switch"` control so toggles are clickable again.
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.8**.
+- GitHub Release notes include Gatekeeper “app is damaged” workarounds (`xattr -cr`) and **build-from-source** guidance when the DMG is blocked.
+
 ## [0.1.7] - 2026-07-26
 
 ### Fixed

@@ -2303,7 +2303,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
     const nextEnabled = !route.enabled;
     setBusyId(route.id);
     setNotice(null);
-    // Optimistic flip so the control never looks dead while IPC / compact probe runs.
+    // Optimistic flip so the control never looks dead while IPC rebuilds runtime.
     setRoutes((current) =>
       current.map((item) => (item.id === route.id ? { ...item, enabled: nextEnabled } : item)),
     );
@@ -2316,7 +2316,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
         text: "已更新选择。若要让 Codex 右下角出现这些模型：请到概览点击「Review & Apply」，然后 Cmd+Q 完全退出 ChatGPT 再打开（关窗口不够）。",
       });
     } catch (caught) {
-      // Reconcile with backend (probe may have rolled the route back to disabled).
+      // Reconcile with backend if enable failed.
       try {
         setRoutes(await listModelRoutes());
       } catch {

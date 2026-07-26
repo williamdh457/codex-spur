@@ -3,6 +3,7 @@
 mod app_update;
 pub mod catalog;
 pub mod codex_config;
+mod compact_shim;
 mod content_encoding;
 mod credentials;
 mod domain;
@@ -2143,22 +2144,9 @@ async fn set_model_enabled(
         }
     }
     state.rebuild_runtime().await?;
-    if enabled {
-        if let Err(error) = probe_route_remote_compaction(&state, &route_id).await {
-            // Do not publish a third-party route that cannot satisfy Desktop's
-            // Remote Compaction V2 contract. Roll back before returning so it
-            // never reaches Review & Apply / the model picker.
-            state
-                .storage
-                .set_route_enabled(&route_id, false)
-                .await
-                .map_err(|rollback| {
-                    format!("{error}; failed to disable incompatible route: {rollback}")
-                })?;
-            state.rebuild_runtime().await?;
-            return Err(error);
-        }
-    }
+    // Remote Compaction V2 is handled by the proxy local shim for non-native
+    // routes (spur1: portable envelope). Do not fail-closed enable on upstream
+    // compact probes — mid-thread compact no longer requires native Compact V2.
     {
         let mut snapshot = state.snapshot.write().await;
         if snapshot.binding.state == "applied" {
@@ -2171,14 +2159,10 @@ async fn set_model_enabled(
     list_model_routes(state).await
 }
 
-/// True when this route must pass a Remote Compaction V2 probe before enable/apply.
-///
-/// Scope is intentionally narrow: the production failure class is **custom /
-/// OpenAI-compatible Responses gateways** that accept chat but do not implement
-/// Compact V2 (e.g. `api.zyzy111.xyz` + `gpt-5.6-sol`). Official OpenAI keeps
-/// native compact; Chat Completions cannot express the carrier; xAI is still
-/// allowed for chat and relies on runtime validation + clear local errors
-/// rather than blocking the entire model from the picker.
+/// Historical helper: enable/apply no longer fail-closed on native Compact V2.
+/// Non-native routes use the proxy local compact shim (`spur1:` envelope).
+/// Kept for diagnostics / optional future soft warnings only.
+#[allow(dead_code)]
 fn route_requires_remote_compaction_probe(route: &storage::StoredRoute) -> bool {
     if route.protocol.to_ascii_lowercase().contains("chat") {
         return false;
@@ -2190,7 +2174,6 @@ fn route_requires_remote_compaction_probe(route: &storage::StoredRoute) -> bool 
     ) {
         return false;
     }
-    // custom and any future unknown Responses kind.
     true
 }
 
@@ -2227,9 +2210,8 @@ fn redact_upstream_base(base_url: &str) -> String {
         .unwrap_or_else(|| "upstream".into())
 }
 
-/// Perform one bounded, local-proxy mediated Remote Compaction V2 probe before
-/// enabling or publishing a non-official Responses route. The proxy validates
-/// the terminal upstream response, so success proves exactly one compact item.
+/// Optional diagnostic probe (no longer gates enable/apply).
+#[allow(dead_code)]
 async fn probe_route_remote_compaction(state: &AppState, route_id: &str) -> Result<(), String> {
     let route = state
         .storage
@@ -2303,34 +2285,11 @@ async fn probe_route_remote_compaction(state: &AppState, route_id: &str) -> Resu
     ))
 }
 
-/// Probe every enabled third-party Responses route. On failure, disable the route
-/// so it cannot land in the Codex catalog. Returns human-readable warnings for
-/// the apply outcome (apply continues with remaining enabled routes).
-async fn probe_enabled_third_party_routes(state: &AppState) -> Result<Vec<String>, String> {
-    let routes = state
-        .storage
-        .list_routes(true)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut warnings = Vec::new();
-    let mut disabled_any = false;
-    for route in routes {
-        if !route_requires_remote_compaction_probe(&route) {
-            continue;
-        }
-        if let Err(error) = probe_route_remote_compaction(state, &route.id).await {
-            let _ = state.storage.set_route_enabled(&route.id, false).await;
-            disabled_any = true;
-            warnings.push(format!(
-                "已禁用「{}」：未通过 Remote Compaction V2 探测（{}）",
-                route.display_name, error
-            ));
-        }
-    }
-    if disabled_any {
-        state.rebuild_runtime().await?;
-    }
-    Ok(warnings)
+/// Apply no longer disables routes for missing native Compact V2; the proxy
+/// local shim covers non-native routes. Retained as a no-op hook so apply still
+/// has a stable place for future soft diagnostics.
+async fn probe_enabled_third_party_routes(_state: &AppState) -> Result<Vec<String>, String> {
+    Ok(Vec::new())
 }
 
 /// Insert credential; returns `Some(id)` when a new row was written.
