@@ -377,13 +377,74 @@ h2 { font-size: 14px; line-height: 20px; }
 .model-item--enabled { background: color-mix(in srgb, var(--selection) 40%, var(--surface)); }
 .model-row, .account-row { display: flex; align-items: center; min-height: 48px; gap: 10px; padding: 0 14px; }
 .model-row code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 9px; }
-.switch { position: relative; flex: 0 0 auto; width: 28px; height: 17px; }
-.switch input { position: absolute; opacity: 0; pointer-events: none; }
-.switch span { position: absolute; inset: 0; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-muted); transition: background-color 140ms ease-out, border-color 140ms ease-out; }
-.switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / .2); transition: transform 180ms cubic-bezier(.2,.75,.2,1); }
-.switch input:checked + span { border-color: var(--accent); background: var(--accent); }
-.switch input:checked + span::after { transform: translateX(11px); }
-.switch input:focus-visible + span { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+/* Whole-row hit target for model enable (sibling of the compact switch). */
+.model-row__select {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 8px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.model-row__select:disabled { opacity: 0.65; cursor: default; }
+.model-row__select:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 72%, white);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+/*
+ * Model enable control: real <button role="switch">, not a checkbox with
+ * pointer-events:none. WKWebView (Tauri) often swallows label→checkbox
+ * activation when the input cannot receive pointer events, which made every
+ * model toggle look dead.
+ */
+.switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 17px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.switch:disabled { opacity: 0.55; cursor: default; }
+.switch:focus-visible { outline: none; }
+.switch:focus-visible .switch__track {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.switch:active:not(:disabled) { transform: scale(0.96); }
+.switch__track {
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  pointer-events: none;
+  transition: background-color 140ms ease-out, border-color 140ms ease-out;
+}
+.switch__track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgb(0 0 0 / .2);
+  transition: transform 180ms cubic-bezier(.2,.75,.2,1);
+}
+.switch--on .switch__track { border-color: var(--accent); background: var(--accent); }
+.switch--on .switch__track::after { transform: translateX(11px); }
 .reasoning-card { margin: 0 14px 14px 52px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); animation: mapping-in 180ms cubic-bezier(.2,.75,.2,1); }
 .reasoning-card__header { display: flex; justify-content: space-between; align-items: center; padding: 9px 11px; border-bottom: 1px solid var(--border-subtle); }
 .reasoning-card__header strong { font-size: 10px; }

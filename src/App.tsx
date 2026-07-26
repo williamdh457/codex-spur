@@ -2283,7 +2283,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
 
   const reload = useCallback(async () => setRoutes(await listModelRoutes()), []);
   useEffect(() => {
@@ -2298,17 +2298,36 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
   );
 
   const toggle = async (route: ModelRouteSummary) => {
+    // Single-flight: set_model_enabled rebuilds runtime; concurrent toggles race.
+    if (busyId) return;
+    const nextEnabled = !route.enabled;
     setBusyId(route.id);
-    setError(null);
+    setNotice(null);
+    // Optimistic flip so the control never looks dead while IPC / compact probe runs.
+    setRoutes((current) =>
+      current.map((item) => (item.id === route.id ? { ...item, enabled: nextEnabled } : item)),
+    );
     try {
-      setRoutes(await setModelEnabled(route.id, !route.enabled));
+      setRoutes(await setModelEnabled(route.id, nextEnabled));
       await refreshSnapshot();
       // Enabling only updates Spur DB/proxy; Codex GUI needs Apply + cold start.
-      setError(
-        "已更新选择。若要让 Codex 右下角出现这些模型：请到概览点击「Review & Apply」，然后 Cmd+Q 完全退出 ChatGPT 再打开（关窗口不够）。",
-      );
+      setNotice({
+        tone: "ok",
+        text: "已更新选择。若要让 Codex 右下角出现这些模型：请到概览点击「Review & Apply」，然后 Cmd+Q 完全退出 ChatGPT 再打开（关窗口不够）。",
+      });
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      // Reconcile with backend (probe may have rolled the route back to disabled).
+      try {
+        setRoutes(await listModelRoutes());
+      } catch {
+        setRoutes((current) =>
+          current.map((item) => (item.id === route.id ? { ...item, enabled: route.enabled } : item)),
+        );
+      }
+      setNotice({
+        tone: "error",
+        text: caught instanceof Error ? caught.message : String(caught),
+      });
     } finally {
       setBusyId(null);
     }
@@ -2321,23 +2340,62 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
         <span className="toolbar-note">{routes.filter((route) => route.enabled).length} 已选择 / {routes.length} 已发现</span>
         <button type="button" className="button button--secondary" onClick={() => void reload()}>刷新列表</button>
       </section>
-      {error && <div className="inline-warning">{error}</div>}
+      {notice ? (
+        <div className={notice.tone === "ok" ? "inline-success" : "inline-warning"} role="status">
+          {busyId ? "正在更新模型选择…" : notice.text}
+        </div>
+      ) : busyId ? (
+        <div className="inline-success" role="status">正在更新模型选择…</div>
+      ) : null}
       <section className="panel">
         {filtered.length === 0 ? (
           <EmptyState title="还没有模型" body="先在概览添加供应商并保存拉取模型，再回来选择要发布到 Codex 的项。" action="等待添加供应商" />
         ) : (
           <div className="model-list">
-            {filtered.map((route) => (
-              <div className={`model-item ${route.enabled ? "model-item--enabled" : ""}`} key={route.id}>
-                <div className="model-row">
-                  <label className="switch"><input type="checkbox" checked={route.enabled} disabled={busyId === route.id} onChange={() => void toggle(route)} /><span /></label>
-                  <span className="data-row__main"><strong>{modelListLabel(route)}</strong><small><code>{route.id}</code> · {route.protocol}</small></span>
-                  <span className="badge badge--neutral">{route.providerName.trim() || route.providerId}</span>
-                  <button type="button" className="button button--ghost" aria-expanded={expanded === route.id} onClick={() => setExpanded(expanded === route.id ? null : route.id)}>推理映射</button>
+            {filtered.map((route) => {
+              const busy = busyId === route.id;
+              return (
+                <div className={`model-item ${route.enabled ? "model-item--enabled" : ""}`} key={route.id}>
+                  <div className="model-row">
+                    <button
+                      type="button"
+                      className={`switch${route.enabled ? " switch--on" : ""}`}
+                      role="switch"
+                      aria-checked={route.enabled}
+                      aria-label={`${route.enabled ? "取消选择" : "选择"} ${modelListLabel(route)}`}
+                      disabled={busyId !== null}
+                      onClick={() => void toggle(route)}
+                    >
+                      <span className="switch__track" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      className="model-row__select"
+                      disabled={busyId !== null}
+                      onClick={() => void toggle(route)}
+                    >
+                      <span className="data-row__main">
+                        <strong>{modelListLabel(route)}</strong>
+                        <small>
+                          <code>{route.id}</code> · {route.protocol}
+                          {busy ? " · 更新中…" : ""}
+                        </small>
+                      </span>
+                    </button>
+                    <span className="badge badge--neutral">{route.providerName.trim() || route.providerId}</span>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      aria-expanded={expanded === route.id}
+                      onClick={() => setExpanded(expanded === route.id ? null : route.id)}
+                    >
+                      推理映射
+                    </button>
+                  </div>
+                  {expanded === route.id && <ReasoningTable route={route} />}
                 </div>
-                {expanded === route.id && <ReasoningTable route={route} />}
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
