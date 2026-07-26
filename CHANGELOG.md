@@ -4,6 +4,19 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-26
+
+### Fixed
+
+- **Remote Compaction V2 compatibility gate**: enabling or publishing a third-party OpenAI-compatible Responses route now probes Compact V2 through the local proxy. Gateways that only accept chat (or return zero/multiple compaction outputs) are disabled with a clear error instead of hard-failing mid-thread in Codex Desktop.
+- **Live compaction carrier sanitization**: keep the trailing live `compaction` control item for both OpenAI and non-OpenAI Responses paths; drop historical encrypted compact/reasoning blocks and strip sticky `previous_response_id` after sanitization.
+- **Compact response validation**: successful remote-compact responses are buffered and checked for exactly one `compaction` output (JSON or SSE `response.completed`) before they reach Desktop.
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.7**.
+- GitHub Release notes include Gatekeeper “app is damaged” workarounds (`xattr -cr`) and **build-from-source** guidance when the DMG is blocked.
+
 ## [0.1.6] - 2026-07-24
 
 ### Features
