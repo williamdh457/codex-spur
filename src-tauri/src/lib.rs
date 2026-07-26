@@ -475,10 +475,14 @@ async fn apply_codex_config(state: State<'_, AppState>) -> Result<CodexApplyOutc
     drop(snapshot);
     // Rebuild catalog from DB so publish always heals stale route JSON.
     state.rebuild_runtime().await?;
+    // Third-party Responses routes that cannot compact must not land in the
+    // Codex picker (Desktop remote compact would hard-fail mid-thread).
+    let probe_warnings = probe_enabled_third_party_routes(&state).await?;
     let catalog = state.catalog.read().await.clone();
     let proxy = state.proxy.read().await;
-    let result = codex_config::apply(&base_url, &proxy.secret, &catalog)
+    let mut result = codex_config::apply(&base_url, &proxy.secret, &catalog)
         .map_err(|error| error.to_string())?;
+    result.warnings.extend(probe_warnings);
     // Fail closed: re-read live publish home; never toast success if still CC Switch.
     let live = codex_config::inspect_live_binding();
     if live.state != "applied" {
@@ -1446,9 +1450,7 @@ async fn check_for_app_update() -> Result<app_update::AppUpdateInfo, String> {
 }
 
 #[tauri::command]
-async fn install_app_update(
-    app: AppHandle,
-) -> Result<app_update::AppUpdateInstallResult, String> {
+async fn install_app_update(app: AppHandle) -> Result<app_update::AppUpdateInstallResult, String> {
     app_update::install_app_update(app).await
 }
 
@@ -2141,6 +2143,22 @@ async fn set_model_enabled(
         }
     }
     state.rebuild_runtime().await?;
+    if enabled {
+        if let Err(error) = probe_route_remote_compaction(&state, &route_id).await {
+            // Do not publish a third-party route that cannot satisfy Desktop's
+            // Remote Compaction V2 contract. Roll back before returning so it
+            // never reaches Review & Apply / the model picker.
+            state
+                .storage
+                .set_route_enabled(&route_id, false)
+                .await
+                .map_err(|rollback| {
+                    format!("{error}; failed to disable incompatible route: {rollback}")
+                })?;
+            state.rebuild_runtime().await?;
+            return Err(error);
+        }
+    }
     {
         let mut snapshot = state.snapshot.write().await;
         if snapshot.binding.state == "applied" {
@@ -2151,6 +2169,168 @@ async fn set_model_enabled(
         }
     }
     list_model_routes(state).await
+}
+
+/// True when this route must pass a Remote Compaction V2 probe before enable/apply.
+///
+/// Scope is intentionally narrow: the production failure class is **custom /
+/// OpenAI-compatible Responses gateways** that accept chat but do not implement
+/// Compact V2 (e.g. `api.zyzy111.xyz` + `gpt-5.6-sol`). Official OpenAI keeps
+/// native compact; Chat Completions cannot express the carrier; xAI is still
+/// allowed for chat and relies on runtime validation + clear local errors
+/// rather than blocking the entire model from the picker.
+fn route_requires_remote_compaction_probe(route: &storage::StoredRoute) -> bool {
+    if route.protocol.to_ascii_lowercase().contains("chat") {
+        return false;
+    }
+    let kind = route.kind.to_ascii_lowercase();
+    if matches!(
+        kind.as_str(),
+        "openai" | "xai" | "kimi" | "deepseek" | "opencode-go" | "minimax"
+    ) {
+        return false;
+    }
+    // custom and any future unknown Responses kind.
+    true
+}
+
+fn route_probe_model_key(route: &storage::StoredRoute) -> String {
+    // Prefer the published catalog slug Desktop will send; fall back to route id
+    // (also dual-keyed in the runtime map).
+    serde_json::from_str::<serde_json::Value>(&route.catalog_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/model/slug")
+                .and_then(|slug| slug.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    value
+                        .get("slug")
+                        .and_then(|slug| slug.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .filter(|slug| !slug.trim().is_empty())
+        .unwrap_or_else(|| route.id.clone())
+}
+
+fn redact_upstream_base(base_url: &str) -> String {
+    // Keep host only — no credentials or full path dump in UI errors.
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|parsed| {
+            let host = parsed.host_str()?.to_string();
+            let scheme = parsed.scheme();
+            Some(format!("{scheme}://{host}"))
+        })
+        .unwrap_or_else(|| "upstream".into())
+}
+
+/// Perform one bounded, local-proxy mediated Remote Compaction V2 probe before
+/// enabling or publishing a non-official Responses route. The proxy validates
+/// the terminal upstream response, so success proves exactly one compact item.
+async fn probe_route_remote_compaction(state: &AppState, route_id: &str) -> Result<(), String> {
+    let route = state
+        .storage
+        .list_routes(false)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|route| route.id == route_id)
+        .ok_or_else(|| "模型路由不存在".to_string())?;
+    if !route_requires_remote_compaction_probe(&route) {
+        return Ok(());
+    }
+    let redacted_base = redact_upstream_base(&route.base_url);
+    let model_key = route_probe_model_key(&route);
+    let (base_url, secret) = {
+        let snapshot = state.snapshot.read().await;
+        let base_url = snapshot
+            .proxy
+            .base_url
+            .clone()
+            .ok_or_else(|| "本地代理未运行，无法验证 compact 兼容性".to_string())?;
+        drop(snapshot);
+        let proxy = state.proxy.read().await;
+        (base_url, proxy.secret.to_string())
+    };
+    // Probe uses a tight client deadline only. Production Desktop compact is not
+    // subject to this budget (long threads routinely take 30–60s+).
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/responses"))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {secret}"))
+        .json(&serde_json::json!({
+            "model": model_key,
+            "store": false,
+            "stream": false,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Remote compaction capability probe."}]
+                },
+                {"type": "compaction"}
+            ]
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Remote Compaction V2 探测失败（上游 {redacted_base}）：{error}"
+            )
+        })?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "upstream did not return a valid Remote Compaction V2 output".into());
+    Err(format!(
+        "模型未启用：{}（HTTP {}，上游 {}）。该上游不满足 Codex Remote Compaction V2（需恰好一个 compaction output）。请换用官方 OpenAI Responses 或兼容上游；chat 可用的网关也不应发布进 Codex 选择器。",
+        detail,
+        status.as_u16(),
+        redacted_base
+    ))
+}
+
+/// Probe every enabled third-party Responses route. On failure, disable the route
+/// so it cannot land in the Codex catalog. Returns human-readable warnings for
+/// the apply outcome (apply continues with remaining enabled routes).
+async fn probe_enabled_third_party_routes(state: &AppState) -> Result<Vec<String>, String> {
+    let routes = state
+        .storage
+        .list_routes(true)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut warnings = Vec::new();
+    let mut disabled_any = false;
+    for route in routes {
+        if !route_requires_remote_compaction_probe(&route) {
+            continue;
+        }
+        if let Err(error) = probe_route_remote_compaction(state, &route.id).await {
+            let _ = state.storage.set_route_enabled(&route.id, false).await;
+            disabled_any = true;
+            warnings.push(format!(
+                "已禁用「{}」：未通过 Remote Compaction V2 探测（{}）",
+                route.display_name, error
+            ));
+        }
+    }
+    if disabled_any {
+        state.rebuild_runtime().await?;
+    }
+    Ok(warnings)
 }
 
 /// Insert credential; returns `Some(id)` when a new row was written.

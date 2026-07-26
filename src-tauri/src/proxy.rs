@@ -361,6 +361,9 @@ async fn forward_responses_compatible(
             }
             Err(response) => return response,
         };
+        // Production Desktop compact of long threads commonly takes tens of
+        // seconds (observed ~48–53s). Do not hard-timeout send here; the probe
+        // path uses its own client-side deadline in `probe_route_remote_compaction`.
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
@@ -408,6 +411,7 @@ async fn forward_responses_compatible(
                     &state.storage,
                     &target.provider_id,
                     &target.upstream_model,
+                    is_remote_compaction_request(&request_body),
                 )
                 .await;
             };
@@ -550,6 +554,7 @@ async fn forward_responses_compatible(
             &state.storage,
             &target.provider_id,
             &target.upstream_model,
+            is_remote_compaction_request(&request_body),
         )
         .await;
     }
@@ -2252,10 +2257,12 @@ fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
 ///
 /// OpenAI kind (官方订阅 / JSON 多账号 / API Key) keeps Codex-native shapes,
 /// but still sanitizes Desktop history that was poisoned by Chat-bridge turns
-/// (bad message ids, foreign reasoning/`encrypted_content`, dead item refs).
+/// (bad message ids, foreign reasoning/`encrypted_content`, dead item refs)
+/// while preserving the live Remote Compaction V2 carrier.
 /// Non-OpenAI kinds share this pipeline: strip Codex-only tools/tool_choice,
-/// drop **all** reasoning (OpenAI ciphertext is not xAI-decryptable), and
-/// clamp fields so future subscriptions do not re-introduce 422s.
+/// drop **replayed** reasoning / historical compaction (OpenAI ciphertext is not
+/// xAI-decryptable), keep the live compact control carrier, and clamp fields so
+/// future subscriptions do not re-introduce 422s.
 fn sanitize_responses_request_for_upstream(kind: &str, request: &mut Value) {
     if keeps_codex_native_tools(kind) {
         sanitize_openai_responses_input(request);
@@ -2296,22 +2303,28 @@ fn rewrite_openai_message_item_id(item: &mut Value) {
 ///
 /// Layers:
 /// 1. Message ids must begin with `msg` (legacy Spur/CC Switch used `resp_…_msg`).
-/// 2. Drop **all** reasoning and compaction items (their encrypted state is
-///    provider-private and cannot be replayed across model families).
-/// 3. Drop unknown history carriers with top-level `encrypted_content` defensively.
+/// 2. Drop **replayed** reasoning and historical compaction items (encrypted
+///    state is provider-private). Preserve the live Remote Compaction V2 carrier.
+/// 3. Drop unknown history carriers with top-level `encrypted_content` defensively,
+///    except the live compaction control item itself.
 /// 4. When `store` is not `true`, drop `item_reference` (unresolvable offline).
 /// 5. If any input item was dropped, strip `previous_response_id` so OpenAI does
 ///    not chase a Spur-synthetic or already-invalid server id.
 fn sanitize_openai_responses_input(request: &mut Value) {
     let store_is_true = request.get("store").and_then(Value::as_bool) == Some(true);
     let drop_item_references = !store_is_true;
+    let live_compaction = live_compaction_index(request);
 
     let mut dropped_any = false;
     if let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) {
         let mut next = Vec::with_capacity(items.len());
-        for mut item in items.drain(..) {
+        for (index, mut item) in items.drain(..).enumerate() {
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
             match item_type {
+                "compaction" if live_compaction == Some(index) => {
+                    // Live Remote Compaction V2 control carrier — must reach OpenAI.
+                    next.push(item);
+                }
                 "reasoning" | "compaction" => {
                     // Provider-private encrypted state is never portable across
                     // Grok/DeepSeek/Kimi ↔ OpenAI.
@@ -2457,19 +2470,21 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
 /// Drop Codex-only / non-portable input carriers that third-party Responses hosts reject.
 ///
 /// - `additional_tools`: Responses Lite private carrier (xAI ModelInput fails)
-/// - **all** `reasoning` and `compaction` items: their encrypted state is not portable
+/// - replayed `reasoning` / `compaction` items: their encrypted state is not portable
 ///   across providers (official GPT → Grok fails with "Could not decrypt encrypted_content")
+/// - the final live Remote Compaction V2 carrier is preserved verbatim
 /// - unknown history carriers are dropped via a portable allow-list (fail closed)
 /// - `item_reference` is never portable to a third-party host
 /// - If anything was dropped, strip `previous_response_id` so affinity does not chase
 ///   an OpenAI (or other foreign) response id on xAI/MiniMax/etc.
 fn sanitize_responses_input_for_upstream(request: &mut Value) {
+    let live_compaction = live_compaction_index(request);
     let mut dropped_any = false;
     let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
     let mut next = Vec::with_capacity(items.len());
-    for item in items.drain(..) {
+    for (index, item) in items.drain(..).enumerate() {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         // Third-party Responses implementations deserialize `input` through a
         // closed enum (xAI calls it ModelInput). Keep only portable conversation
@@ -2480,6 +2495,12 @@ fn sanitize_responses_input_for_upstream(request: &mut Value) {
             "message" | "function_call" | "function_call_output"
         ) || (item_type.is_empty() && item.get("role").is_some());
         match item_type {
+            "compaction" if live_compaction == Some(index) => {
+                // This is the live Remote Compaction V2 control carrier, not
+                // replayed provider-private state. It must reach an upstream
+                // unchanged or the terminal response cannot contain a compact output.
+                next.push(item);
+            }
             "additional_tools" | "reasoning" | "compaction" => {
                 dropped_any = true;
             }
@@ -3144,12 +3165,94 @@ fn endpoint(base_url: &str, kind: &str, path: &str) -> String {
     }
 }
 
+/// True only for the current Remote Compaction V2 control request. Historical
+/// compaction rows can be present in replayed input, so the sanitizer preserves
+/// only the final carrier; Desktop appends the live control carrier last.
+fn live_compaction_index(request: &Value) -> Option<usize> {
+    request
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .rposition(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+        })
+}
+
+fn is_remote_compaction_request(request: &Value) -> bool {
+    live_compaction_index(request).is_some()
+}
+
+fn compaction_output_count(response: &Value) -> usize {
+    response
+        .pointer("/output")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn output_type_summary(response: &Value) -> String {
+    response
+        .pointer("/output")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "missing output".into())
+}
+
+/// Validate the terminal Responses payload. Both JSON and SSE Responses formats
+/// carry the authoritative output list in `response.completed`.
+fn validate_remote_compaction_response(bytes: &[u8], is_sse: bool) -> Result<(), String> {
+    let response = if is_sse {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| "Upstream returned non-UTF-8 SSE for remote compaction".to_string())?;
+        text.split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter_map(|event| event.get("response").cloned())
+            .last()
+            .ok_or_else(|| {
+                "Upstream remote compaction SSE ended without response.completed".to_string()
+            })?
+    } else {
+        serde_json::from_slice::<Value>(bytes)
+            .map_err(|_| "Upstream returned invalid JSON for remote compaction".to_string())?
+    };
+    let compactions = compaction_output_count(&response);
+    if compactions == 1 {
+        return Ok(());
+    }
+    let output_count = response
+        .pointer("/output")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    Err(format!(
+        "Upstream is incompatible with Codex Remote Compaction V2: expected exactly one compaction output item, got {compactions} from {output_count} output items ({}).",
+        output_type_summary(&response),
+    ))
+}
+
 async fn passthrough(
     response: reqwest::Response,
     metrics: &UsageMetrics,
     storage: &Storage,
     provider_id: &str,
     model_id: &str,
+    expects_compaction: bool,
 ) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -3162,7 +3265,45 @@ async fn passthrough(
         .as_deref()
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
 
-    // True streaming for Responses SSE: forward chunks as they arrive so Desktop
+    // Remote Compaction V2 has a strict output contract. Buffer only this rare
+    // control request so a third-party gateway cannot send a superficially-successful
+    // SSE stream that Desktop later rejects with an opaque "0 from N outputs" error.
+    // No short body timeout: real compact of long threads can take a minute+.
+    if expects_compaction && status.is_success() {
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_body_error",
+                    &format!("Failed to read upstream compaction response: {error}"),
+                )
+            }
+        };
+        if let Err(message) = validate_remote_compaction_response(&bytes, is_sse) {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "remote_compaction_incompatible",
+                &message,
+            );
+        }
+        let mut builder = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        if is_sse {
+            builder = builder.header(header::CACHE_CONTROL, "no-cache");
+        }
+        return builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_response_error",
+                "Failed to build validated compaction response",
+            )
+        });
+    }
+
+    // True streaming for normal Responses SSE: forward chunks as they arrive so Desktop
     // sees first token promptly (avoid buffering the whole upstream stream).
     if is_sse && status.is_success() {
         // Usage is approximate for live streams (full JSON parse only on buffered paths).
@@ -4557,35 +4698,101 @@ data: [DONE]
 
     #[test]
     fn remote_compact_input_uses_portable_allow_list_and_strips_sticky_id() {
-        // Real compact calls carry a mix of recorded model state, a synthetic
-        // compaction item, tool trail, and Desktop-only carriers. xAI parses
-        // input as a closed ModelInput enum, so all unknown rows must go.
+        // Real compact calls carry replayed private state, a tool trail, Desktop-only
+        // carriers, and a live Remote Compaction V2 carrier last. xAI parses input
+        // as a closed ModelInput enum, so all unknown rows must go — except the live
+        // control carrier Desktop appends at the end.
         let mut body = json!({
             "model": "grok-4.5",
             "previous_response_id": "resp_from_another_provider",
             "input": [
                 {"type":"message", "role":"user", "content":[{"type":"input_text","text":"summarize"}]},
-                {"type":"compaction", "encrypted_content":"gAAAAA-private"},
+                {"type":"compaction", "encrypted_content":"gAAAAA-historical"},
                 {"type":"reasoning", "encrypted_content":"foreign-cipher"},
                 {"type":"additional_tools", "tools":[]},
                 {"type":"item_reference", "id":"item_1"},
                 {"type":"future_codex_carrier", "payload":{"secret":"nope"}},
                 {"type":"function_call", "call_id":"call_1", "name":"exec_command", "arguments":"{}"},
-                {"type":"function_call_output", "call_id":"call_1", "output":"ok"}
+                {"type":"function_call_output", "call_id":"call_1", "output":"ok"},
+                {"type":"compaction"}
             ]
         });
         sanitize_responses_request_for_upstream("xai", &mut body);
+        let input = body["input"].as_array().unwrap();
         assert_eq!(
-            body["input"].as_array().unwrap().len(),
-            3,
-            "message plus tool-call trail must remain"
+            input.len(),
+            4,
+            "message, tool trail, and live compaction carrier must remain: {input:?}"
         );
+        assert_eq!(input.last().unwrap()["type"], "compaction");
+        assert!(input.last().unwrap().get("encrypted_content").is_none());
         assert!(body.get("previous_response_id").is_none());
         let serialized = body.to_string();
-        assert!(!serialized.contains("compaction"));
-        assert!(!serialized.contains("encrypted_content"));
+        assert!(serialized.contains("\"type\":\"compaction\""));
+        assert!(!serialized.contains("gAAAAA-historical"));
+        assert!(!serialized.contains("foreign-cipher"));
         assert!(!serialized.contains("future_codex_carrier"));
-        assert!(!serialized.contains("gAAAAA-private"));
+    }
+
+    #[test]
+    fn openai_path_preserves_live_compaction_and_drops_historical() {
+        let mut body = json!({
+            "store": false,
+            "previous_response_id": "resp_sticky",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_user1",
+                    "content": [{"type": "input_text", "text": "hi"}]
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": "gAAAAA-old-compact"
+                },
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "foreign-cipher"
+                },
+                {
+                    "type": "compaction"
+                }
+            ]
+        });
+        sanitize_responses_request_for_upstream("openai", &mut body);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2, "user message + live compaction only: {input:?}");
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "compaction");
+        assert!(input[1].get("encrypted_content").is_none());
+        assert!(body.get("previous_response_id").is_none());
+        let serialized = body.to_string();
+        assert!(!serialized.contains("gAAAAA-old-compact"));
+        assert!(!serialized.contains("foreign-cipher"));
+    }
+
+    #[test]
+    fn compaction_validator_accepts_exactly_one_json_output() {
+        let body = br#"{"output":[{"type":"compaction","id":"cmp_1"}]}"#;
+        assert!(validate_remote_compaction_response(body, false).is_ok());
+    }
+
+    #[test]
+    fn compaction_validator_rejects_zero_or_multiple_outputs() {
+        let none = br#"{"output":[{"type":"message"},{"type":"function_call"}]}"#;
+        let none_error = validate_remote_compaction_response(none, false).unwrap_err();
+        assert!(none_error.contains("got 0 from 2 output items (message, function_call)"));
+
+        let multiple = br#"{"output":[{"type":"compaction"},{"type":"compaction"}]}"#;
+        assert!(validate_remote_compaction_response(multiple, false)
+            .unwrap_err()
+            .contains("got 2 from 2 output items"));
+    }
+
+    #[test]
+    fn compaction_validator_reads_completed_sse_output() {
+        let body = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"compaction\"}]}}\n\n";
+        assert!(validate_remote_compaction_response(body, true).is_ok());
     }
 
     #[test]
