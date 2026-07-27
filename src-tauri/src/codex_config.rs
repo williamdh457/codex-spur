@@ -66,6 +66,11 @@ pub struct LiveBinding {
 /// Error text when Apply would publish custom models the Desktop GUI will hide.
 pub const DESKTOP_AUTH_REQUIRED_MSG: &str = "未检测到有效的 ChatGPT 官方登录（用户 Codex 目录下的 auth.json）。Desktop 会隐藏 Kimi/DeepSeek 等自定义模型，只显示官方 GPT-5.6。请先在 ChatGPT / Codex Desktop 登录官方账号（不是 Codex Spur 的 API Key / 浏览器 OAuth），再完全退出应用后重开，然后重新 Review & Apply。Spur 不会改写 auth.json。";
 
+/// Keep the custom provider visible through official ChatGPT auth while making
+/// Codex use its native local-compaction path. Codex enables opaque remote
+/// compaction solely when the provider display name is exactly `OpenAI`.
+pub const CODEX_SELECT_PROVIDER_NAME: &str = "Codex Spur";
+
 /// Top-level Codex config key that gates Desktop's hosted web_search tool.
 /// Aligns with CC Switch: some native `/responses` gateways hard-400 on that tool.
 pub const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -203,7 +208,7 @@ pub fn inspect_desktop_visibility(
     let gate_name_ok = select_table
         .and_then(|item| item.get("name"))
         .and_then(|item| item.as_str())
-        == Some("OpenAI");
+        == Some(CODEX_SELECT_PROVIDER_NAME);
     let gate_auth_ok = select_table
         .and_then(|item| item.get("requires_openai_auth"))
         .and_then(|item| item.as_bool())
@@ -228,9 +233,13 @@ pub fn inspect_desktop_visibility(
             format!("当前 model_provider = \"{provider}\"，尚未切换到 codex_select")
         }
     } else if !gate_name_ok || !gate_auth_ok {
-        "门控被改坏：需要 name = \"OpenAI\" 且 requires_openai_auth = true；请重新 Apply".into()
+        format!(
+            "门控被改坏：需要 name = \"{CODEX_SELECT_PROVIDER_NAME}\" 且 requires_openai_auth = true；请重新 Apply"
+        )
     } else {
-        "name = OpenAI + requires_openai_auth = true".into()
+        format!(
+            "name = {CODEX_SELECT_PROVIDER_NAME} + requires_openai_auth = true（官方 Local Compact）"
+        )
     };
     checks.push(DesktopVisibilityCheck {
         id: "provider_gate".into(),
@@ -487,12 +496,13 @@ pub fn preview(base_url: &str, catalog: &ModelsResponse) -> ApplyPreview {
 model_catalog_json = "{}"
 
 [model_providers.codex_select]
-name = "OpenAI"
+name = "{}"
 base_url = "{}"
 wire_api = "responses"
 requires_openai_auth = true
 supports_websockets = false"#,
         catalog_path.display(),
+        CODEX_SELECT_PROVIDER_NAME,
         base_url,
     );
     let mut warnings = Vec::new();
@@ -641,13 +651,12 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
         .as_table_mut()
         .context("model_providers 不是 TOML table")?;
     let mut select_provider = Table::new();
-    // Desktop model-picker gate (Nice Switch "preserve official login" pattern):
-    // ChatGPT.app hides non-official catalog rows (spur-route-*, nice-route-*, DeepSeek,
-    // Kimi, …) when the active provider does not present an OpenAI identity. Setting
-    // name="OpenAI" + requires_openai_auth=true lets Desktop load ~/.codex/auth.json
-    // for identity/gating only. Request auth still uses experimental_bearer_token
-    // against the local Spur proxy (base_url) — official tokens are never sent upstream.
-    select_provider["name"] = value("OpenAI");
+    // Keep official ChatGPT login for Desktop identity/catalog gating, but publish a
+    // non-OpenAI provider name. Codex's official `supports_remote_compaction()`
+    // checks the display name only: exactly `OpenAI` selects opaque remote compact;
+    // this name selects official local compact and leaves a portable plaintext summary.
+    // Request auth still uses experimental_bearer_token against the local Spur proxy.
+    select_provider["name"] = value(CODEX_SELECT_PROVIDER_NAME);
     select_provider["base_url"] = value(base_url);
     select_provider["wire_api"] = value("responses");
     select_provider["requires_openai_auth"] = value(true);
@@ -711,10 +720,10 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
             && select_table
                 .and_then(|item| item.get("name"))
                 .and_then(|item| item.as_str())
-                == Some("OpenAI");
+                == Some(CODEX_SELECT_PROVIDER_NAME);
         if !desktop_gate_ok {
             anyhow::bail!(
-                "应用后 codex_select 未设置 Desktop 门控字段（name=OpenAI, requires_openai_auth=true）；Kimi/DeepSeek 会被 GUI 隐藏"
+                "应用后 codex_select 未设置 Local Compact 门控字段（name={CODEX_SELECT_PROVIDER_NAME}, requires_openai_auth=true）"
             );
         }
 
@@ -1052,8 +1061,8 @@ mod tests {
         assert!(config_raw.contains("model_catalog_json = \"codex-select/model-catalog.json\""));
         assert!(config_raw.contains("[model_providers.codex_select]"));
         assert!(config_raw.contains("model = \"spur-route-k3deadbeef001\""));
-        // Desktop gate: OpenAI name + requires_openai_auth so custom models show in GUI.
-        assert!(config_raw.contains("name = \"OpenAI\""));
+        // Non-OpenAI display name selects Codex official local compact; auth gate stays enabled.
+        assert!(config_raw.contains("name = \"Codex Spur\""));
         assert!(config_raw.contains("requires_openai_auth = true"));
         assert!(config_raw.contains("experimental_bearer_token = \"test-token\""));
 
@@ -1113,6 +1122,14 @@ mod tests {
     }
 
     #[test]
+    fn codex_select_provider_name_keeps_official_local_compaction_enabled() {
+        // Codex's `ModelProviderInfo::supports_remote_compaction()` checks this
+        // exact display name. Reusing it would bring opaque encrypted compact back.
+        assert_ne!(CODEX_SELECT_PROVIDER_NAME, "OpenAI");
+        assert_eq!(CODEX_SELECT_PROVIDER_NAME, "Codex Spur");
+    }
+
+    #[test]
     fn apply_writes_snake_case_catalog_and_codex_select_provider() {
         let _guard = ENV_LOCK
             .lock()
@@ -1157,7 +1174,7 @@ mod tests {
         assert!(config_raw.contains("[model_providers.codex_select]"));
         assert!(config_raw.contains("model = \"spur-route-k3deadbeef001\""));
         assert!(config_raw.contains("experimental_bearer_token = \"test-token\""));
-        assert!(config_raw.contains("name = \"OpenAI\""));
+        assert!(config_raw.contains("name = \"Codex Spur\""));
         assert!(config_raw.contains("requires_openai_auth = true"));
         assert!(
             config_raw.contains("supports_websockets = false"),
