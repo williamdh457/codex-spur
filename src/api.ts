@@ -187,6 +187,30 @@ export async function createProviderInstance(kind: string, name?: string): Promi
   return invoke<ProviderSummary>("create_provider_instance", { kind, name: name ?? null });
 }
 
+export async function listReasoningProfileOptions(): Promise<import("./types").ReasoningProfileOption[]> {
+  if (!isTauriRuntime()) {
+    return [
+      { id: "openai_native", title: "OpenAI / Codex 原生", help: "官方/真 GPT 满档" },
+      { id: "openai_compat", title: "OpenAI 兼容（保守）", help: "low/medium/high" },
+      { id: "deepseek", title: "DeepSeek", help: "关 / high / max" },
+      { id: "kimi", title: "Kimi", help: "off/low/medium/high" },
+      { id: "xai", title: "xAI Grok", help: "low/medium/high" },
+      { id: "minimax", title: "MiniMax", help: "thinking 三态" },
+      { id: "glm", title: "智谱 GLM", help: "关 / high / max" },
+      { id: "qwen", title: "通义 Qwen", help: "enable_thinking" },
+      { id: "passthrough", title: "透传（不改写）", help: "风险自负" },
+    ];
+  }
+  return invoke("list_reasoning_profile_options");
+}
+
+export async function setProviderReasoningProfile(
+  providerId: string,
+  profileId: string,
+): Promise<import("./types").ProviderSummary> {
+  return invoke("set_provider_reasoning_profile", { providerId, profileId });
+}
+
 export type OpenCodeGoCredentialStatus = {
   found: boolean;
   pathLabel: string;

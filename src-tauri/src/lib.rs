@@ -16,6 +16,7 @@ mod openai_oauth;
 mod opencode_go;
 pub mod providers;
 mod proxy;
+mod reasoning_map;
 mod quota;
 mod scheduler;
 pub mod storage;
@@ -970,11 +971,19 @@ async fn publish_discovered_models(
     models: &[providers::DiscoveredProviderModel],
     normalized_base: &str,
 ) -> Result<Vec<ModelRouteSummary>, String> {
+    let profile = reasoning_map::ReasoningProfileId::parse(&provider.reasoning_profile_id)
+        .unwrap_or_else(|| reasoning_map::ReasoningProfileId::default_for_kind(&provider.kind));
     let records = models
         .iter()
         .map(|model| {
-            providers::route_catalog_json(&provider.id, &provider.kind, &provider.name, model)
-                .map(|catalog_json| (model.id.clone(), model.display_name.clone(), catalog_json))
+            providers::route_catalog_json_with_profile(
+                &provider.id,
+                &provider.kind,
+                &provider.name,
+                model,
+                profile,
+            )
+            .map(|catalog_json| (model.id.clone(), model.display_name.clone(), catalog_json))
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -1340,6 +1349,34 @@ async fn create_provider_instance(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "创建供应商后读取失败".to_string())
+}
+
+#[tauri::command]
+async fn list_reasoning_profile_options(
+) -> Result<Vec<reasoning_map::ReasoningProfileOption>, String> {
+    Ok(reasoning_map::list_reasoning_profile_options())
+}
+
+#[tauri::command]
+async fn set_provider_reasoning_profile(
+    state: State<'_, AppState>,
+    provider_id: String,
+    profile_id: String,
+) -> Result<ProviderSummary, String> {
+    state
+        .storage
+        .set_provider_reasoning_profile(&provider_id, &profile_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    // Re-heal route catalog_json so mapping cards + catalog levels match the new template.
+    let _ = state.storage.heal_all_route_catalogs().await;
+    state.rebuild_runtime().await.map_err(|e| e.to_string())?;
+    state
+        .storage
+        .get_provider(&provider_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "供应商不存在".to_string())
 }
 
 #[tauri::command]
@@ -3242,6 +3279,8 @@ pub fn run() {
             import_opencode_go_credential,
             import_provider_config_json,
             create_provider_instance,
+            list_reasoning_profile_options,
+            set_provider_reasoning_profile,
             delete_provider_instance,
             rename_provider_instance,
             rename_credential,

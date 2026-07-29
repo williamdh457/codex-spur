@@ -753,7 +753,8 @@ async fn forward_chat_compatible(
     // Codex Desktop talks Responses API; DeepSeek/Kimi expose Chat Completions only.
     // Naive passthrough of Responses `tools` (type/name/parameters, local_shell, …)
     // makes upstream reject with 400. Convert like Nice Switch's transform_codex_chat.
-    let chat_body = responses_to_chat_completions(&request_body, &target.upstream_model);
+    let chat_body =
+        responses_to_chat_completions(&request_body, &target.upstream_model, target);
     let endpoint = endpoint(&target.base_url, &target.kind, "chat/completions");
     let max_switches = state
         .storage
@@ -2306,18 +2307,12 @@ fn map_reasoning(target: &RouteTarget, request: &mut Value) {
     let Some(codex_effort) = request.pointer("/reasoning/effort").and_then(Value::as_str) else {
         return;
     };
-    // Use kind (openai/kimi/…), not instance provider_id (UUID).
-    let profile = providers::reasoning_profile(&target.kind, &target.upstream_model);
-    let upstream = profile
-        .mappings
-        .iter()
-        .find(|mapping| mapping.codex_effort.as_str() == codex_effort)
-        .map(|mapping| mapping.upstream_effort.clone());
-    if let Some(upstream) = upstream {
-        if let Some(reasoning) = request.get_mut("reasoning").and_then(Value::as_object_mut) {
-            reasoning.insert("effort".into(), Value::String(upstream));
-        }
-    }
+    let profile = crate::reasoning_map::ReasoningProfileId::parse(&target.reasoning_profile_id)
+        .unwrap_or_else(|| {
+            crate::reasoning_map::ReasoningProfileId::default_for_kind(&target.kind)
+        });
+    let patch = crate::reasoning_map::patch_for(profile, codex_effort);
+    crate::reasoning_map::apply_patch_to_responses_request(request, &patch);
 }
 
 /// Tool `type` values accepted by xAI's Responses API (from upstream 422 enum).
@@ -2975,7 +2970,11 @@ fn inject_stream_include_usage(chat: &mut Value) {
 }
 
 /// Convert a Codex Responses request into OpenAI Chat Completions for Kimi/DeepSeek.
-fn responses_to_chat_completions(request_body: &Value, upstream_model: &str) -> Value {
+fn responses_to_chat_completions(
+    request_body: &Value,
+    upstream_model: &str,
+    target: &RouteTarget,
+) -> Value {
     let mut messages = Vec::new();
     if let Some(instructions) = request_body.get("instructions") {
         let text = instruction_text(instructions);
@@ -3037,32 +3036,33 @@ fn responses_to_chat_completions(request_body: &Value, upstream_model: &str) -> 
         }
     }
 
-    // Only inject OpenAI-style reasoning_effort when the Codex effort is a legal
-    // Chat Completions enum. Never forward profile tokens like disabled/enabled/off.
+    // Map Codex reasoning effort through the provider's user-selected template.
     if let Some(effort) = request_body
         .pointer("/reasoning/effort")
         .and_then(Value::as_str)
     {
-        if let Some(mapped) = chat_reasoning_effort(effort) {
-            chat.as_object_mut()
-                .expect("chat object")
-                .insert("reasoning_effort".into(), Value::String(mapped.into()));
-        }
+        let profile = crate::reasoning_map::ReasoningProfileId::parse(&target.reasoning_profile_id)
+            .unwrap_or_else(|| {
+                crate::reasoning_map::ReasoningProfileId::default_for_kind(&target.kind)
+            });
+        let patch = crate::reasoning_map::patch_for(profile, effort);
+        crate::reasoning_map::apply_patch_to_chat_request(&mut chat, &patch);
     }
 
     chat
 }
 
-/// Map Codex ladder → Chat Completions `reasoning_effort` (DeepSeek/Kimi/OpenAI-compat).
-/// Returns None to omit the field (e.g. none/minimal → no thinking param).
-fn chat_reasoning_effort(codex_effort: &str) -> Option<&'static str> {
-    match codex_effort {
-        "none" | "minimal" | "disabled" | "off" => None,
-        "low" => Some("low"),
-        "medium" | "enabled" | "default" => Some("medium"),
-        "high" => Some("high"),
-        "xhigh" | "max" | "ultra" => Some("high"),
-        _ => None,
+#[cfg(test)]
+fn test_route_target(kind: &str) -> RouteTarget {
+    RouteTarget {
+        provider_id: "test".into(),
+        kind: kind.into(),
+        upstream_model: "model".into(),
+        base_url: "https://example.test/v1".into(),
+        protocol: "Chat Completions".into(),
+        reasoning_profile_id: crate::reasoning_map::ReasoningProfileId::default_for_kind(kind)
+            .as_str()
+            .into(),
     }
 }
 
@@ -4083,12 +4083,14 @@ mod tests {
 
     #[test]
     fn stream_chat_request_injects_include_usage() {
+        let target = test_route_target("deepseek");
         let chat = responses_to_chat_completions(
             &json!({
                 "input": "hi",
                 "stream": true
             }),
             "deepseek-v4-flash",
+            &target,
         );
         assert_eq!(chat["stream"], true);
         assert_eq!(chat["stream_options"]["include_usage"], true);
@@ -4096,6 +4098,7 @@ mod tests {
         let non_stream = responses_to_chat_completions(
             &json!({ "input": "hi", "stream": false }),
             "deepseek-v4-flash",
+            &target,
         );
         assert!(non_stream.get("stream_options").is_none());
     }
@@ -4637,6 +4640,7 @@ data: [DONE]
                 "stream": false
             }),
             "deepseek-v4-flash",
+            &test_route_target("deepseek"),
         );
         let roles: Vec<&str> = chat["messages"]
             .as_array()
@@ -5119,6 +5123,7 @@ data: [DONE]
                 "tool_choice": {"type": "namespace", "name": "codex"}
             }),
             "deepseek-chat",
+            &test_route_target("deepseek"),
         );
         assert!(chat.get("tools").is_none() || chat["tools"].as_array().unwrap().is_empty());
         assert!(chat.get("tool_choice").is_none());
@@ -5133,6 +5138,7 @@ data: [DONE]
                 "tools": sample_codex_tools()
             }),
             "kimi-for-coding",
+            &test_route_target("kimi"),
         );
         let tools = chat["tools"].as_array().expect("function tools kept");
         assert_eq!(tools.len(), 2);
@@ -5143,6 +5149,7 @@ data: [DONE]
 
     #[test]
     fn chat_conversion_omits_empty_tools_and_maps_input() {
+        let target = test_route_target("deepseek");
         let chat = responses_to_chat_completions(
             &json!({
                 "model": "ignored",
@@ -5153,6 +5160,7 @@ data: [DONE]
                 "reasoning": {"effort": "high"}
             }),
             "deepseek-v4-flash",
+            &target,
         );
         assert_eq!(chat["model"], "deepseek-v4-flash");
         assert_eq!(chat["messages"][0]["role"], "system");
@@ -5162,15 +5170,26 @@ data: [DONE]
             "unsupported tools must be dropped"
         );
         assert_eq!(chat["reasoning_effort"], "high");
+        assert_eq!(chat["thinking"]["type"], "enabled");
 
         let low = responses_to_chat_completions(
             &json!({"input": "hi", "reasoning": {"effort": "none"}}),
             "deepseek-v4-flash",
+            &target,
         );
         assert!(
             low.get("reasoning_effort").is_none(),
-            "none/minimal must not emit invalid reasoning_effort"
+            "none must not emit reasoning_effort"
         );
+        assert_eq!(low["thinking"]["type"], "disabled");
+
+        let xhigh = responses_to_chat_completions(
+            &json!({"input": "hi", "reasoning": {"effort": "xhigh"}}),
+            "deepseek-v4-flash",
+            &target,
+        );
+        assert_eq!(xhigh["reasoning_effort"], "max");
+        assert_ne!(xhigh["reasoning_effort"], "medium");
     }
 
     #[test]

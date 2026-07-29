@@ -39,6 +39,8 @@ pub struct StoredRoute {
     pub base_url: String,
     /// Provider entry channel (`official` / `api` / `json`); used for xAI base resolution.
     pub entry_category: Option<String>,
+    /// User-selected reasoning mapping template (see `reasoning_map::ReasoningProfileId`).
+    pub reasoning_profile_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -286,12 +288,19 @@ impl Storage {
                 .try_get::<Option<String>, _>("fixed_credential_id")
                 .unwrap_or(None),
             entry_category,
+            reasoning_profile_id: resolve_reasoning_profile_id(
+                &kind,
+                row.try_get::<Option<String>, _>("reasoning_profile_id")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
         }
     }
 
     pub async fn list_providers(&self) -> Result<Vec<ProviderSummary>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id, entry_category,
+            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id, entry_category, reasoning_profile_id,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id) AS credential_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
                 (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count,
@@ -310,7 +319,7 @@ impl Storage {
         provider_id: &str,
     ) -> Result<Option<ProviderSummary>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id, entry_category,
+            "SELECT id, kind, name, region, protocol, configured, selected_models, discovered_models, last_fetched_at, base_url, active_pool_id, routing_mode, fixed_credential_id, entry_category, reasoning_profile_id,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id) AS credential_count,
                 (SELECT COUNT(*) FROM credentials c WHERE c.provider_id = providers.id AND c.healthy = 1) AS healthy_credential_count,
                 (SELECT COUNT(*) FROM account_pools p WHERE p.provider_id = providers.id AND p.enabled = 1) AS pool_count,
@@ -360,14 +369,17 @@ impl Storage {
                 format!("{} {}", default_name, existing + 1)
             }
         };
+        let reasoning_profile_id =
+            crate::reasoning_map::ReasoningProfileId::default_for_kind(kind).as_str();
         sqlx::query(
-            "INSERT INTO providers (id, kind, name, region, protocol, configured) VALUES (?, ?, ?, ?, ?, 0)",
+            "INSERT INTO providers (id, kind, name, region, protocol, configured, reasoning_profile_id) VALUES (?, ?, ?, ?, ?, 0, ?)",
         )
         .bind(&id)
         .bind(kind)
         .bind(&display)
         .bind(region)
         .bind(protocol)
+        .bind(reasoning_profile_id)
         .execute(&self.pool)
         .await?;
         let pool_id = self.ensure_default_pool(&id).await?;
@@ -377,6 +389,27 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(id)
+    }
+
+    pub async fn set_provider_reasoning_profile(
+        &self,
+        provider_id: &str,
+        profile_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        let parsed = crate::reasoning_map::ReasoningProfileId::parse(profile_id).ok_or_else(
+            || sqlx::Error::Protocol(format!("未知推理映射模板：{profile_id}").into()),
+        )?;
+        let result = sqlx::query(
+            "UPDATE providers SET reasoning_profile_id = ? WHERE id = ?",
+        )
+        .bind(parsed.as_str())
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::Protocol("供应商不存在".into()));
+        }
+        Ok(())
     }
 
     pub async fn delete_provider_instance(&self, provider_id: &str) -> Result<(), sqlx::Error> {
@@ -460,25 +493,36 @@ impl Storage {
 
     pub async fn list_routes(&self, enabled_only: bool) -> Result<Vec<StoredRoute>, sqlx::Error> {
         let query = if enabled_only {
-            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
         } else {
-            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
         };
         let rows = sqlx::query(query).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
-            .map(|row| StoredRoute {
-                id: row.get("id"),
-                provider_id: row.get("provider_id"),
-                provider_name: row.get("provider_name"),
-                kind: row.get("kind"),
-                upstream_model: row.get("upstream_model"),
-                display_name: row.get("display_name"),
-                enabled: row.get::<i64, _>("enabled") != 0,
-                catalog_json: row.get("catalog_json"),
-                protocol: row.get("protocol"),
-                base_url: row.get("base_url"),
-                entry_category: row.try_get("entry_category").ok().flatten(),
+            .map(|row| {
+                let kind: String = row.get("kind");
+                let reasoning_profile_id = resolve_reasoning_profile_id(
+                    &kind,
+                    row.try_get::<Option<String>, _>("reasoning_profile_id")
+                        .ok()
+                        .flatten()
+                        .as_deref(),
+                );
+                StoredRoute {
+                    id: row.get("id"),
+                    provider_id: row.get("provider_id"),
+                    provider_name: row.get("provider_name"),
+                    kind,
+                    upstream_model: row.get("upstream_model"),
+                    display_name: row.get("display_name"),
+                    enabled: row.get::<i64, _>("enabled") != 0,
+                    catalog_json: row.get("catalog_json"),
+                    protocol: row.get("protocol"),
+                    base_url: row.get("base_url"),
+                    entry_category: row.try_get("entry_category").ok().flatten(),
+                    reasoning_profile_id,
+                }
             })
             .collect())
     }
@@ -2714,6 +2758,17 @@ impl Storage {
 
 pub fn route_id(provider_id: &str, upstream_model: &str) -> String {
     format!("{provider_id}/{}", slugify(upstream_model))
+}
+
+fn resolve_reasoning_profile_id(kind: &str, stored: Option<&str>) -> String {
+    if let Some(raw) = stored.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(parsed) = crate::reasoning_map::ReasoningProfileId::parse(raw) {
+            return parsed.as_str().to_string();
+        }
+    }
+    crate::reasoning_map::ReasoningProfileId::default_for_kind(kind)
+        .as_str()
+        .to_string()
 }
 
 fn slugify(value: &str) -> String {

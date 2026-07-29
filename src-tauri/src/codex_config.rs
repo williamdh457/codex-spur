@@ -634,7 +634,13 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
     };
 
     let selected_model = choose_selected_model(&document, catalog);
-    let selected_effort = selected_model
+    // Preserve an existing user-chosen effort when still legal for the selected model.
+    // Only fill default when the key is missing or no longer in the model's support list.
+    let existing_effort = document
+        .get("model_reasoning_effort")
+        .and_then(|item| item.as_str())
+        .map(str::to_string);
+    let catalog_default = selected_model
         .as_ref()
         .and_then(|slug| {
             catalog
@@ -644,6 +650,43 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
                 .and_then(|model| model.default_reasoning_level)
         })
         .unwrap_or(ReasoningEffort::Medium);
+    let supported_for_selected: Vec<ReasoningEffort> = selected_model
+        .as_ref()
+        .and_then(|slug| {
+            catalog
+                .models
+                .iter()
+                .find(|model| &model.slug == slug)
+                .map(|model| {
+                    model
+                        .supported_reasoning_levels
+                        .iter()
+                        .map(|level| level.effort)
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    let selected_effort = existing_effort
+        .as_deref()
+        .and_then(|raw| {
+            let effort = match raw {
+                "none" => Some(ReasoningEffort::None),
+                "minimal" => Some(ReasoningEffort::Minimal),
+                "low" => Some(ReasoningEffort::Low),
+                "medium" => Some(ReasoningEffort::Medium),
+                "high" => Some(ReasoningEffort::High),
+                "xhigh" => Some(ReasoningEffort::Xhigh),
+                "max" => Some(ReasoningEffort::Max),
+                "ultra" => Some(ReasoningEffort::Ultra),
+                _ => None,
+            }?;
+            if supported_for_selected.is_empty() || supported_for_selected.contains(&effort) {
+                Some(effort)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(catalog_default);
 
     // ChatGPT's GUI resolves model catalogs relative to CODEX_HOME, matching CC Switch.
     let catalog_path_str = "codex-select/model-catalog.json";

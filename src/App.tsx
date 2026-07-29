@@ -33,6 +33,7 @@ import {
   listModelRoutes,
   listPoolMembersDetailed,
   listProxyRequestEvents,
+  listReasoningProfileOptions,
   openExternalUrl,
   pollXaiDeviceLogin,
   previewCodexApply,
@@ -42,6 +43,7 @@ import {
   restorePreviousCodexConfig,
   setDiagnosticsMaxEvents,
   setModelEnabled,
+  setProviderReasoningProfile,
   setProviderRouting,
   startOpenAiBrowserLogin,
   startXaiDeviceLogin,
@@ -66,6 +68,7 @@ import type {
   ProviderSummary,
   ProxyRequestEvent,
   QuotaWindow,
+  ReasoningProfileOption,
   StatusTone,
 } from "./types";
 import { UsagePage } from "./usage";
@@ -328,7 +331,10 @@ function ProviderRow({ provider, onSelect }: { provider: ProviderSummary; onSele
       <span className="provider-mark" aria-hidden="true">{provider.name.slice(0, 1)}</span>
       <span className="data-row__main">
         <strong>{provider.name}</strong>
-        <small>{provider.kind} · {provider.region} · {provider.protocol}</small>
+        <small>
+          {provider.kind} · {provider.region} · {provider.protocol}
+          {provider.reasoningProfileId ? ` · 推理:${provider.reasoningProfileId}` : ""}
+        </small>
       </span>
       <span className="provider-row__badges">
         {entry && (
@@ -724,6 +730,8 @@ function AddProviderWizard({
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL.openai);
   const [apiKey, setApiKey] = useState("");
   const [openCodeGoStatus, setOpenCodeGoStatus] = useState<string | null>(null);
+  const [reasoningOptions, setReasoningOptions] = useState<ReasoningProfileOption[]>([]);
+  const [reasoningProfileId, setReasoningProfileId] = useState("openai_native");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   /** OpenAI official subscription — browser PKCE session (no secrets). */
@@ -738,6 +746,16 @@ function AddProviderWizard({
   const finishingLoginRef = useRef(false);
 
   useEscapeClose(onClose);
+
+  useEffect(() => {
+    let active = true;
+    void listReasoningProfileOptions().then((options) => {
+      if (active) setReasoningOptions(options);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -786,6 +804,17 @@ function AddProviderWizard({
     setMessage(null);
     setApiKey("");
     setOpenCodeGoStatus(null);
+    // Default template from kind; user can override (esp. custom / OpenCode Go).
+    const defaults: Record<string, string> = {
+      openai: "openai_native",
+      deepseek: "deepseek",
+      kimi: "kimi",
+      xai: "xai",
+      minimax: "minimax",
+      custom: "openai_native",
+      "opencode-go": "openai_native",
+    };
+    setReasoningProfileId(defaults[next.kind] ?? "openai_native");
     if (next.kind === "opencode-go") {
       void inspectOpenCodeGoCredential()
         .then((status) => setOpenCodeGoStatus(`${status.message}（${status.pathLabel}）`))
@@ -827,6 +856,11 @@ function AddProviderWizard({
     });
   };
 
+  const applyWizardReasoningProfile = async (providerId: string) => {
+    if (!reasoningProfileId) return;
+    await setProviderReasoningProfile(providerId, reasoningProfileId);
+  };
+
   const submitOpenCodeGoImport = async () => {
     setBusy(true);
     setMessage(null);
@@ -834,6 +868,7 @@ function AddProviderWizard({
     try {
       const created = await createProviderInstance("opencode-go", displayName.trim() || undefined);
       createdId = created.id;
+      await applyWizardReasoningProfile(created.id);
       await importOpenCodeGoCredential(created.id);
       const routes = await discoverProviderModels(created.id, DEFAULT_BASE_URL["opencode-go"], undefined);
       const count = routes.filter((route) => route.providerId === created.id).length;
@@ -857,6 +892,7 @@ function AddProviderWizard({
       }
       const created = await createProviderInstance(method.kind, displayName.trim() || undefined);
       createdId = created.id;
+      await applyWizardReasoningProfile(created.id);
       const routes = await discoverProviderModels(created.id, baseUrl, apiKey || undefined);
       const count = routes.filter((route) => route.providerId === created.id).length;
       finishCreate(created, count);
@@ -875,6 +911,7 @@ function AddProviderWizard({
     try {
       const created = await createProviderInstance(method.kind, displayName.trim() || undefined);
       createdId = created.id;
+      await applyWizardReasoningProfile(created.id);
       const routes = await importProviderConfigJson(created.id, await file.text());
       const count = routes.filter((route) => route.providerId === created.id).length;
       finishCreate(created, count);
@@ -900,6 +937,7 @@ function AddProviderWizard({
     try {
       const created = await createProviderInstance(method.kind, displayName.trim() || undefined);
       createdId = created.id;
+      await applyWizardReasoningProfile(created.id);
       const imported = asSession
         ? await importSessionJson(created.id, input)
         : await importCredentialsJson(created.id, input);
@@ -1126,6 +1164,24 @@ function AddProviderWizard({
                 onChange={(event) => setDisplayName(event.target.value)}
                 placeholder={`默认：${method.kind === "custom" ? "自定义供应商" : method.title.split(" · ")[0]} / 第 2 个起自动编号`}
               />
+            </label>
+            <label className="field">
+              <span>推理映射模板</span>
+              <select
+                value={reasoningProfileId}
+                onChange={(event) => setReasoningProfileId(event.target.value)}
+                disabled={busy}
+              >
+                {reasoningOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.title}
+                  </option>
+                ))}
+              </select>
+              <small className="field-help">
+                {reasoningOptions.find((o) => o.id === reasoningProfileId)?.help
+                  ?? "按真实上游厂商选择；custom 接 GPT 选 OpenAI 原生，接杂牌选兼容保守或对应厂商。"}
+              </small>
             </label>
 
             {method.mode === "oauth" && method.kind === "openai" && (
@@ -1491,9 +1547,23 @@ function EditProviderSheet({
   const [renamingCredentialId, setRenamingCredentialId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [renameBusy, setRenameBusy] = useState(false);
+  const [reasoningOptions, setReasoningOptions] = useState<ReasoningProfileOption[]>([]);
+  const [reasoningProfileId, setReasoningProfileId] = useState(
+    provider.reasoningProfileId || "openai_native",
+  );
   const deleteBusy = deletingCredentialId != null || deletingProvider;
 
   useEscapeClose(onClose, !confirm && !deleteBusy);
+
+  useEffect(() => {
+    let active = true;
+    void listReasoningProfileOptions().then((options) => {
+      if (active) setReasoningOptions(options);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setQuotaClockMs(Date.now()), 60_000);
@@ -1908,6 +1978,43 @@ function EditProviderSheet({
                 <span>显示名称</span>
                 <input value={name} onChange={(event) => setName(event.target.value)} onBlur={() => void saveName()} />
               </label>
+              <label className="field">
+                <span>推理映射模板</span>
+                <select
+                  value={reasoningProfileId}
+                  disabled={busy}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setReasoningProfileId(next);
+                    void (async () => {
+                      setBusy(true);
+                      setMessage(null);
+                      try {
+                        await setProviderReasoningProfile(provider.id, next);
+                        setMessage("已更新推理映射模板，并刷新 catalog 档位。");
+                        await onChanged();
+                      } catch (error) {
+                        setMessage(error instanceof Error ? error.message : String(error));
+                      } finally {
+                        setBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  {(reasoningOptions.length
+                    ? reasoningOptions
+                    : [{ id: reasoningProfileId, title: reasoningProfileId, help: "" }]
+                  ).map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.title}
+                    </option>
+                  ))}
+                </select>
+                <small className="field-help">
+                  {reasoningOptions.find((o) => o.id === reasoningProfileId)?.help
+                    ?? "决定 Codex 推理档如何改写到上游；custom / OpenCode Go 请按真实厂商选择。"}
+                </small>
+              </label>
             </section>
 
             <section className="modal-section" aria-label="连接">
@@ -2260,7 +2367,10 @@ function EditProviderSheet({
 function ReasoningTable({ route }: { route: ModelRouteSummary }) {
   return (
     <div className="reasoning-card">
-      <div className="reasoning-card__header"><strong>{route.reasoningProfile.title}</strong><small>完整八档映射</small></div>
+      <div className="reasoning-card__header">
+        <strong>{route.reasoningProfile.title}</strong>
+        <small>Codex 八档 → 上游（Catalog 只展示可区分子集）</small>
+      </div>
       <div className="mapping-grid" role="table" aria-label={`${route.displayName} 推理映射`}>
         {route.reasoningProfile.mappings.map((mapping) => (
           <div className="mapping-row" role="row" key={mapping.codexEffort}>

@@ -5,10 +5,7 @@ use reqwest::header::{HeaderMap, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::{
-    CatalogModel, ReasoningEffort, ReasoningEffortPreset, ReasoningMapping, ReasoningProfile,
-    TruncationPolicy,
-};
+use crate::domain::{CatalogModel, ReasoningEffort, ReasoningProfile, TruncationPolicy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProviderModel {
@@ -645,61 +642,23 @@ pub async fn discover_models(
     Ok(models)
 }
 
+/// Resolve the user-selected (or kind-default) reasoning template for a provider kind.
+pub fn reasoning_profile_id_for_kind(kind: &str) -> crate::reasoning_map::ReasoningProfileId {
+    crate::reasoning_map::ReasoningProfileId::default_for_kind(kind)
+}
+
+/// Build the eight-row mapping card for a provider template + model id.
 pub fn reasoning_profile(kind: &str, model_id: &str) -> ReasoningProfile {
-    let (title, upstream_levels): (&str, [&str; 8]) = match kind {
-        "deepseek" => (
-            "DeepSeek 两档推理映射",
-            [
-                "disabled", "disabled", "disabled", "enabled", "enabled", "enabled", "enabled",
-                "enabled",
-            ],
-        ),
-        "kimi" => (
-            "Kimi 多档推理映射",
-            [
-                "off", "low", "low", "medium", "high", "high", "high", "high",
-            ],
-        ),
-        "minimax" => (
-            "MiniMax 单档推理映射",
-            [
-                "default", "default", "default", "default", "default", "default", "default",
-                "default",
-            ],
-        ),
-        "xai" => (
-            // Grok 4.x exposes low/medium/high; higher Codex rungs clamp to high.
-            // none/minimal still map to low rather than inventing a disable switch.
-            "xAI Grok 三档推理映射",
-            [
-                "low", "low", "low", "medium", "high", "high", "high", "high",
-            ],
-        ),
-        _ => (
-            "OpenAI 兼容推理映射",
-            [
-                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-            ],
-        ),
-    };
-    let mappings = ReasoningEffort::ALL
-        .into_iter()
-        .zip(upstream_levels)
-        .map(|(codex_effort, upstream_effort)| ReasoningMapping {
-            codex_effort,
-            upstream_effort: upstream_effort.to_string(),
-            explanation: format!(
-                "Codex {} → {} {}",
-                codex_effort.as_str(),
-                kind,
-                upstream_effort
-            ),
-        })
-        .collect();
-    ReasoningProfile {
-        title: format!("{title} · {model_id}"),
-        mappings,
-    }
+    let profile = reasoning_profile_id_for_kind(kind);
+    crate::reasoning_map::reasoning_profile(profile, model_id)
+}
+
+/// Build mapping card from an explicit user-selected template id.
+pub fn reasoning_profile_for(
+    profile_id: crate::reasoning_map::ReasoningProfileId,
+    model_id: &str,
+) -> ReasoningProfile {
+    crate::reasoning_map::reasoning_profile(profile_id, model_id)
 }
 
 /// Codex GUI product copy for reasoning chips (aligned with CC Switch heal template).
@@ -715,6 +674,42 @@ pub fn codex_reasoning_level_description(effort: ReasoningEffort) -> &'static st
         ReasoningEffort::Xhigh => "Extra high reasoning depth for complex problems",
         ReasoningEffort::Max => "Maximum reasoning depth for the hardest problems",
         ReasoningEffort::Ultra => "Maximum reasoning with automatic task delegation",
+    }
+}
+
+/// Apply honest catalog reasoning levels for a user-selected template.
+/// For `openai_native`, prefer `models_cache` levels when `upstream_model`/`slug` is known.
+pub fn apply_reasoning_levels_for_profile(
+    model: &mut CatalogModel,
+    profile: crate::reasoning_map::ReasoningProfileId,
+    upstream_or_slug: Option<&str>,
+) {
+    use crate::reasoning_map::ReasoningProfileId;
+    let levels = match profile {
+        ReasoningProfileId::OpenaiNative | ReasoningProfileId::Passthrough => {
+            let slug = upstream_or_slug
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(model.slug.as_str()));
+            slug.and_then(crate::official_prompt_map::mapped_reasoning_levels_from_cache)
+                .unwrap_or_else(|| crate::reasoning_map::catalog_reasoning_levels(profile))
+        }
+        other => crate::reasoning_map::catalog_reasoning_levels(other),
+    };
+    model.supported_reasoning_levels = levels;
+    let default = crate::reasoning_map::default_reasoning_level(profile);
+    if model
+        .supported_reasoning_levels
+        .iter()
+        .any(|l| l.effort == default)
+    {
+        model.default_reasoning_level = Some(default);
+    } else {
+        model.default_reasoning_level = model
+            .supported_reasoning_levels
+            .first()
+            .map(|l| l.effort)
+            .or(Some(ReasoningEffort::Medium));
     }
 }
 
@@ -755,21 +750,22 @@ pub fn normalize_catalog_model_for_codex_with_kind(
     // postponing compaction after an app update.
     model.effective_context_window_percent =
         crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT;
-    // Product ladder (CC Switch heal): no minimal; max/ultra keep official English copy.
-    model.supported_reasoning_levels = ReasoningEffort::ALL
-        .into_iter()
-        .map(|effort| ReasoningEffortPreset {
-            effort,
-            description: codex_reasoning_level_description(effort).into(),
-        })
-        .collect();
+    // Honest catalog levels come from the provider's reasoning template (caller may
+    // override via `apply_reasoning_levels_for_profile` before/after this heal).
+    // Keep existing non-empty levels when already profile-shaped; otherwise default
+    // from kind so legacy rows still validate.
+    if model.supported_reasoning_levels.is_empty() {
+        let profile = reasoning_profile_id_for_kind(kind.unwrap_or("custom"));
+        apply_reasoning_levels_for_profile(model, profile, None);
+    }
     if model.default_reasoning_level.is_none()
-        || matches!(
-            model.default_reasoning_level,
-            Some(ReasoningEffort::Minimal)
-        )
+        || model
+            .default_reasoning_level
+            .is_some_and(|d| !model.supported_reasoning_levels.iter().any(|l| l.effort == d))
     {
-        model.default_reasoning_level = Some(ReasoningEffort::Medium);
+        let profile = reasoning_profile_id_for_kind(kind.unwrap_or("custom"));
+        model.default_reasoning_level =
+            Some(crate::reasoning_map::default_reasoning_level(profile));
     }
     // High-end efforts (max/ultra) need reasoning summaries enabled for full Codex chrome.
     model.supports_reasoning_summaries = true;
@@ -891,13 +887,22 @@ pub fn catalog_model(
     provider_label: &str,
     model: &DiscoveredProviderModel,
 ) -> CatalogModel {
-    let supported_reasoning_levels = ReasoningEffort::ALL
-        .into_iter()
-        .map(|effort| ReasoningEffortPreset {
-            effort,
-            description: codex_reasoning_level_description(effort).into(),
-        })
-        .collect();
+    catalog_model_with_profile(
+        provider_id,
+        kind,
+        provider_label,
+        model,
+        reasoning_profile_id_for_kind(kind),
+    )
+}
+
+pub fn catalog_model_with_profile(
+    provider_id: &str,
+    kind: &str,
+    provider_label: &str,
+    model: &DiscoveredProviderModel,
+    profile: crate::reasoning_map::ReasoningProfileId,
+) -> CatalogModel {
     // GPT-class models used with ChatGPT backend expect larger windows; others keep 128k default.
     let is_openai_family =
         kind == "openai" || model.id.contains("gpt-5") || model.id.contains("gpt-4");
@@ -927,8 +932,8 @@ pub fn catalog_model(
         slug,
         display_name: format!("{} · {}", provider_label, model.display_name),
         description: Some(format!("{} · {}", provider_label, model.display_name)),
-        default_reasoning_level: Some(ReasoningEffort::Medium),
-        supported_reasoning_levels,
+        default_reasoning_level: Some(crate::reasoning_map::default_reasoning_level(profile)),
+        supported_reasoning_levels: Vec::new(),
         shell_type: "shell_command".into(),
         visibility: "list".into(),
         supported_in_api: true,
@@ -972,12 +977,11 @@ pub fn catalog_model(
         tool_mode: None,
         multi_agent_version: None,
     };
-    // Keep reasoning_profile mapping independent; catalog already has product copy.
-    let _ = reasoning_profile(kind, &model.id);
     // Always pass kind so Kimi/DeepSeek rows are healed lean (no shell/apply_patch
     // ads that make ChatGPT Desktop show an empty model picker).
     // Maps base_instructions from model_instructions_file / models_cache.
     normalize_catalog_model_for_codex_with_kind(&mut catalog, 1000, Some(kind));
+    apply_reasoning_levels_for_profile(&mut catalog, profile, Some(&model.id));
     catalog
 }
 
@@ -987,9 +991,25 @@ pub fn route_catalog_json(
     provider_label: &str,
     model: &DiscoveredProviderModel,
 ) -> anyhow::Result<String> {
+    route_catalog_json_with_profile(
+        provider_id,
+        kind,
+        provider_label,
+        model,
+        reasoning_profile_id_for_kind(kind),
+    )
+}
+
+pub fn route_catalog_json_with_profile(
+    provider_id: &str,
+    kind: &str,
+    provider_label: &str,
+    model: &DiscoveredProviderModel,
+    profile: crate::reasoning_map::ReasoningProfileId,
+) -> anyhow::Result<String> {
     let payload = RouteCatalogPayload {
-        model: catalog_model(provider_id, kind, provider_label, model),
-        reasoning_profile: reasoning_profile(kind, &model.id),
+        model: catalog_model_with_profile(provider_id, kind, provider_label, model, profile),
+        reasoning_profile: reasoning_profile_for(profile, &model.id),
     };
     Ok(serde_json::to_string(&payload)?)
 }
@@ -1098,9 +1118,25 @@ mod tests {
             "opencode-go",
             "custom",
             "xai",
+            "openai",
         ] {
             assert_eq!(reasoning_profile(provider, "model").mappings.len(), 8);
         }
+    }
+
+    #[test]
+    fn deepseek_profile_maps_xhigh_display_to_max() {
+        let profile = reasoning_profile("deepseek", "deepseek-v4-flash");
+        let xhigh = profile
+            .mappings
+            .iter()
+            .find(|m| m.codex_effort == ReasoningEffort::Xhigh)
+            .expect("xhigh");
+        assert!(
+            xhigh.upstream_effort.contains("max"),
+            "expected max in {}",
+            xhigh.upstream_effort
+        );
     }
 
     #[test]
@@ -1125,7 +1161,18 @@ mod tests {
         assert!(models.iter().any(|m| m.id == "grok-4.5"));
         let profile = reasoning_profile("xai", "grok-4.5");
         assert_eq!(profile.mappings.len(), 8);
-        assert_eq!(profile.mappings[4].upstream_effort, "high");
+        let high = profile
+            .mappings
+            .iter()
+            .find(|m| m.codex_effort == ReasoningEffort::High)
+            .expect("high");
+        assert_eq!(high.upstream_effort, "high");
+        let xhigh = profile
+            .mappings
+            .iter()
+            .find(|m| m.codex_effort == ReasoningEffort::Xhigh)
+            .expect("xhigh");
+        assert_eq!(xhigh.upstream_effort, "high");
     }
 
     #[test]
@@ -1203,21 +1250,12 @@ mod tests {
             .get("supported_reasoning_levels")
             .and_then(|v| v.as_array())
             .expect("levels");
-        assert_eq!(levels.len(), 8);
+        // Kimi template advertises honest distinct rungs only (not a fake full 8).
         let efforts: Vec<&str> = levels
             .iter()
             .filter_map(|level| level.get("effort").and_then(|v| v.as_str()))
             .collect();
-        assert_eq!(
-            efforts,
-            vec!["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
-        );
-        let max_desc = levels
-            .iter()
-            .find(|level| level.get("effort").and_then(|v| v.as_str()) == Some("max"))
-            .and_then(|level| level.get("description").and_then(|v| v.as_str()))
-            .unwrap_or_default();
-        assert_eq!(max_desc, "Maximum reasoning depth for the hardest problems");
+        assert_eq!(efforts, vec!["none", "low", "medium", "high"]);
         assert_eq!(
             json.get("shell_type").and_then(|v| v.as_str()),
             Some("shell_command")

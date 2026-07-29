@@ -19,6 +19,8 @@ pub struct RouteTarget {
     pub upstream_model: String,
     pub base_url: String,
     pub protocol: String,
+    /// User-selected reasoning template id (`openai_native`, `deepseek`, …).
+    pub reasoning_profile_id: String,
 }
 
 pub type SharedCatalog = Arc<RwLock<ModelsResponse>>;
@@ -104,11 +106,23 @@ pub fn validate_catalog(catalog: &ModelsResponse) -> Result<()> {
             .iter()
             .map(|level| level.effort)
             .collect::<Vec<_>>();
-        if efforts != ReasoningEffort::ALL {
+        if efforts.is_empty() {
             bail!(
-                "catalog 第 {} 个模型 reasoning levels 必须按 none, minimal, low, medium, high, xhigh, max, ultra 完整输出",
+                "catalog 第 {} 个模型 supported_reasoning_levels 不能为空",
                 index + 1
             );
+        }
+        // Honest subsets are allowed (e.g. terra 6 档、DeepSeek 3 档). Reject only
+        // unknown duplicates / empty descriptions / default outside the list.
+        let mut seen = std::collections::HashSet::new();
+        for effort in &efforts {
+            if !seen.insert(*effort) {
+                bail!(
+                    "catalog 第 {} 个模型 reasoning levels 存在重复档 {}",
+                    index + 1,
+                    effort.as_str()
+                );
+            }
         }
         if model
             .supported_reasoning_levels
@@ -192,6 +206,13 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
         1000,
         Some(route.kind.as_str()),
     );
+    let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
+        .unwrap_or_else(|| crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind));
+    crate::providers::apply_reasoning_levels_for_profile(
+        &mut model,
+        profile,
+        Some(route.upstream_model.as_str()),
+    );
     // Prefer Desktop-native public slug when unique; heal path claims freely (single row).
     let mut claimed = std::collections::HashSet::new();
     model.slug = crate::providers::catalog_publish_slug(
@@ -202,7 +223,8 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
     if model.display_name.trim().is_empty() {
         model.display_name = route.display_name.clone();
     }
-    let reasoning_profile = crate::providers::reasoning_profile(&route.kind, &route.upstream_model);
+    let reasoning_profile =
+        crate::providers::reasoning_profile_for(profile, &route.upstream_model);
     let payload = RouteCatalogPayload {
         model,
         reasoning_profile,
@@ -288,6 +310,15 @@ pub fn build_from_routes(
                 1000 + enabled_index,
                 Some(route.kind.as_str()),
             );
+            let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
+                .unwrap_or_else(|| {
+                    crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind)
+                });
+            crate::providers::apply_reasoning_levels_for_profile(
+                &mut model,
+                profile,
+                Some(route.upstream_model.as_str()),
+            );
             // Desktop power picker only lists gpt-5.6-terra/sol (CC Switch style). Prefer
             // those public slugs when unique; otherwise keep opaque spur-route-*.
             let opaque =
@@ -326,6 +357,7 @@ pub fn build_from_routes(
                 upstream_model: route.upstream_model.clone(),
                 base_url,
                 protocol: route.protocol.clone(),
+                reasoning_profile_id: profile.as_str().to_string(),
             };
             // Publish key + dual-keys so in-flight sessions on old slugs still route.
             targets.insert(published.clone(), target.clone());
@@ -480,6 +512,9 @@ mod tests {
             protocol: "chat_completions".into(),
             base_url: "https://example.invalid/v1".into(),
             entry_category: None,
+            reasoning_profile_id: crate::reasoning_map::ReasoningProfileId::default_for_kind(kind)
+                .as_str()
+                .into(),
         }
     }
 
@@ -538,14 +573,9 @@ mod tests {
                 "slug must not contain /, got {}",
                 model.slug
             );
-            let efforts: Vec<_> = model
-                .supported_reasoning_levels
-                .iter()
-                .map(|level| level.effort.as_str())
-                .collect();
-            assert_eq!(
-                efforts,
-                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+            assert!(
+                !model.supported_reasoning_levels.is_empty(),
+                "must advertise at least one reasoning level"
             );
             assert!(targets.contains_key(&model.slug));
             // Custom-provider rows never advertise shell/apply_patch (CC Switch shape).
@@ -700,16 +730,34 @@ mod tests {
     }
 
     #[test]
-    fn strict_validation_rejects_incomplete_reasoning_ladder() {
+    fn strict_validation_rejects_empty_reasoning_levels() {
         let mut model = placeholder_model("spur-route-kimi".into(), "Kimi".into());
-        model
-            .supported_reasoning_levels
-            .retain(|level| level.effort != ReasoningEffort::Minimal);
+        model.supported_reasoning_levels.clear();
         let error = validate_catalog(&ModelsResponse {
             models: vec![model],
         })
         .unwrap_err();
-        assert!(error.to_string().contains("minimal"));
+        assert!(
+            error.to_string().contains("supported_reasoning_levels"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn honest_subsets_validate() {
+        let mut model = placeholder_model("spur-route-kimi".into(), "Kimi".into());
+        model.supported_reasoning_levels = crate::reasoning_map::catalog_reasoning_levels(
+            crate::reasoning_map::ReasoningProfileId::Kimi,
+        );
+        model.default_reasoning_level = Some(ReasoningEffort::Medium);
+        model.base_instructions = format!(
+            "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
+            "x".repeat(3000)
+        );
+        validate_catalog(&ModelsResponse {
+            models: vec![model],
+        })
+        .expect("honest kimi subset must validate");
     }
 
     #[test]

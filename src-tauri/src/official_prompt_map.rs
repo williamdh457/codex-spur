@@ -311,6 +311,77 @@ fn read_models_cache_base_instructions(path: &Path) -> Result<Option<(String, St
     Ok(best)
 }
 
+/// Map official `supported_reasoning_levels` for a Desktop model slug from models_cache.
+/// Returns None when the cache is missing or the slug has no levels.
+pub fn mapped_reasoning_levels_from_cache(
+    slug: &str,
+) -> Option<Vec<crate::domain::ReasoningEffortPreset>> {
+    mapped_reasoning_levels_from_cache_path(
+        &crate::codex_config::prompt_map_codex_home().join("models_cache.json"),
+        slug,
+    )
+}
+
+pub fn mapped_reasoning_levels_from_cache_path(
+    cache_path: &Path,
+    slug: &str,
+) -> Option<Vec<crate::domain::ReasoningEffortPreset>> {
+    let raw = fs::read_to_string(cache_path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let models = value.get("models")?.as_array()?;
+    let want = slug.trim().to_ascii_lowercase();
+    let want_tail = want.rsplit(['/', ':']).next().unwrap_or(&want);
+    for model in models {
+        let row_slug = model
+            .get("slug")
+            .or_else(|| model.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let row_tail = row_slug.rsplit(['/', ':']).next().unwrap_or(&row_slug);
+        if row_slug != want && row_tail != want_tail {
+            continue;
+        }
+        let levels = model.get("supported_reasoning_levels")?.as_array()?;
+        let mut out = Vec::new();
+        for level in levels {
+            let effort_raw = level.get("effort").and_then(Value::as_str)?;
+            let effort = match effort_raw {
+                "none" => crate::domain::ReasoningEffort::None,
+                "minimal" => crate::domain::ReasoningEffort::Minimal,
+                "low" => crate::domain::ReasoningEffort::Low,
+                "medium" => crate::domain::ReasoningEffort::Medium,
+                "high" => crate::domain::ReasoningEffort::High,
+                "xhigh" => crate::domain::ReasoningEffort::Xhigh,
+                "max" => crate::domain::ReasoningEffort::Max,
+                "ultra" => crate::domain::ReasoningEffort::Ultra,
+                _ => continue,
+            };
+            let description = level
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    crate::providers::codex_reasoning_level_description(effort).to_string()
+                });
+            out.push(crate::domain::ReasoningEffortPreset {
+                effort,
+                description,
+            });
+        }
+        if out.is_empty() {
+            return None;
+        }
+        return Some(out);
+    }
+    // sol missing: fall back to terra if present
+    if want_tail.contains("sol") {
+        return mapped_reasoning_levels_from_cache_path(cache_path, "gpt-5.6-terra");
+    }
+    None
+}
+
 fn model_base_instructions(models: &[Value], slug: &str) -> Option<String> {
     for model in models {
         let row_slug = model

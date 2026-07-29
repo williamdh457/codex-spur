@@ -67,6 +67,8 @@ pub struct ProviderSummary {
     /// Primary entry channel for list badges: `official` | `json` | `api`.
     /// Legacy values `pool` / `config` are normalized to `json` when read.
     pub entry_category: Option<String>,
+    /// User-selected reasoning mapping template id (see `reasoning_map::ReasoningProfileId`).
+    pub reasoning_profile_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,7 +343,7 @@ pub struct ApplyPreview {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,

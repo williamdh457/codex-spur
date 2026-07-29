@@ -79,7 +79,7 @@ Spur 是 **local-first** 的桌面控制面：管你真正在用的模型，不�
 |---|---|
 | 平台 | macOS（Apple Silicon）· Windows x64 |
 | 技术栈 | Tauri 2 · React · TypeScript · Rust |
-| 版本 | **0.1.9** |
+| 版本 | **0.1.10** |
 | 许可 | MIT |
 
 ---
@@ -137,7 +137,7 @@ none · minimal · low · medium · high · xhigh · max · ultra
 
 **macOS**
 
-1. 打开 [Releases](https://github.com/williamdh457/codex-spur/releases/latest) 下载 DMG（例如 `Codex.Spur_0.1.9_aarch64.dmg`） 
+1. 打开 [Releases](https://github.com/williamdh457/codex-spur/releases/latest) 下载 DMG（例如 `Codex.Spur_0.1.10_aarch64.dmg`） 
 2. 打开 DMG，把 **Codex Spur** 拖进 **「应用程序」**  
 3. 打开 App（若被拦截，见下方 [「应用已损坏」](#首次打开提示应用已损坏)）  
 4. 使用第三方模型时保持菜单栏进程在线  

@@ -4,6 +4,20 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-07-29
+
+### Fixed
+
+- **Reasoning mapping aligned to real vendor ladders**: each provider instance has a user-selected **reasoning profile template** (OpenAI native, OpenAI-compat conservative, DeepSeek, Kimi, xAI, MiniMax, GLM, Qwen, passthrough). Catalog levels are honest subsets; proxy maps Codex `none…ultra` to real upstream tokens (`thinking`, `reasoning_effort`, `enable_thinking`, …).
+- **DeepSeek V4**: maps to thinking on/off + `high`/`max` (xhigh → max, not medium).
+- **OpenAI-compat gateways**: clamp xhigh/max/ultra → `high` so unknown efforts do not silently fall back to medium.
+- **OpenAI native / GPT custom**: identity mapping; catalog levels prefer `models_cache.json` when present.
+- **Apply preserves `model_reasoning_effort`** when still legal for the selected model instead of always rewriting medium.
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.10**.
+
 ## [0.1.9] - 2026-07-29
 
 ### Fixed

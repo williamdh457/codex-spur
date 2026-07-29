@@ -46,6 +46,14 @@ export type ProviderSummary = {
   fixedCredentialId: string | null;
   /** Entry channel badge: official (browser) | json (file import) | api (form key). Legacy pool/config normalize to json. */
   entryCategory: "official" | "json" | "api" | "pool" | "config" | null;
+  /** User-selected reasoning mapping template id. */
+  reasoningProfileId: string;
+};
+
+export type ReasoningProfileOption = {
+  id: string;
+  title: string;
+  help: string;
 };
 
 export type ReasoningMapping = {
