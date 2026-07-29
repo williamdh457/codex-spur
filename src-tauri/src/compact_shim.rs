@@ -23,6 +23,7 @@ pub const OCX_COMPACTION_PREFIX: &str = "ocx1:";
 
 /// Official compact template fallback (codex-rs `prompts/templates/compact/prompt.md`).
 /// Prefer [`effective_compact_prompt`] so `experimental_compact_prompt_file` maps in.
+#[allow(dead_code)] // public API + unit tests; runtime uses effective_compact_prompt()
 pub const COMPACT_PROMPT: &str = crate::official_prompt_map::OFFICIAL_COMPACT_PROMPT_FALLBACK;
 
 /// Framing when a portable summary is replayed into a later turn.

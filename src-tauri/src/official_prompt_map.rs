@@ -193,6 +193,8 @@ pub fn apply_mapped_base_instructions(model_base_instructions: &mut String) {
     }
 }
 
+/// Test/helper entry: map from an explicit Codex home (temp fixtures).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn apply_mapped_base_instructions_from(model_base_instructions: &mut String, codex_home: &Path) {
     match resolve_base_instructions_from(codex_home) {
         Ok(mapped) => write_mapped(model_base_instructions, mapped),
