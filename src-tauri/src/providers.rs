@@ -718,13 +718,20 @@ pub fn codex_reasoning_level_description(effort: ReasoningEffort) -> &'static st
     }
 }
 
-pub const CODEX_AGENT_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
+/// Legacy short stub formerly used as catalog `base_instructions`.
+/// Fingerprint for pollution detection only — never write this as default copy.
+#[deprecated(note = "use official_prompt_map; never invent base_instructions")]
+pub const CODEX_AGENT_BASE_INSTRUCTIONS: &str =
+    crate::official_prompt_map::POLLUTED_BASE_INSTRUCTIONS_STUB;
 
 /// Ensure a catalog row matches working third-party catalogs (CC/Nice Switch).
 ///
 /// Stale SQLite `catalog_json` often carries OpenAI-only tool flags. ChatGPT's custom
 /// model picker has been observed to show an empty list when third-party rows advertise
 /// shell/apply_patch/web_search like native GPT rows. Heal to the Nice Switch Kimi shape.
+///
+/// `base_instructions` are **mapped** from Codex home (`model_instructions_file` /
+/// `models_cache.json`) — never filled with a Spur-authored stub.
 pub fn normalize_catalog_model_for_codex(model: &mut CatalogModel, priority: i32) {
     normalize_catalog_model_for_codex_with_kind(model, priority, None);
 }
@@ -738,9 +745,7 @@ pub fn normalize_catalog_model_for_codex_with_kind(
     model.priority = priority;
     model.visibility = "list".into();
     model.supported_in_api = true;
-    if model.base_instructions.trim().is_empty() {
-        model.base_instructions = CODEX_AGENT_BASE_INSTRUCTIONS.into();
-    }
+    crate::official_prompt_map::apply_mapped_base_instructions(&mut model.base_instructions);
     model.truncation_policy = TruncationPolicy {
         mode: "bytes".into(),
         limit: 10_000,
@@ -933,7 +938,8 @@ pub fn catalog_model(
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        base_instructions: CODEX_AGENT_BASE_INSTRUCTIONS.into(),
+        // Placeholder until normalize maps official/user prompts from Codex home.
+        base_instructions: String::new(),
         model_messages: None,
         include_skills_usage_instructions: false,
         supports_reasoning_summaries: true,
@@ -970,6 +976,7 @@ pub fn catalog_model(
     let _ = reasoning_profile(kind, &model.id);
     // Always pass kind so Kimi/DeepSeek rows are healed lean (no shell/apply_patch
     // ads that make ChatGPT Desktop show an empty model picker).
+    // Maps base_instructions from model_instructions_file / models_cache.
     normalize_catalog_model_for_codex_with_kind(&mut catalog, 1000, Some(kind));
     catalog
 }
@@ -1215,13 +1222,23 @@ mod tests {
             json.get("shell_type").and_then(|v| v.as_str()),
             Some("shell_command")
         );
+        let bi = json
+            .get("base_instructions")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        // Prefer live mapping from ~/.codex; if this machine has no cache/file the
+        // field may be empty (fail-closed). Never accept the historical short stub.
         assert!(
-            json.get("base_instructions")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .contains("You are Codex"),
-            "base_instructions should match Codex agent blurb"
+            !crate::official_prompt_map::is_polluted_stub(bi) || bi.is_empty(),
+            "base_instructions must not be the historical short stub"
         );
+        if !bi.is_empty() {
+            assert!(
+                bi.len() > 200 || bi.contains('\n'),
+                "mapped base_instructions should be a real prompt body, got len={}",
+                bi.len()
+            );
+        }
         let slug = json
             .get("slug")
             .and_then(|v| v.as_str())

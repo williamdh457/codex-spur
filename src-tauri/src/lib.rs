@@ -10,6 +10,7 @@ mod domain;
 mod kimi_list_shield;
 mod kimi_target;
 mod media_sanitizer;
+mod official_prompt_map;
 mod openai_agent_identity;
 mod openai_oauth;
 mod opencode_go;

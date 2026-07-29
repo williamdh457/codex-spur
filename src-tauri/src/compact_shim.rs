@@ -21,19 +21,26 @@ pub const SPUR_COMPACTION_PREFIX: &str = "spur1:";
 /// Also accept OpenCodex envelopes if a thread mixed tools (decode-only).
 pub const OCX_COMPACTION_PREFIX: &str = "ocx1:";
 
-/// Mirrors codex-rs local compact instruction semantics.
-pub const COMPACT_PROMPT: &str = r#"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
-
-Include:
-- Current progress and key decisions made
-- Important context, constraints, or user preferences
-- What remains to be done (clear next steps)
-- Any critical data, examples, or references needed to continue
-
-Be concise, structured, and focused on helping the next LLM seamlessly continue the work."#;
+/// Official compact template fallback (codex-rs `prompts/templates/compact/prompt.md`).
+/// Prefer [`effective_compact_prompt`] so `experimental_compact_prompt_file` maps in.
+pub const COMPACT_PROMPT: &str = crate::official_prompt_map::OFFICIAL_COMPACT_PROMPT_FALLBACK;
 
 /// Framing when a portable summary is replayed into a later turn.
-pub const SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+/// Official `summary_prefix.md` — not Spur-authored.
+pub const SUMMARY_PREFIX: &str = crate::official_prompt_map::OFFICIAL_SUMMARY_PREFIX_FALLBACK;
+
+/// Compact prompt mapped from Codex home config, else official OSS template.
+pub fn effective_compact_prompt() -> String {
+    let mapped = crate::official_prompt_map::resolve_compact_prompt();
+    if mapped.source != crate::official_prompt_map::CompactPromptSource::OfficialFallback {
+        tracing::debug!(
+            label = %mapped.source_label,
+            chars = mapped.text.len(),
+            "using mapped compact prompt override"
+        );
+    }
+    mapped.text
+}
 
 pub const OPAQUE_COMPACTION_NOTE: &str =
     "[earlier conversation was compacted; the summary is stored in a format this model cannot read]";
@@ -211,12 +218,13 @@ pub fn trim_transcript_to_budget(transcript: &str, budget_chars: usize) -> Strin
 pub fn build_compact_user_prompt(transcript: &str, context_window_tokens: Option<i64>) -> String {
     let budget = compact_input_char_budget(context_window_tokens);
     let body = trim_transcript_to_budget(transcript, budget);
+    let compact_prompt = effective_compact_prompt();
     if body.trim().is_empty() {
         format!(
-            "{COMPACT_PROMPT}\n\n---\n\n(no portable conversation text was available; earlier history may have been encrypted under another provider)"
+            "{compact_prompt}\n\n---\n\n(no portable conversation text was available; earlier history may have been encrypted under another provider)"
         )
     } else {
-        format!("{COMPACT_PROMPT}\n\n---\n\n{body}")
+        format!("{compact_prompt}\n\n---\n\n{body}")
     }
 }
 
@@ -312,6 +320,21 @@ pub fn expand_historical_compaction_items(request: &mut Value, keep_live_carrier
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compact_and_summary_constants_match_official_fallback() {
+        assert_eq!(
+            COMPACT_PROMPT,
+            crate::official_prompt_map::OFFICIAL_COMPACT_PROMPT_FALLBACK
+        );
+        assert_eq!(
+            SUMMARY_PREFIX,
+            crate::official_prompt_map::OFFICIAL_SUMMARY_PREFIX_FALLBACK
+        );
+        let prompt = build_compact_user_prompt("hello transcript", None);
+        assert!(prompt.starts_with(COMPACT_PROMPT));
+        assert!(prompt.contains("hello transcript"));
+    }
 
     #[test]
     fn spur_envelope_round_trips() {

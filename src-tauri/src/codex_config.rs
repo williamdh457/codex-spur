@@ -33,6 +33,17 @@ pub fn publish_codex_home() -> PathBuf {
     user_codex_home()
 }
 
+/// Home used when **reading** official / user-overridden prompts.
+///
+/// Always the real user `~/.codex` by default — not the catalog write sandbox
+/// (`CODEX_SPUR_PUBLISH_HOME`). Tests may override with `CODEX_SPUR_PROMPT_HOME`.
+pub fn prompt_map_codex_home() -> PathBuf {
+    if let Some(value) = env::var_os("CODEX_SPUR_PROMPT_HOME") {
+        return PathBuf::from(value);
+    }
+    user_codex_home()
+}
+
 fn user_codex_home() -> PathBuf {
     // Prefer HOME (Unix / Git Bash / some launchers), then USERPROFILE (native Windows).
     // Codex Desktop/CLI config is expected under <user home>/.codex on both platforms.

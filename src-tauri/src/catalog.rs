@@ -391,7 +391,8 @@ pub fn placeholder_model(slug: String, display_name: String) -> CatalogModel {
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        base_instructions: crate::providers::CODEX_AGENT_BASE_INSTRUCTIONS.into(),
+        // Filled by normalize via official_prompt_map (model_instructions_file / models_cache).
+        base_instructions: String::new(),
         model_messages: None,
         include_skills_usage_instructions: false,
         supports_reasoning_summaries: true,
@@ -439,6 +440,12 @@ mod tests {
     ) -> StoredRoute {
         let legacy = legacy_route_slug(provider_id, upstream);
         // Intentionally stale: slash slug + camelCase + truncated ladder (what used to break GUI).
+        // Long base_instructions survive when live prompt-map is unavailable in parallel tests;
+        // normalize still overwrites with mapped official/user text when ~/.codex is readable.
+        let fixture_bi = format!(
+            "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
+            "fixture".repeat(400)
+        );
         let catalog_json = serde_json::json!({
             "model": {
                 "slug": legacy,
@@ -452,7 +459,8 @@ mod tests {
                 "shellType": "shell_command",
                 "visibility": "list",
                 "supportedInApi": true,
-                "priority": 0
+                "priority": 0,
+                "base_instructions": fixture_bi
             },
             "reasoning_profile": {
                 "title": "stale",
@@ -664,23 +672,31 @@ mod tests {
 
     #[test]
     fn strict_validation_checks_every_model_and_required_empty_arrays() {
+        // Do not depend on live ~/.codex mapping (other tests may hijack
+        // CODEX_SPUR_PUBLISH_HOME). Inject a non-stub body for structure checks.
+        let mapped_body = format!(
+            "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
+            "x".repeat(3000)
+        );
         let mut first = placeholder_model("spur-route-first".into(), "First".into());
         let mut second = placeholder_model("spur-route-second".into(), "Second".into());
+        first.base_instructions = mapped_body.clone();
+        second.base_instructions = mapped_body;
         first.experimental_supported_tools.clear();
         validate_catalog(&ModelsResponse {
-            models: vec![first, second.clone()],
+            models: vec![first.clone(), second.clone()],
         })
         .expect("empty required array must serialize and validate");
 
         second.base_instructions.clear();
         let error = validate_catalog(&ModelsResponse {
-            models: vec![
-                placeholder_model("spur-route-first".into(), "First".into()),
-                second,
-            ],
+            models: vec![first, second],
         })
         .unwrap_err();
-        assert!(error.to_string().contains("第 2 个模型"));
+        assert!(
+            error.to_string().contains("第 2 个模型"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

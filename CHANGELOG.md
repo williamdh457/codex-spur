@@ -4,6 +4,19 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-29
+
+### Fixed
+
+- **Official prompt mapping (no more stub system prompt)**: catalog `base_instructions` are mapped live from Codex home — `model_instructions_file` → inline `base_instructions` → `models_cache.json` — instead of the historical 117-char “You are Codex…” stub that replaced Desktop’s full agent system prompt (~17KB). Edit your official/override prompt and re-Apply (or restart Spur) to rematerialize every route.
+- **Compact prompt mapping**: local compact shim prefers `experimental_compact_prompt_file` / `compact_prompt` from `config.toml`; otherwise uses the official OSS compact template (not a Spur-authored handoff).
+- **Plan / Goal passthrough**: Spur does not author plan/goal templates; request `developer` bodies are role-mapped for Chat bridges without rewriting content.
+- **Stub pollution heal**: empty or short stub `base_instructions` are cleared or overwritten on every catalog normalize; refuse to re-publish the old stub as “official”.
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.9**.
+
 ## [0.1.8] - 2026-07-26
 
 ### Fixed
