@@ -4,6 +4,17 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-07-30
+
+### Fixed
+
+- **Official lean `base_instructions` from openai/codex `models.json`**: catalog rows no longer use the 117-char CC Switch stub. **Sol** resolves from the official `gpt-5.6-sol` entry; **Terra/Luna** from their official entries; **all other spur routes** map to the Terra/Luna lean body. Source: `codex-rs/models-manager/models.json` fixtures under `src-tauri/fixtures/official_prompts/`. Tool ads remain lean (no `apply_patch_tool_type`) so Desktop model list stays intact.
+- **OpenAI compact is portable (same as Kimi/DeepSeek)**: when Desktop issues Remote Compaction V2, Spur always runs the local summarizer on the **current** model and returns a `spur1:` plaintext envelope — including for OpenAI routes. Everyday OpenAI turns still use Responses as before; only the compact beat is intercepted. This avoids minting `gAAAAA…` ciphertext that other models cannot read after a mid-thread switch. Historical OpenAI ciphertext is still not decryptable; re-`/compact` under the new path to get a portable summary.
+
+### Packaging
+
+- macOS Apple Silicon build for **0.1.12**.
+
 ## [0.1.11] - 2026-07-30
 
 ### Fixed

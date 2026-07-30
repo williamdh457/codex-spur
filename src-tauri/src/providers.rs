@@ -713,19 +713,26 @@ pub fn apply_reasoning_levels_for_profile(
     }
 }
 
-/// CC Switch native catalog identity (117 chars). Default for every spur-route.
+/// Legacy alias kept for call sites that still reference the old constant name.
+/// Coding catalog rows no longer target this one-liner; see
+/// [`crate::official_prompt_map::apply_official_base_instructions`].
 pub const CODEX_AGENT_BASE_INSTRUCTIONS: &str =
     crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS;
 
-/// Ensure a catalog row matches working third-party catalogs (CC Switch).
+/// Ensure a catalog row matches working third-party catalogs (CC Switch tool shape)
+/// while using **OpenAI official** lean `base_instructions` from models.json.
 ///
 /// Stale SQLite `catalog_json` often carries OpenAI-only tool flags. ChatGPT's custom
 /// model picker has been observed to show an empty list when third-party rows advertise
-/// shell/apply_patch/web_search like native GPT rows. Heal to the lean CC Switch shape.
+/// shell/apply_patch/web_search like native GPT rows. Tool ads stay lean.
 ///
-/// `base_instructions` use the **CC Switch neutral identity** when empty or polluted.
-/// Do not map `model_instructions_file` / full `models_cache` agent bodies into multi-route
-/// catalog rows — Desktop assembles Skills / Plan / MCP at request time.
+/// `base_instructions` mapping (openai/codex models.json):
+/// - GPT-5.6 Sol → official `gpt-5.6-sol` entry
+/// - GPT-5.6 Terra / Luna → official terra / luna entries
+/// - All other spur routes → official Terra/Luna shared lean body
+///
+/// Do not map `model_instructions_file` / UNRESTRICTED files into multi-route rows.
+/// Desktop still assembles Skills / Plan / MCP at request time on top of this lean base.
 pub fn normalize_catalog_model_for_codex(model: &mut CatalogModel, priority: i32) {
     normalize_catalog_model_for_codex_with_kind(model, priority, None);
 }
@@ -739,7 +746,12 @@ pub fn normalize_catalog_model_for_codex_with_kind(
     model.priority = priority;
     model.visibility = "list".into();
     model.supported_in_api = true;
-    crate::official_prompt_map::heal_catalog_base_instructions(&mut model.base_instructions);
+    crate::official_prompt_map::apply_official_base_instructions(
+        &mut model.base_instructions,
+        &model.slug,
+        &model.display_name,
+        "",
+    );
     model.truncation_policy = TruncationPolicy {
         mode: "bytes".into(),
         limit: 10_000,
@@ -942,7 +954,7 @@ pub fn catalog_model_with_profile(
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        // Healed to CC Switch neutral in normalize_catalog_model_for_codex_with_kind.
+        // Filled from official openai/codex models.json in normalize.
         base_instructions: String::new(),
         model_messages: None,
         include_skills_usage_instructions: false,
@@ -978,8 +990,16 @@ pub fn catalog_model_with_profile(
     };
     // Always pass kind so Kimi/DeepSeek rows are healed lean (no shell/apply_patch
     // ads that make ChatGPT Desktop show an empty model picker).
-    // Heals base_instructions to CC Switch neutral when empty/polluted.
+    // Sets base_instructions from official openai/codex models.json (Sol / Terra / Luna).
     normalize_catalog_model_for_codex_with_kind(&mut catalog, 1000, Some(kind));
+    // Re-apply with upstream id so Sol/Terra/Luna display names + upstream map correctly
+    // even when the published slug is already a native Desktop slug.
+    crate::official_prompt_map::apply_official_base_instructions(
+        &mut catalog.base_instructions,
+        &catalog.slug,
+        &catalog.display_name,
+        &model.id,
+    );
     apply_reasoning_levels_for_profile(&mut catalog, profile, Some(&model.id));
     catalog
 }
@@ -1263,12 +1283,15 @@ mod tests {
             .get("base_instructions")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        // Non-Sol spur routes map to official Terra/Luna lean body (openai/codex models.json).
         assert_eq!(
             bi,
-            crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS,
-            "catalog base_instructions must be CC Switch neutral identity"
+            crate::official_prompt_map::OFFICIAL_GPT56_TERRA_LUNA_BASE_INSTRUCTIONS,
+            "catalog base_instructions must be official GPT-5.6 Terra/Luna lean body"
         );
-        assert_eq!(bi.len(), 117);
+        assert!(bi.contains("apply_patch"));
+        assert!(bi.contains("Adapt accordingly based on the user"));
+        assert!(bi.len() > 10_000);
         let slug = json
             .get("slug")
             .and_then(|v| v.as_str())

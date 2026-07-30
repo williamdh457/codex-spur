@@ -2182,9 +2182,9 @@ async fn set_model_enabled(
         }
     }
     state.rebuild_runtime().await?;
-    // Remote Compaction V2 is handled by the proxy local shim for non-native
-    // routes (spur1: portable envelope). Do not fail-closed enable on upstream
-    // compact probes — mid-thread compact no longer requires native Compact V2.
+    // Remote Compaction V2 is handled by the proxy local portable shim for all
+    // routes including OpenAI (spur1: envelope). Do not fail-closed enable on
+    // upstream compact probes — mid-thread compact no longer requires native V2.
     {
         let mut snapshot = state.snapshot.write().await;
         if snapshot.binding.state == "applied" {
@@ -2198,7 +2198,7 @@ async fn set_model_enabled(
 }
 
 /// Historical helper: enable/apply no longer fail-closed on native Compact V2.
-/// Non-native routes use the proxy local compact shim (`spur1:` envelope).
+/// All routes use the proxy local portable compact shim (`spur1:` envelope).
 /// Kept for diagnostics / optional future soft warnings only.
 #[allow(dead_code)]
 fn route_requires_remote_compaction_probe(route: &storage::StoredRoute) -> bool {

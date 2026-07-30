@@ -789,9 +789,10 @@ mod tests {
         );
         assert_eq!(
             payload.model.base_instructions,
-            crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS,
-            "polluted long base_instructions must heal to CC Switch neutral"
+            crate::official_prompt_map::OFFICIAL_GPT56_TERRA_LUNA_BASE_INSTRUCTIONS,
+            "polluted long base_instructions must heal to official Terra/Luna lean body"
         );
+        assert!(payload.model.base_instructions.contains("apply_patch"));
     }
 
     #[test]

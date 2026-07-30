@@ -267,12 +267,12 @@ async fn responses(
     if let Some(object) = parsed.as_object_mut() {
         object.insert("model".into(), Value::String(target.upstream_model.clone()));
     }
-    // Non-native routes cannot mint OpenAI Compact V2 ciphertext. Run the current
-    // model as a summarizer and return a portable spur1: compaction item so
-    // Desktop does not fatal mid-thread. Official OpenAI keeps native compact.
-    if is_remote_compaction_request(&parsed)
-        && !compact_shim::uses_native_remote_compaction(&target.kind)
-    {
+    // All routes (including OpenAI): local portable Compact V2 shim.
+    // Normal turns still use Responses/Chat as before; only the compact beat is
+    // intercepted. Produces spur1: plaintext envelopes (same as Kimi/DeepSeek)
+    // instead of native OpenAI gAAAAA… ciphertext so mid-thread model switches
+    // can still read the summary. Desktop still sees a valid V2 compaction item.
+    if is_remote_compaction_request(&parsed) {
         return local_compact_v2_shim(&state, &target, parsed, &affinity).await;
     }
     if target.protocol.to_ascii_lowercase().contains("chat") {
@@ -294,8 +294,8 @@ async fn responses(
     }
 }
 
-/// Local Remote Compaction V2 for non-OpenAI routes: summarize with the current
-/// model and return exactly one portable `spur1:` compaction item.
+/// Local Remote Compaction V2 for every route (including OpenAI): summarize with
+/// the current model and return exactly one portable `spur1:` compaction item.
 async fn local_compact_v2_shim(
     state: &ProxyState,
     target: &RouteTarget,
@@ -5108,6 +5108,44 @@ data: [DONE]
             .unwrap()
             .contains("portable checkpoint"));
         assert_eq!(input[2]["type"], "compaction");
+    }
+
+    #[test]
+    fn remote_compact_request_detected_for_openai_style_payload() {
+        // Live Remote Compaction V2 carrier is the last compaction item (Desktop).
+        let compact_turn = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"long history"}]},
+                {"type":"compaction"}
+            ]
+        });
+        assert!(is_remote_compaction_request(&compact_turn));
+
+        let normal_turn = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+            ]
+        });
+        assert!(
+            !is_remote_compaction_request(&normal_turn),
+            "everyday OpenAI Responses turns must not be treated as compact"
+        );
+    }
+
+    #[test]
+    fn portable_shim_response_is_valid_remote_compact_v2_for_openai_model() {
+        // What local_compact_v2_shim returns for any kind (including openai).
+        let body = crate::compact_shim::synthetic_compaction_response(
+            "gpt-5.6-sol",
+            "checkpoint for next model",
+        );
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert!(validate_remote_compaction_response(&bytes, false).is_ok());
+        let enc = body["output"][0]["encrypted_content"].as_str().unwrap();
+        assert!(enc.starts_with(crate::compact_shim::SPUR_COMPACTION_PREFIX));
+        assert!(!enc.starts_with("gAAAAA"));
     }
 
     #[test]

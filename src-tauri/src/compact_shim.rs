@@ -1,15 +1,20 @@
-//! Local Remote Compaction V2 shim for non-native upstreams.
+//! Local Remote Compaction V2 shim (portable / explicit plaintext envelope).
 //!
 //! Codex Desktop expects exactly one `{type:"compaction", encrypted_content:…}`
-//! output item. Third-party / Chat Completions routes cannot mint OpenAI
-//! ciphertext, so Spur runs the **current** route as a plain summarizer and
-//! wraps the text in a portable envelope (`spur1:` + base64).
+//! output item. Spur intercepts **every** compact beat (including OpenAI) and
+//! runs the **current** route as a plain summarizer, wrapping the text in a
+//! portable envelope (`spur1:` + base64). Normal non-compact turns are unchanged
+//! (OpenAI keeps Responses; Kimi/DeepSeek keep the Chat bridge).
 //!
-//! Design notes (see product plan):
+//! Why not native OpenAI `gAAAAA…` compact via Spur:
+//! - That ciphertext is not readable by Kimi/Grok/etc. after a model switch.
+//! - Spur cannot decrypt OpenAI KMS blobs client-side.
+//! - A portable envelope at compact time makes the summary explicit for all routes.
+//!
+//! Design notes:
 //! - Compact only with history the **current** model can still read (decode
 //!   our own envelopes; never pretend to decrypt foreign `gAAAAA…` blobs).
-//! - Cross-provider handoff-on-old is a later phase; this module only covers
-//!   same-route compact so mid-thread Desktop remote compact does not fatal.
+//! - Historical foreign ciphertext expands to an honest opaque note only.
 //! - Inspired by the OpenCodex compact contract (MIT); independent Rust code.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -46,10 +51,12 @@ pub fn effective_compact_prompt() -> String {
 pub const OPAQUE_COMPACTION_NOTE: &str =
     "[earlier conversation was compacted; the summary is stored in a format this model cannot read]";
 
-/// Only official OpenAI kind uses upstream native Compact V2. Everything else
-/// (Chat bridge, custom/xAI/MiniMax Responses) uses the local shim.
-pub fn uses_native_remote_compaction(kind: &str) -> bool {
-    kind.eq_ignore_ascii_case("openai")
+/// Historical helper: Spur no longer mints native OpenAI Compact V2 ciphertext
+/// for any kind (including `openai`). All compact beats use the local portable
+/// shim so summaries stay cross-model readable. Always returns `false`.
+#[allow(dead_code)] // kept for call-site clarity / tests; proxy no longer branches on it
+pub fn uses_native_remote_compaction(_kind: &str) -> bool {
+    false
 }
 
 pub fn encode_spur_compaction_summary(summary: &str) -> String {
@@ -403,12 +410,26 @@ mod tests {
     }
 
     #[test]
+    fn no_kind_uses_native_openai_encrypted_compact() {
+        // Product rule: OpenAI through Spur also uses portable spur1 compact.
+        assert!(!uses_native_remote_compaction("openai"));
+        assert!(!uses_native_remote_compaction("OpenAI"));
+        assert!(!uses_native_remote_compaction("kimi"));
+        assert!(!uses_native_remote_compaction("xai"));
+        assert!(!uses_native_remote_compaction("deepseek"));
+    }
+
+    #[test]
     fn synthetic_response_has_exactly_one_compaction() {
         let body = synthetic_compaction_response("gpt-test", "summary text");
         let output = body["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "compaction");
         let enc = output[0]["encrypted_content"].as_str().unwrap();
+        assert!(
+            enc.starts_with(SPUR_COMPACTION_PREFIX),
+            "portable envelope required, got {enc}"
+        );
         assert_eq!(
             decode_portable_compaction_summary(enc).as_deref(),
             Some("summary text")
