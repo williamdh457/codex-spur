@@ -4,6 +4,18 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-07-30
+
+### Fixed
+
+- **CC Switch catalog identity (revert 0.1.9 long-prompt mapping)**: multi-route `base_instructions` again use the **117-char neutral** identity from CC Switch’s native template — not `model_instructions_file`, not full `models_cache` GPT agent bodies (~17KB), and not mis-mapped unrestricted files. Desktop still assembles Skills / Plan / Goal / MCP / AGENTS at request time.
+- **Heal polluted catalog rows**: empty, `[MODE: UNRESTRICTED]…`, and mis-mapped GPT long agent texts are rewritten to the CC Switch neutral identity on every normalize / Apply.
+- **Chat bridge `collapse_system_messages_to_head`**: after `developer` → `system` mapping, all system messages are merged into `messages[0]` (CC Switch / MiniMax-compatible). Plan/Goal developer blocks no longer sit mid-conversation as extra system roles.
+
+### Packaging
+
+- macOS Apple Silicon DMG for **0.1.11** (ad-hoc signed, not notarized — see Gatekeeper / build-from-source notes in the Release).
+
 ## [0.1.10] - 2026-07-29
 
 ### Fixed

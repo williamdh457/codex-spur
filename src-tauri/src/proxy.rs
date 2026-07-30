@@ -2983,9 +2983,14 @@ fn responses_to_chat_completions(
         }
     }
     messages.extend(response_input_to_messages(request_body.get("input")));
-    if messages.is_empty() {
-        messages.push(json!({"role": "user", "content": ""}));
-    }
+    // CC Switch: MiniMax (and some gateways) allow only messages[0] as system.
+    // Desktop injects developer blocks mid-input; map then collapse to head.
+    let messages = collapse_system_messages_to_head(messages);
+    let messages = if messages.is_empty() {
+        vec![json!({"role": "user", "content": ""})]
+    } else {
+        messages
+    };
 
     let wants_stream = request_body
         .get("stream")
@@ -3082,6 +3087,36 @@ fn instruction_text(value: &Value) -> String {
             .to_string(),
         _ => String::new(),
     }
+}
+
+/// MiniMax requires only the first message may be `role=system` (error 2013).
+/// Collapse every system message to the head, joining with blank lines — same
+/// as CC Switch `collapse_system_messages_to_head`. Safe for DeepSeek/Kimi too.
+fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
+    let mut system_chunks: Vec<String> = Vec::new();
+    let mut rest: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) == Some("system") {
+            if let Some(text) = msg.get("content").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    system_chunks.push(text.to_string());
+                }
+                continue;
+            }
+        }
+        rest.push(msg);
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(rest.len() + 1);
+    if !system_chunks.is_empty() {
+        out.push(json!({
+            "role": "system",
+            "content": system_chunks.join("\n\n")
+        }));
+    }
+    out.extend(rest);
+    out
 }
 
 /// Map Codex Responses roles onto Chat Completions roles accepted by
@@ -4642,17 +4677,52 @@ data: [DONE]
             "deepseek-v4-flash",
             &test_route_target("deepseek"),
         );
-        let roles: Vec<&str> = chat["messages"]
-            .as_array()
-            .unwrap()
+        let messages = chat["messages"].as_array().unwrap();
+        let roles: Vec<&str> = messages
             .iter()
             .map(|m| m["role"].as_str().unwrap())
             .collect();
-        assert!(roles.contains(&"system"));
+        // CC Switch: all system chunks collapsed into messages[0] only.
+        assert_eq!(roles[0], "system");
+        assert_eq!(roles.iter().filter(|r| **r == "system").count(), 1);
         assert!(roles.contains(&"user"));
         assert!(!roles.contains(&"developer"));
+        let system_text = messages[0]["content"].as_str().unwrap();
+        assert!(system_text.contains("You are Codex."));
+        assert!(system_text.contains("Collab mode"));
         assert_eq!(responses_role_to_chat_role("developer"), "system");
         assert_eq!(responses_role_to_chat_role("assistant"), "assistant");
+    }
+
+    #[test]
+    fn collapses_mid_conversation_system_to_head() {
+        let chat = responses_to_chat_completions(
+            &json!({
+                "instructions": "Identity",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]},
+                    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Plan mode"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]}
+                ],
+                "stream": false
+            }),
+            "MiniMax-M2.5",
+            &test_route_target("custom"),
+        );
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages.iter().filter(|m| m["role"] == "system").count(),
+            1,
+            "only the first message may be system"
+        );
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("Identity"));
+        assert!(system.contains("Plan mode"));
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "first");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "second");
     }
 
     #[test]

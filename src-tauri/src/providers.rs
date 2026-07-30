@@ -713,20 +713,19 @@ pub fn apply_reasoning_levels_for_profile(
     }
 }
 
-/// Legacy short stub formerly used as catalog `base_instructions`.
-/// Fingerprint for pollution detection only — never write this as default copy.
-#[deprecated(note = "use official_prompt_map; never invent base_instructions")]
+/// CC Switch native catalog identity (117 chars). Default for every spur-route.
 pub const CODEX_AGENT_BASE_INSTRUCTIONS: &str =
-    crate::official_prompt_map::POLLUTED_BASE_INSTRUCTIONS_STUB;
+    crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS;
 
-/// Ensure a catalog row matches working third-party catalogs (CC/Nice Switch).
+/// Ensure a catalog row matches working third-party catalogs (CC Switch).
 ///
 /// Stale SQLite `catalog_json` often carries OpenAI-only tool flags. ChatGPT's custom
 /// model picker has been observed to show an empty list when third-party rows advertise
-/// shell/apply_patch/web_search like native GPT rows. Heal to the Nice Switch Kimi shape.
+/// shell/apply_patch/web_search like native GPT rows. Heal to the lean CC Switch shape.
 ///
-/// `base_instructions` are **mapped** from Codex home (`model_instructions_file` /
-/// `models_cache.json`) — never filled with a Spur-authored stub.
+/// `base_instructions` use the **CC Switch neutral identity** when empty or polluted.
+/// Do not map `model_instructions_file` / full `models_cache` agent bodies into multi-route
+/// catalog rows — Desktop assembles Skills / Plan / MCP at request time.
 pub fn normalize_catalog_model_for_codex(model: &mut CatalogModel, priority: i32) {
     normalize_catalog_model_for_codex_with_kind(model, priority, None);
 }
@@ -740,7 +739,7 @@ pub fn normalize_catalog_model_for_codex_with_kind(
     model.priority = priority;
     model.visibility = "list".into();
     model.supported_in_api = true;
-    crate::official_prompt_map::apply_mapped_base_instructions(&mut model.base_instructions);
+    crate::official_prompt_map::heal_catalog_base_instructions(&mut model.base_instructions);
     model.truncation_policy = TruncationPolicy {
         mode: "bytes".into(),
         limit: 10_000,
@@ -943,7 +942,7 @@ pub fn catalog_model_with_profile(
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        // Placeholder until normalize maps official/user prompts from Codex home.
+        // Healed to CC Switch neutral in normalize_catalog_model_for_codex_with_kind.
         base_instructions: String::new(),
         model_messages: None,
         include_skills_usage_instructions: false,
@@ -979,7 +978,7 @@ pub fn catalog_model_with_profile(
     };
     // Always pass kind so Kimi/DeepSeek rows are healed lean (no shell/apply_patch
     // ads that make ChatGPT Desktop show an empty model picker).
-    // Maps base_instructions from model_instructions_file / models_cache.
+    // Heals base_instructions to CC Switch neutral when empty/polluted.
     normalize_catalog_model_for_codex_with_kind(&mut catalog, 1000, Some(kind));
     apply_reasoning_levels_for_profile(&mut catalog, profile, Some(&model.id));
     catalog
@@ -1264,19 +1263,12 @@ mod tests {
             .get("base_instructions")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        // Prefer live mapping from ~/.codex; if this machine has no cache/file the
-        // field may be empty (fail-closed). Never accept the historical short stub.
-        assert!(
-            !crate::official_prompt_map::is_polluted_stub(bi) || bi.is_empty(),
-            "base_instructions must not be the historical short stub"
+        assert_eq!(
+            bi,
+            crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS,
+            "catalog base_instructions must be CC Switch neutral identity"
         );
-        if !bi.is_empty() {
-            assert!(
-                bi.len() > 200 || bi.contains('\n'),
-                "mapped base_instructions should be a real prompt body, got len={}",
-                bi.len()
-            );
-        }
+        assert_eq!(bi.len(), 117);
         let slug = json
             .get("slug")
             .and_then(|v| v.as_str())

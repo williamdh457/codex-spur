@@ -1,29 +1,38 @@
-//! Map Codex official / user-overridden prompts into Spur — never invent copy.
+//! Catalog identity + compact prompt helpers, aligned to **CC Switch**.
 //!
-//! Source priority for `base_instructions`:
-//! 1. `config.toml` → `model_instructions_file` (user override)
-//! 2. `config.toml` → inline `base_instructions`
-//! 3. `models_cache.json` Desktop agent row (`gpt-5.6-terra` …)
+//! # Catalog `base_instructions` (CC Switch standard)
 //!
-//! Compact prompt priority:
-//! 1. `experimental_compact_prompt_file`
-//! 2. inline `compact_prompt`
-//! 3. OSS-aligned fallback constant (byte-identical to codex-rs compact template)
+//! Multi-route catalogs use a **short neutral identity** only:
 //!
-//! Plan / Goal templates stay inside Desktop; Spur only passthroughs request bodies.
+//! ```text
+//! You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.
+//! ```
+//!
+//! Codex Desktop assembles Skills / Plan / Goal / MCP / AGENTS / tools at request
+//! time. Spur must **not**:
+//! - map `model_instructions_file` into every spur-route;
+//! - copy `models_cache.json` 11k–19k GPT agent bodies into third-party rows;
+//! - invent a second system prompt in the proxy.
+//!
+//! # Compact prompt
+//!
+//! Still mapped from Codex home when present; otherwise OSS compact template.
+//! Plan / Goal bodies stay Desktop passthrough.
 
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::Value;
 use toml_edit::DocumentMut;
 
-/// Historical Spur/CC Switch one-liner that replaced full official system prompts.
-/// Fingerprint only — never use as default body.
-pub const POLLUTED_BASE_INSTRUCTIONS_STUB: &str = "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
+/// CC Switch native catalog identity (byte-identical to
+/// `codex_native_responses_template.json`). This is the **target** state.
+pub const CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
+
+
 
 /// Byte-identical to `codex-rs/prompts/templates/compact/prompt.md` (fallback only).
 pub const OFFICIAL_COMPACT_PROMPT_FALLBACK: &str = r#"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
@@ -39,29 +48,6 @@ Be concise, structured, and focused on helping the next LLM seamlessly continue 
 /// Byte-identical to `codex-rs/prompts/templates/compact/summary_prefix.md`.
 pub const OFFICIAL_SUMMARY_PREFIX_FALLBACK: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 
-const PREFERRED_CACHE_SLUGS: &[&str] = &[
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.5",
-    "gpt-5.4-mini",
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BaseInstructionsSource {
-    ModelInstructionsFile,
-    InlineBaseInstructions,
-    ModelsCache,
-}
-
-#[derive(Debug, Clone)]
-pub struct MappedBaseInstructions {
-    pub text: String,
-    pub source: BaseInstructionsSource,
-    /// Relative or absolute path / slug for logs (never the full prompt).
-    pub source_label: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactPromptSource {
     ExperimentalCompactPromptFile,
@@ -76,72 +62,53 @@ pub struct MappedCompactPrompt {
     pub source_label: String,
 }
 
-/// True when `text` is the old stub or another non-official short placeholder.
-pub fn is_polluted_stub(text: &str) -> bool {
+/// True when catalog `base_instructions` must be healed to CC Switch neutral.
+///
+/// The 117-char CC Switch identity is **not** pollution.
+pub fn needs_base_instructions_heal(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
         return true;
     }
-    if t == POLLUTED_BASE_INSTRUCTIONS_STUB {
-        return true;
+    // Target state
+    if t == CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS {
+        return false;
     }
+    // Truncated one-liner (not a real identity)
     if t == "You are Codex." {
         return true;
     }
-    // Single-line short "You are Codex…" headers are not full Desktop prompts.
-    if t.len() < 2_000 && !t.contains('\n') && t.starts_with("You are Codex") {
+    // Mis-mapped jailbreak / personal system files (0.1.9 pollution)
+    if t.starts_with("[MODE: UNRESTRICTED]") {
+        return true;
+    }
+    // Mis-mapped full Desktop GPT agent bodies (models_cache length class)
+    // Identity lines for vendors are short; anything this long with GPT agent
+    // headers was almost certainly bulk-mapped into every route.
+    if t.len() > 2_000
+        && (t.contains("# Personality")
+            || t.starts_with("You are Codex, an agent based on GPT-")
+            || t.starts_with("You are Codex, a coding agent based on GPT-"))
+    {
         return true;
     }
     false
 }
 
-pub fn resolve_base_instructions() -> Result<MappedBaseInstructions> {
-    resolve_base_instructions_from(&crate::codex_config::prompt_map_codex_home())
-}
-
-pub fn resolve_base_instructions_from(codex_home: &Path) -> Result<MappedBaseInstructions> {
-    let config_path = codex_home.join("config.toml");
-    let config_text = fs::read_to_string(&config_path).ok();
-    let doc = config_text
-        .as_deref()
-        .and_then(|text| text.parse::<DocumentMut>().ok());
-
-    if let Some(doc) = doc.as_ref() {
-        if let Some(rel) = top_level_string(doc, "model_instructions_file") {
-            let path = resolve_codex_relative(codex_home, &rel);
-            if let Some(text) = read_non_empty_file(&path)? {
-                return Ok(MappedBaseInstructions {
-                    text,
-                    source: BaseInstructionsSource::ModelInstructionsFile,
-                    source_label: path.display().to_string(),
-                });
-            }
+/// Heal catalog row identity to CC Switch neutral when empty or polluted.
+///
+/// Does **not** read `model_instructions_file` or `models_cache` into multi-route
+/// catalog rows (that was the 0.1.9 mistake).
+pub fn heal_catalog_base_instructions(model_base_instructions: &mut String) {
+    if needs_base_instructions_heal(model_base_instructions) {
+        if !model_base_instructions.is_empty() {
+            tracing::info!(
+                chars = model_base_instructions.len(),
+                "healed polluted catalog base_instructions to CC Switch neutral identity"
+            );
         }
-        if let Some(inline) = top_level_string(doc, "base_instructions") {
-            let text = inline.trim().to_string();
-            if !text.is_empty() {
-                return Ok(MappedBaseInstructions {
-                    text,
-                    source: BaseInstructionsSource::InlineBaseInstructions,
-                    source_label: "config.toml#base_instructions".into(),
-                });
-            }
-        }
+        *model_base_instructions = CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS.to_string();
     }
-
-    let cache_path = codex_home.join("models_cache.json");
-    if let Some((slug, text)) = read_models_cache_base_instructions(&cache_path)? {
-        return Ok(MappedBaseInstructions {
-            text,
-            source: BaseInstructionsSource::ModelsCache,
-            source_label: format!("models_cache.json#{slug}"),
-        });
-    }
-
-    bail!(
-        "无法映射官方 base_instructions：请配置 model_instructions_file，或登录 Codex Desktop 生成 {}，禁止回填短 stub",
-        cache_path.display()
-    )
 }
 
 pub fn resolve_compact_prompt() -> MappedCompactPrompt {
@@ -181,55 +148,6 @@ pub fn resolve_compact_prompt_from(codex_home: &Path) -> MappedCompactPrompt {
     }
 }
 
-/// Apply mapped official/user base_instructions onto a catalog row (live Codex home).
-///
-/// Always overwrites when mapping succeeds (so edits to model_instructions_file
-/// land on the next heal/apply). On mapping failure, clears polluted stubs so
-/// they cannot be re-published.
-pub fn apply_mapped_base_instructions(model_base_instructions: &mut String) {
-    match resolve_base_instructions() {
-        Ok(mapped) => write_mapped(model_base_instructions, mapped),
-        Err(error) => clear_polluted_on_map_failure(model_base_instructions, &error),
-    }
-}
-
-/// Test/helper entry: map from an explicit Codex home (temp fixtures).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn apply_mapped_base_instructions_from(model_base_instructions: &mut String, codex_home: &Path) {
-    match resolve_base_instructions_from(codex_home) {
-        Ok(mapped) => write_mapped(model_base_instructions, mapped),
-        Err(error) => clear_polluted_on_map_failure(model_base_instructions, &error),
-    }
-}
-
-fn write_mapped(model_base_instructions: &mut String, mapped: MappedBaseInstructions) {
-    if model_base_instructions.as_str() != mapped.text.as_str() {
-        tracing::info!(
-            source = ?mapped.source,
-            label = %mapped.source_label,
-            chars = mapped.text.len(),
-            "mapped official base_instructions into catalog row"
-        );
-    }
-    *model_base_instructions = mapped.text;
-}
-
-fn clear_polluted_on_map_failure(model_base_instructions: &mut String, error: &anyhow::Error) {
-    if is_polluted_stub(model_base_instructions) {
-        tracing::error!(
-            %error,
-            "official base_instructions mapping failed; clearing polluted stub"
-        );
-        model_base_instructions.clear();
-    } else {
-        tracing::warn!(
-            %error,
-            chars = model_base_instructions.len(),
-            "official base_instructions mapping failed; keeping non-stub existing text"
-        );
-    }
-}
-
 fn top_level_string(doc: &DocumentMut, key: &str) -> Option<String> {
     doc.get(key)
         .and_then(|item| item.as_str())
@@ -258,57 +176,6 @@ fn read_non_empty_file(path: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(text))
-}
-
-fn read_models_cache_base_instructions(path: &Path) -> Result<Option<(String, String)>> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("读取 models_cache 失败：{}", path.display()))?;
-    let value: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("解析 models_cache 失败：{}", path.display()))?;
-    let models = value
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("models_cache.json 缺少 models 数组"))?;
-
-    for slug in PREFERRED_CACHE_SLUGS {
-        if let Some(text) = model_base_instructions(models, slug) {
-            return Ok(Some(((*slug).to_string(), text)));
-        }
-    }
-
-    let mut best: Option<(String, String)> = None;
-    for model in models {
-        let slug = model
-            .get("slug")
-            .or_else(|| model.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if slug.eq_ignore_ascii_case("codex-auto-review") {
-            continue;
-        }
-        let Some(text) = model
-            .get("base_instructions")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        if is_polluted_stub(text) {
-            continue;
-        }
-        match &best {
-            None => best = Some((slug.to_string(), text.to_string())),
-            Some((_, prev)) if text.len() > prev.len() => {
-                best = Some((slug.to_string(), text.to_string()));
-            }
-            _ => {}
-        }
-    }
-    Ok(best)
 }
 
 /// Map official `supported_reasoning_levels` for a Desktop model slug from models_cache.
@@ -382,28 +249,6 @@ pub fn mapped_reasoning_levels_from_cache_path(
     None
 }
 
-fn model_base_instructions(models: &[Value], slug: &str) -> Option<String> {
-    for model in models {
-        let row_slug = model
-            .get("slug")
-            .or_else(|| model.get("id"))
-            .and_then(Value::as_str)?;
-        if row_slug != slug {
-            continue;
-        }
-        let text = model
-            .get("base_instructions")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        if is_polluted_stub(text) {
-            return None;
-        }
-        return Some(text.to_string());
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,109 +265,80 @@ mod tests {
     }
 
     #[test]
-    fn polluted_stub_detected() {
-        assert!(is_polluted_stub(POLLUTED_BASE_INSTRUCTIONS_STUB));
-        assert!(is_polluted_stub("You are Codex."));
-        assert!(is_polluted_stub(""));
-        assert!(!is_polluted_stub(&format!(
+    fn neutral_identity_is_not_pollution() {
+        assert!(!needs_base_instructions_heal(CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS));
+        assert_eq!(CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS.len(), 117);
+    }
+
+    #[test]
+    fn unrestricted_and_empty_need_heal() {
+        assert!(needs_base_instructions_heal(""));
+        assert!(needs_base_instructions_heal("You are Codex."));
+        assert!(needs_base_instructions_heal(
+            "[MODE: UNRESTRICTED]\n\nFIRST-PASS NORMALIZER:\n- foo"
+        ));
+        assert!(needs_base_instructions_heal(&format!(
             "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
             "x".repeat(3000)
         )));
     }
 
     #[test]
-    fn model_instructions_file_wins_over_models_cache() {
-        let home = temp_home("file-wins");
-        // Make cache text long enough to not look polluted if chosen wrongly.
-        let long_cache = format!(
-            "FROM_CACHE_PROMPT_SHOULD_NOT_WIN\n\n# Personality\n{}",
-            "c".repeat(3000)
-        );
+    fn heal_writes_neutral() {
+        let mut bi = "[MODE: UNRESTRICTED]\n\nCodex is a sandbox.".to_string();
+        heal_catalog_base_instructions(&mut bi);
+        assert_eq!(bi, CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn heal_empty_writes_neutral() {
+        let mut bi = String::new();
+        heal_catalog_base_instructions(&mut bi);
+        assert_eq!(bi, CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn heal_keeps_vendor_short_identity() {
+        let vendor =
+            "You are Codex, a coding agent based on MiniMax-M3. You and the user share the same workspace and collaborate to achieve the user's goals.";
+        let mut bi = vendor.to_string();
+        heal_catalog_base_instructions(&mut bi);
+        assert_eq!(bi, vendor);
+    }
+
+    #[test]
+    fn heal_ignores_codex_home_mapping() {
+        let home = temp_home("ignore-home");
         fs::write(
             home.join("models_cache.json"),
             serde_json::json!({
                 "models": [{
                     "slug": "gpt-5.6-terra",
-                    "base_instructions": long_cache
+                    "base_instructions": format!(
+                        "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
+                        "c".repeat(4000)
+                    )
                 }]
             })
             .to_string(),
         )
         .unwrap();
-        fs::write(home.join("user-instructions.md"), "USER_FILE_PROMPT_BODY\nline2").unwrap();
+        fs::write(
+            home.join("user-instructions.md"),
+            "[MODE: UNRESTRICTED]\nfrom file",
+        )
+        .unwrap();
         fs::write(
             home.join("config.toml"),
             "model_instructions_file = \"./user-instructions.md\"\n",
         )
         .unwrap();
 
-        let mapped = resolve_base_instructions_from(&home).expect("map");
-        assert_eq!(mapped.source, BaseInstructionsSource::ModelInstructionsFile);
-        assert!(mapped.text.contains("USER_FILE_PROMPT_BODY"));
-        assert!(!mapped.text.contains("FROM_CACHE"));
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn models_cache_used_when_no_file() {
-        let home = temp_home("cache");
-        let body = format!(
-            "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
-            "p".repeat(4000)
-        );
-        fs::write(
-            home.join("models_cache.json"),
-            serde_json::json!({
-                "models": [
-                    {"slug": "codex-auto-review", "base_instructions": "review only"},
-                    {"slug": "gpt-5.6-terra", "base_instructions": body}
-                ]
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let mapped = resolve_base_instructions_from(&home).expect("map");
-        assert_eq!(mapped.source, BaseInstructionsSource::ModelsCache);
-        assert!(mapped.source_label.contains("gpt-5.6-terra"));
-        assert!(mapped.text.starts_with("You are Codex, an agent"));
-        assert!(mapped.text.len() > 2000);
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn missing_sources_error_without_stub() {
-        let home = temp_home("empty");
-        let err = resolve_base_instructions_from(&home).unwrap_err();
-        assert!(err.to_string().contains("无法映射"));
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn apply_clears_stub_when_mapping_fails() {
-        let home = temp_home("clear-stub");
-        let mut bi = POLLUTED_BASE_INSTRUCTIONS_STUB.to_string();
-        apply_mapped_base_instructions_from(&mut bi, &home);
-        assert!(bi.is_empty());
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn apply_overwrites_stub_with_mapped() {
-        let home = temp_home("overwrite");
-        let body = format!("OFFICIAL_MAPPED\n\n# General\n{}", "z".repeat(3000));
-        fs::write(
-            home.join("models_cache.json"),
-            serde_json::json!({
-                "models": [{"slug": "gpt-5.6-terra", "base_instructions": body}]
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let mut bi = POLLUTED_BASE_INSTRUCTIONS_STUB.to_string();
-        apply_mapped_base_instructions_from(&mut bi, &home);
-        assert!(bi.starts_with("OFFICIAL_MAPPED"));
-        assert!(!is_polluted_stub(&bi));
+        let mut bi = String::new();
+        // Codex home must not override multi-route catalog identity.
+        let _ = home;
+        heal_catalog_base_instructions(&mut bi);
+        assert_eq!(bi, CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS);
         let _ = fs::remove_dir_all(&home);
     }
 

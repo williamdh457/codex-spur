@@ -423,7 +423,7 @@ pub fn placeholder_model(slug: String, display_name: String) -> CatalogModel {
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        // Filled by normalize via official_prompt_map (model_instructions_file / models_cache).
+        // Filled by normalize to CC Switch neutral identity.
         base_instructions: String::new(),
         model_messages: None,
         include_skills_usage_instructions: false,
@@ -472,8 +472,7 @@ mod tests {
     ) -> StoredRoute {
         let legacy = legacy_route_slug(provider_id, upstream);
         // Intentionally stale: slash slug + camelCase + truncated ladder (what used to break GUI).
-        // Long base_instructions survive when live prompt-map is unavailable in parallel tests;
-        // normalize still overwrites with mapped official/user text when ~/.codex is readable.
+        // Intentionally polluted long body — normalize heals to CC Switch neutral.
         let fixture_bi = format!(
             "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
             "fixture".repeat(400)
@@ -702,16 +701,12 @@ mod tests {
 
     #[test]
     fn strict_validation_checks_every_model_and_required_empty_arrays() {
-        // Do not depend on live ~/.codex mapping (other tests may hijack
-        // CODEX_SPUR_PUBLISH_HOME). Inject a non-stub body for structure checks.
-        let mapped_body = format!(
-            "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
-            "x".repeat(3000)
-        );
+        let neutral =
+            crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS.to_string();
         let mut first = placeholder_model("spur-route-first".into(), "First".into());
         let mut second = placeholder_model("spur-route-second".into(), "Second".into());
-        first.base_instructions = mapped_body.clone();
-        second.base_instructions = mapped_body;
+        first.base_instructions = neutral.clone();
+        second.base_instructions = neutral;
         first.experimental_supported_tools.clear();
         validate_catalog(&ModelsResponse {
             models: vec![first.clone(), second.clone()],
@@ -750,10 +745,8 @@ mod tests {
             crate::reasoning_map::ReasoningProfileId::Kimi,
         );
         model.default_reasoning_level = Some(ReasoningEffort::Medium);
-        model.base_instructions = format!(
-            "You are Codex, an agent based on GPT-5.\n\n# Personality\n{}",
-            "x".repeat(3000)
-        );
+        model.base_instructions =
+            crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS.into();
         validate_catalog(&ModelsResponse {
             models: vec![model],
         })
@@ -793,6 +786,11 @@ mod tests {
         assert_eq!(
             payload.model.effective_context_window_percent,
             crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT
+        );
+        assert_eq!(
+            payload.model.base_instructions,
+            crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS,
+            "polluted long base_instructions must heal to CC Switch neutral"
         );
     }
 
