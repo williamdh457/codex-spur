@@ -154,83 +154,100 @@ function Overview({
         <Metric label="健康账号" value={String(snapshot.healthyAccounts)} note="可参与调度" />
       </section>
 
-      <section className="panel panel--policy" aria-label="会话策略">
-        <div className="panel__header">
-          <div>
-            <h2>会话策略</h2>
-            <p>决定同一对话里能不能中途换模型，以及 OpenAI 云端加密压缩。</p>
-          </div>
-        </div>
-        <div
-          className="segmented-control conversation-policy-control"
-          role="radiogroup"
-          aria-label="中途换模型"
-        >
-          <button
-            type="button"
-            role="radio"
-            aria-checked={allowSwitch}
-            className={allowSwitch ? "is-active" : undefined}
-            disabled={policyBusy}
-            onClick={() =>
-              onConversationPolicyChange({
-                midThread: "allowSwitch",
-                openaiCloudCompact: false,
-              })
-            }
+      <section className="policy-card" aria-label="会话策略">
+        <header className="policy-card__head">
+          <h2>会话策略</h2>
+          <p>同一对话里能不能换模型，以及是否启用 OpenAI 云端压缩</p>
+        </header>
+
+        <div className="policy-card__body">
+          <div
+            className="policy-switch"
+            role="radiogroup"
+            aria-label="中途换模型"
           >
-            允许中途换模型
-          </button>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={!allowSwitch}
-            className={!allowSwitch ? "is-active" : undefined}
-            disabled={policyBusy}
-            onClick={() =>
-              onConversationPolicyChange({
-                midThread: "stickyNoSwitch",
-                openaiCloudCompact: policy.openaiCloudCompact,
-              })
-            }
-          >
-            不中途换模型
-          </button>
-        </div>
-        <p className="conversation-policy-help">
-          {allowSwitch
-            ? "默认推荐：OpenAI ↔ Grok ↔ Kimi 可同线程切换。压缩用可移植摘要（spur1），双方都能读；OpenAI 云端加密黑科技关闭。"
-            : "连续使用同一厂（尤其 GPT 族）。可开启下方云端压缩；换到其它厂请新开线程。"}
-        </p>
-        {!allowSwitch ? (
-          <label className="conversation-policy-cloud">
-            <input
-              type="checkbox"
-              checked={policy.openaiCloudCompact}
+            <button
+              type="button"
+              role="radio"
+              aria-checked={allowSwitch}
+              className={`policy-switch__option${allowSwitch ? " is-active" : ""}`}
               disabled={policyBusy}
-              onChange={(event) =>
+              onClick={() =>
                 onConversationPolicyChange({
-                  midThread: "stickyNoSwitch",
-                  openaiCloudCompact: event.target.checked,
+                  midThread: "allowSwitch",
+                  openaiCloudCompact: false,
                 })
               }
-            />
-            <span>
-              <strong>启用 OpenAI 云端加密压缩</strong>
-              <small>
-                对齐 CC Switch：Apply 后 provider name=OpenAI，走服务端加密 compact。改完后请 Review &amp; Apply。
-              </small>
-            </span>
-          </label>
-        ) : null}
-        {policy.openaiCloudCompact && !allowSwitch ? (
-          <div className="callout callout--inline callout--warning">
-            <strong>云端压缩已开</strong>
-            <p>
-              请连续使用 OpenAI/GPT 模型。中途切到 Grok / Kimi / DeepSeek 会读不了加密摘要——请新开对话，或改回「允许中途换模型」。
-            </p>
+            >
+              <span className="policy-switch__title">允许中途换</span>
+              <span className="policy-switch__hint">可移植压缩 · 推荐</span>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={!allowSwitch}
+              className={`policy-switch__option${!allowSwitch ? " is-active" : ""}`}
+              disabled={policyBusy}
+              onClick={() =>
+                onConversationPolicyChange({
+                  midThread: "stickyNoSwitch",
+                  openaiCloudCompact: policy.openaiCloudCompact,
+                })
+              }
+            >
+              <span className="policy-switch__title">不中途换</span>
+              <span className="policy-switch__hint">固定同厂 · 可开云压缩</span>
+            </button>
           </div>
-        ) : null}
+
+          <div className="policy-summary" data-mode={allowSwitch ? "portable" : "sticky"}>
+            {allowSwitch ? (
+              <>
+                <p className="policy-summary__lead">同线程可切换 OpenAI / Grok / Kimi / DeepSeek</p>
+                <p className="policy-summary__meta">
+                  压缩摘要双方可读 · 云端加密压缩关闭
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="policy-summary__lead">本会话连续使用同一厂（尤其 GPT）</p>
+                <p className="policy-summary__meta">
+                  换厂请新开线程 · 可选下方云端压缩
+                </p>
+              </>
+            )}
+          </div>
+
+          {!allowSwitch ? (
+            <label
+              className={`policy-cloud${policy.openaiCloudCompact ? " is-on" : ""}`}
+            >
+              <input
+                type="checkbox"
+                checked={policy.openaiCloudCompact}
+                disabled={policyBusy}
+                onChange={(event) =>
+                  onConversationPolicyChange({
+                    midThread: "stickyNoSwitch",
+                    openaiCloudCompact: event.target.checked,
+                  })
+                }
+              />
+              <span className="policy-cloud__text">
+                <span className="policy-cloud__title">OpenAI 云端加密压缩</span>
+                <span className="policy-cloud__desc">
+                  改完后请 Review &amp; Apply · 仅适合连续 GPT
+                </span>
+              </span>
+            </label>
+          ) : null}
+
+          {policy.openaiCloudCompact && !allowSwitch ? (
+            <p className="policy-warn" role="status">
+              云端压缩已开：切到 Grok / Kimi / DeepSeek 前请新开对话
+            </p>
+          ) : null}
+        </div>
       </section>
 
       <section className="panel">
