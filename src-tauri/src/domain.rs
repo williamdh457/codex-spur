@@ -301,6 +301,106 @@ pub struct UsageDashboardSnapshot {
     pub providers: Vec<UsageBreakdown>,
 }
 
+/// Mid-thread model switching policy (main Overview control).
+///
+/// - `AllowSwitch` (default): portable spur1 compact; OpenAI↔Grok↔Kimi same thread OK.
+/// - `StickyNoSwitch`: prefer continuous same-family use; optional OpenAI cloud compact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MidThreadModelPolicy {
+    #[default]
+    AllowSwitch,
+    StickyNoSwitch,
+}
+
+impl MidThreadModelPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowSwitch => "allowSwitch",
+            Self::StickyNoSwitch => "stickyNoSwitch",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "stickyNoSwitch" | "sticky" | "no_switch" | "noSwitch" => Self::StickyNoSwitch,
+            _ => Self::AllowSwitch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPolicy {
+    /// Default: allow mid-thread model switches with portable compact.
+    pub mid_thread: MidThreadModelPolicy,
+    /// Only meaningful when `mid_thread == StickyNoSwitch`. Enables OpenAI
+    /// Remote Compact V2 (provider name `OpenAI` + proxy pass-through).
+    pub openai_cloud_compact: bool,
+}
+
+impl Default for ConversationPolicy {
+    fn default() -> Self {
+        Self {
+            mid_thread: MidThreadModelPolicy::AllowSwitch,
+            openai_cloud_compact: false,
+        }
+    }
+}
+
+impl ConversationPolicy {
+    /// True when Desktop should request OpenAI-native encrypted cloud compact
+    /// and Spur must not intercept those compact beats with spur1.
+    pub fn uses_openai_cloud_compact(self) -> bool {
+        matches!(self.mid_thread, MidThreadModelPolicy::StickyNoSwitch)
+            && self.openai_cloud_compact
+    }
+
+    /// Normalize illegal combinations.
+    /// Allow-switch always disables cloud compact. Cloud compact only sticks
+    /// when the user is already in sticky mode.
+    pub fn sanitized(self) -> Self {
+        if matches!(self.mid_thread, MidThreadModelPolicy::AllowSwitch) {
+            Self {
+                mid_thread: MidThreadModelPolicy::AllowSwitch,
+                openai_cloud_compact: false,
+            }
+        } else {
+            Self {
+                mid_thread: MidThreadModelPolicy::StickyNoSwitch,
+                openai_cloud_compact: self.openai_cloud_compact,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod conversation_policy_tests {
+    use super::*;
+
+    #[test]
+    fn allow_switch_clears_cloud_compact() {
+        let p = ConversationPolicy {
+            mid_thread: MidThreadModelPolicy::AllowSwitch,
+            openai_cloud_compact: true,
+        }
+        .sanitized();
+        assert_eq!(p.mid_thread, MidThreadModelPolicy::AllowSwitch);
+        assert!(!p.openai_cloud_compact);
+        assert!(!p.uses_openai_cloud_compact());
+    }
+
+    #[test]
+    fn cloud_compact_requires_sticky() {
+        let p = ConversationPolicy {
+            mid_thread: MidThreadModelPolicy::StickyNoSwitch,
+            openai_cloud_compact: true,
+        }
+        .sanitized();
+        assert!(p.uses_openai_cloud_compact());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSnapshot {
@@ -311,6 +411,9 @@ pub struct AppSnapshot {
     pub healthy_accounts: u32,
     pub attention_items: Vec<String>,
     pub desktop_visibility: DesktopVisibility,
+    /// Main-UI conversation / compact policy.
+    #[serde(default)]
+    pub conversation_policy: ConversationPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

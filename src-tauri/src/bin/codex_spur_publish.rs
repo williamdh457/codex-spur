@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let base_url = "http://127.0.0.1:17861/v1";
 
-    let result = codex_config::apply(base_url, &bearer, &catalog)?;
+    let result = codex_config::apply(base_url, &bearer, &catalog, false)?;
     let live = codex_config::inspect_live_binding();
     let visibility = codex_config::inspect_desktop_visibility(None, Some(base_url));
 

@@ -8,6 +8,7 @@ import type {
   AppSnapshot,
   ApplyPreview,
   CodexApplyOutcome,
+  ConversationPolicy,
   CredentialSummary,
   KimiListShieldStatus,
   KimiPublishOutcome,
@@ -22,6 +23,11 @@ import type {
   UsageDashboardSnapshot,
   UsageRange,
 } from "./types";
+
+const defaultConversationPolicy: ConversationPolicy = {
+  midThread: "allowSwitch",
+  openaiCloudCompact: false,
+};
 
 const browserFallback: AppSnapshot = {
   proxy: {
@@ -55,6 +61,7 @@ const browserFallback: AppSnapshot = {
       },
     ],
   },
+  conversationPolicy: defaultConversationPolicy,
 };
 
 function isTauriRuntime(): boolean {
@@ -63,6 +70,24 @@ function isTauriRuntime(): boolean {
 
 export async function getAppSnapshot(): Promise<AppSnapshot> {
   return isTauriRuntime() ? invoke<AppSnapshot>("get_app_snapshot") : browserFallback;
+}
+
+export async function getConversationPolicy(): Promise<ConversationPolicy> {
+  if (!isTauriRuntime()) return defaultConversationPolicy;
+  return invoke<ConversationPolicy>("get_conversation_policy");
+}
+
+export async function setConversationPolicy(
+  policy: ConversationPolicy,
+): Promise<ConversationPolicy> {
+  if (!isTauriRuntime()) {
+    return {
+      midThread: policy.midThread,
+      openaiCloudCompact:
+        policy.midThread === "stickyNoSwitch" ? policy.openaiCloudCompact : false,
+    };
+  }
+  return invoke<ConversationPolicy>("set_conversation_policy", { policy });
 }
 
 export async function previewCodexApply(): Promise<ApplyPreview> {

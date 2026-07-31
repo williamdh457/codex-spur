@@ -103,6 +103,10 @@ impl AppState {
         if published_models == 0 {
             attention_items.push("添加供应商并拉取模型后，才能应用到 Codex。".into());
         }
+        let conversation_policy = storage
+            .get_conversation_policy()
+            .await
+            .unwrap_or_default();
         let snapshot = AppSnapshot {
             proxy: ProxyStatus {
                 running: true,
@@ -122,6 +126,7 @@ impl AppState {
             healthy_accounts: credentials.iter().filter(|item| item.healthy).count() as u32,
             attention_items,
             desktop_visibility,
+            conversation_policy,
         };
         let state = Self {
             snapshot: RwLock::new(snapshot),
@@ -453,7 +458,40 @@ async fn get_app_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, Str
             .attention_items
             .push("添加供应商并拉取模型后，才能应用到 Codex。".into());
     }
+    snapshot.conversation_policy = state
+        .storage
+        .get_conversation_policy()
+        .await
+        .unwrap_or_default();
     Ok(snapshot.clone())
+}
+
+#[tauri::command]
+async fn get_conversation_policy(
+    state: State<'_, AppState>,
+) -> Result<domain::ConversationPolicy, String> {
+    state
+        .storage
+        .get_conversation_policy()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_conversation_policy(
+    policy: domain::ConversationPolicy,
+    state: State<'_, AppState>,
+) -> Result<domain::ConversationPolicy, String> {
+    let saved = state
+        .storage
+        .set_conversation_policy(&policy)
+        .await
+        .map_err(|error| error.to_string())?;
+    {
+        let mut snapshot = state.snapshot.write().await;
+        snapshot.conversation_policy = saved.clone();
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -484,7 +522,13 @@ async fn apply_codex_config(state: State<'_, AppState>) -> Result<CodexApplyOutc
     let probe_warnings = probe_enabled_third_party_routes(&state).await?;
     let catalog = state.catalog.read().await.clone();
     let proxy = state.proxy.read().await;
-    let mut result = codex_config::apply(&base_url, &proxy.secret, &catalog)
+    let cloud_compact = state
+        .storage
+        .get_conversation_policy()
+        .await
+        .map(|p| p.uses_openai_cloud_compact())
+        .unwrap_or(false);
+    let mut result = codex_config::apply(&base_url, &proxy.secret, &catalog, cloud_compact)
         .map_err(|error| error.to_string())?;
     result.warnings.extend(probe_warnings);
     // Fail closed: re-read live publish home; never toast success if still CC Switch.
@@ -2087,7 +2131,14 @@ async fn republish_codex_catalog_best_effort(state: &AppState) -> Result<(), Str
     };
     state.rebuild_runtime().await?;
     let catalog = state.catalog.read().await.clone();
-    let result = codex_config::apply(&base_url, &secret, &catalog).map_err(|e| e.to_string())?;
+    let cloud_compact = state
+        .storage
+        .get_conversation_policy()
+        .await
+        .map(|p| p.uses_openai_cloud_compact())
+        .unwrap_or(false);
+    let result = codex_config::apply(&base_url, &secret, &catalog, cloud_compact)
+        .map_err(|e| e.to_string())?;
     let _ = state
         .storage
         .record_apply_revision(
@@ -3257,6 +3308,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
+            get_conversation_policy,
+            set_conversation_policy,
             get_usage_snapshot,
             get_usage_dashboard,
             preview_codex_apply,

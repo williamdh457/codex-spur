@@ -295,6 +295,19 @@ export type DesktopVisibility = {
   checks: DesktopVisibilityCheck[];
 };
 
+/** Mid-thread model switch policy (Overview main control). */
+export type MidThreadModelPolicy = "allowSwitch" | "stickyNoSwitch";
+
+export type ConversationPolicy = {
+  /** Default allowSwitch: portable compact, cross-model mid-thread OK. */
+  midThread: MidThreadModelPolicy;
+  /**
+   * Only when midThread === stickyNoSwitch.
+   * Writes provider name=OpenAI and lets Remote Compact V2 through.
+   */
+  openaiCloudCompact: boolean;
+};
+
 export type AppSnapshot = {
   proxy: ProxyStatus;
   binding: CodexBindingStatus;
@@ -303,6 +316,7 @@ export type AppSnapshot = {
   healthyAccounts: number;
   attentionItems: string[];
   desktopVisibility: DesktopVisibility;
+  conversationPolicy?: ConversationPolicy;
 };
 
 export type ApplyPreview = {

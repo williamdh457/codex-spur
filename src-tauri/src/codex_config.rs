@@ -82,6 +82,10 @@ pub const DESKTOP_AUTH_REQUIRED_MSG: &str = "未检测到有效的 ChatGPT 官�
 /// compaction solely when the provider display name is exactly `OpenAI`.
 pub const CODEX_SELECT_PROVIDER_NAME: &str = "Codex Spur";
 
+/// Provider display name that unlocks Desktop Remote Compact V2 (encrypted cloud).
+/// Only written when the user opts into sticky + OpenAI cloud compact.
+pub const CODEX_OPENAI_CLOUD_COMPACT_NAME: &str = "OpenAI";
+
 /// Top-level Codex config key that gates Desktop's hosted web_search tool.
 /// Aligns with CC Switch: some native `/responses` gateways hard-400 on that tool.
 pub const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -216,10 +220,13 @@ pub fn inspect_desktop_visibility(
         .as_ref()
         .and_then(|doc| doc.get("model_providers"))
         .and_then(|item| item.get("codex_select"));
-    let gate_name_ok = select_table
+    let gate_name = select_table
         .and_then(|item| item.get("name"))
         .and_then(|item| item.as_str())
-        == Some(CODEX_SELECT_PROVIDER_NAME);
+        .unwrap_or("");
+    // Portable compact uses "Codex Spur"; sticky cloud compact uses "OpenAI".
+    let gate_name_ok =
+        gate_name == CODEX_SELECT_PROVIDER_NAME || gate_name == CODEX_OPENAI_CLOUD_COMPACT_NAME;
     let gate_auth_ok = select_table
         .and_then(|item| item.get("requires_openai_auth"))
         .and_then(|item| item.as_bool())
@@ -245,11 +252,13 @@ pub fn inspect_desktop_visibility(
         }
     } else if !gate_name_ok || !gate_auth_ok {
         format!(
-            "门控被改坏：需要 name = \"{CODEX_SELECT_PROVIDER_NAME}\" 且 requires_openai_auth = true；请重新 Apply"
+            "门控被改坏：需要 name = \"{CODEX_SELECT_PROVIDER_NAME}\" 或 \"{CODEX_OPENAI_CLOUD_COMPACT_NAME}\" 且 requires_openai_auth = true；请重新 Apply"
         )
+    } else if gate_name == CODEX_OPENAI_CLOUD_COMPACT_NAME {
+        "name = OpenAI + requires_openai_auth = true（云端加密压缩；中途换厂请新开线程）".into()
     } else {
         format!(
-            "name = {CODEX_SELECT_PROVIDER_NAME} + requires_openai_auth = true（官方 Local Compact）"
+            "name = {CODEX_SELECT_PROVIDER_NAME} + requires_openai_auth = true（可移植压缩，允许中途换模型）"
         )
     };
     checks.push(DesktopVisibilityCheck {
@@ -563,7 +572,12 @@ pub struct ApplyResult {
     pub warnings: Vec<String>,
 }
 
-pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Result<ApplyResult> {
+pub fn apply(
+    base_url: &str,
+    bearer_token: &str,
+    catalog: &ModelsResponse,
+    openai_cloud_compact: bool,
+) -> Result<ApplyResult> {
     if catalog.models.is_empty() {
         anyhow::bail!("至少选择一个模型后才能应用到 Codex");
     }
@@ -705,15 +719,25 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
         .as_table_mut()
         .context("model_providers 不是 TOML table")?;
     let mut select_provider = Table::new();
-    // Keep official ChatGPT login for Desktop identity/catalog gating, but publish a
-    // non-OpenAI provider name. Codex's official `supports_remote_compaction()`
-    // checks the display name only: exactly `OpenAI` selects opaque remote compact;
-    // this name selects official local compact and leaves a portable plaintext summary.
+    // Codex `supports_remote_compaction()` is true only when name == "OpenAI".
+    // Default ("Codex Spur") → local/portable compact (mid-thread switch OK).
+    // Sticky + cloud compact → "OpenAI" so Desktop requests encrypted Remote Compact V2.
     // Request auth still uses experimental_bearer_token against the local Spur proxy.
-    select_provider["name"] = value(CODEX_SELECT_PROVIDER_NAME);
+    let provider_display_name = if openai_cloud_compact {
+        CODEX_OPENAI_CLOUD_COMPACT_NAME
+    } else {
+        CODEX_SELECT_PROVIDER_NAME
+    };
+    select_provider["name"] = value(provider_display_name);
     select_provider["base_url"] = value(base_url);
     select_provider["wire_api"] = value("responses");
     select_provider["requires_openai_auth"] = value(true);
+    if openai_cloud_compact {
+        warnings.push(
+            "已启用 OpenAI 云端加密压缩：请连续使用 GPT 族；中途换到 Grok/Kimi/DeepSeek 请新开线程。"
+                .into(),
+        );
+    }
     // Explicit false: Codex defaults may probe websocket /v1/responses and surface
     // multi-retry reconnects before falling back to SSE (Nice/CC Switch pattern).
     select_provider["supports_websockets"] = value(false);
@@ -767,18 +791,27 @@ pub fn apply(base_url: &str, bearer_token: &str, catalog: &ModelsResponse) -> Re
         let select_table = verified
             .get("model_providers")
             .and_then(|item| item.get("codex_select"));
+        let written_name = select_table
+            .and_then(|item| item.get("name"))
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        let name_ok = written_name == CODEX_SELECT_PROVIDER_NAME
+            || written_name == CODEX_OPENAI_CLOUD_COMPACT_NAME;
         let desktop_gate_ok = select_table
             .and_then(|item| item.get("requires_openai_auth"))
             .and_then(|item| item.as_bool())
             == Some(true)
-            && select_table
-                .and_then(|item| item.get("name"))
-                .and_then(|item| item.as_str())
-                == Some(CODEX_SELECT_PROVIDER_NAME);
+            && name_ok;
         if !desktop_gate_ok {
             anyhow::bail!(
-                "应用后 codex_select 未设置 Local Compact 门控字段（name={CODEX_SELECT_PROVIDER_NAME}, requires_openai_auth=true）"
+                "应用后 codex_select 未设置门控字段（name={CODEX_SELECT_PROVIDER_NAME}|{CODEX_OPENAI_CLOUD_COMPACT_NAME}, requires_openai_auth=true）"
             );
+        }
+        if openai_cloud_compact && written_name != CODEX_OPENAI_CLOUD_COMPACT_NAME {
+            anyhow::bail!("云端压缩已请求但 name 未写成 OpenAI");
+        }
+        if !openai_cloud_compact && written_name != CODEX_SELECT_PROVIDER_NAME {
+            anyhow::bail!("可移植压缩模式 name 应为 Codex Spur");
         }
 
         let written_catalog =
@@ -1094,7 +1127,7 @@ mod tests {
                 sample_model("spur-route-gpt5luna00001", "OpenAI · GPT-5.6-Luna"),
             ],
         };
-        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         assert_eq!(result.model_count, 2);
         assert!(result.config_path.starts_with(&publish_dir));
         assert!(!result.config_path.starts_with(&orca_dir));
@@ -1155,7 +1188,7 @@ mod tests {
         let catalog = ModelsResponse {
             models: vec![sample_model("spur-route-minimax001", "MiniMax · M2")],
         };
-        apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         let config_raw = fs::read_to_string(dir.join("config.toml")).expect("config");
         assert!(
             config_raw.contains("web_search = \"disabled\""),
@@ -1165,7 +1198,7 @@ mod tests {
         let catalog = ModelsResponse {
             models: vec![sample_model("spur-route-kimi001", "Kimi · K3")],
         };
-        apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply2");
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply2");
         let config_raw = fs::read_to_string(dir.join("config.toml")).expect("config2");
         assert!(
             !config_raw.contains("web_search = \"disabled\""),
@@ -1181,6 +1214,43 @@ mod tests {
         // exact display name. Reusing it would bring opaque encrypted compact back.
         assert_ne!(CODEX_SELECT_PROVIDER_NAME, "OpenAI");
         assert_eq!(CODEX_SELECT_PROVIDER_NAME, "Codex Spur");
+        assert_eq!(CODEX_OPENAI_CLOUD_COMPACT_NAME, "OpenAI");
+    }
+
+    #[test]
+    fn apply_cloud_compact_writes_openai_provider_name() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-cloud-compact-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp home");
+        write_test_chatgpt_auth(&dir);
+        std::env::set_var("CODEX_SPUR_PUBLISH_HOME", &dir);
+        let catalog = ModelsResponse {
+            models: vec![sample_model("gpt-5.6-terra", "OpenAI · Terra")],
+        };
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog, true).expect("apply cloud");
+        let config_raw = fs::read_to_string(dir.join("config.toml")).expect("config");
+        assert!(
+            config_raw.contains("name = \"OpenAI\""),
+            "cloud compact must set name=OpenAI, got:\n{config_raw}"
+        );
+        assert!(config_raw.contains("requires_openai_auth = true"));
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply portable");
+        let config_raw = fs::read_to_string(dir.join("config.toml")).expect("config2");
+        assert!(
+            config_raw.contains("name = \"Codex Spur\""),
+            "portable mode must set Codex Spur, got:\n{config_raw}"
+        );
+        std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1206,7 +1276,7 @@ mod tests {
                 sample_model("spur-route-k2deadbeef002", "Kimi · K2"),
             ],
         };
-        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         assert_eq!(result.model_count, 2);
         assert_eq!(
             result.selected_model.as_deref(),
@@ -1263,7 +1333,7 @@ mod tests {
         let catalog = ModelsResponse {
             models: vec![sample_model("uuid/k3", "Kimi · K3")],
         };
-        let err = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).unwrap_err();
+        let err = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("slug"), "unexpected error: {message}");
         std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
@@ -1290,7 +1360,7 @@ mod tests {
             models: vec![sample_model("spur-route-valid", "Kimi · K3")],
         };
 
-        let error = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).unwrap_err();
+        let error = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).unwrap_err();
         assert!(error.to_string().contains("读取 Codex config.toml 失败"));
         assert!(dir.join("config.toml").is_dir());
         assert!(!dir.join("codex-select/model-catalog.json").exists());
@@ -1318,7 +1388,7 @@ mod tests {
         let catalog = ModelsResponse {
             models: vec![sample_model("spur-route-kimi001", "Kimi · K2.7")],
         };
-        let error = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).unwrap_err();
+        let error = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("auth.json") || message.contains("官方登录"),
@@ -1347,7 +1417,7 @@ mod tests {
         let catalog = ModelsResponse {
             models: vec![sample_model("gpt-5.6-terra", "GPT-5.6-Terra")],
         };
-        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         assert_eq!(result.model_count, 1);
         std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
         let _ = fs::remove_dir_all(&dir);
@@ -1398,7 +1468,7 @@ mod tests {
         let catalog = ModelsResponse {
             models: vec![sample_model("spur-route-kimi001", "Kimi · K2.7")],
         };
-        apply("http://127.0.0.1:17861/v1", "test-token", &catalog).expect("apply");
+        apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         let visibility = inspect_desktop_visibility(Some(true), Some("http://127.0.0.1:17861/v1"));
         assert!(visibility.ready, "{visibility:?}");
         assert_eq!(visibility.status_label, "就绪");

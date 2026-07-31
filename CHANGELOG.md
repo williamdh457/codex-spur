@@ -6,6 +6,7 @@ All notable changes to Codex Spur are documented in this file.
 
 ### Features
 
+- **Overview session policy (mid-thread switch)**: main UI segmented control — **允许中途换模型** (default, portable `spur1` compact so OpenAI↔Grok can both read summaries) vs **不中途换模型** with optional **OpenAI 云端加密压缩** (Apply writes `name = "OpenAI"`, proxy passes OpenAI Compact V2). Changing policy requires Review & Apply when cloud compact is involved.
 - **DeepSeek V4 native Responses (official Codex path)**: new DeepSeek instances default to **`protocol = Responses`** (no longer Chat Completions). `deepseek-v4-flash` / `deepseek-v4-pro` always forward to upstream **`/responses`** even if a legacy provider row still says Chat — matching DeepSeek’s 2026-07-31 Codex script (`wire_api = "responses"`). Legacy ids such as `deepseek-chat` stay on the Chat Completions bridge. Catalog rows for DeepSeek align with the official script: **1M** context, `effective_context_window_percent = 95`, `truncation_policy.mode = tokens`, `default_reasoning_summary = none`, `apply_patch_tool_type = freeform`, `model_messages.instructions_template` dual-write of the lean `base_instructions`. Still published under Spur’s `codex_select` provider (does **not** monopolize `model_provider = deepseek`).
 
 ### Fixed

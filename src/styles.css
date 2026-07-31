@@ -1071,6 +1071,58 @@ h2 { font-size: 14px; line-height: 20px; }
 .segmented-control button:hover { background: color-mix(in srgb, var(--accent) 10%, var(--surface)); color: var(--text); }
 .segmented-control button:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 72%, white); outline-offset: -2px; z-index: 1; }
 .segmented-control button:active { background: color-mix(in srgb, var(--accent) 18%, var(--surface)); }
+.panel--policy {
+  display: grid;
+  gap: 12px;
+}
+.conversation-policy-control {
+  width: 100%;
+  max-width: 420px;
+}
+.conversation-policy-control button {
+  flex: 1;
+  min-height: 32px;
+  font-weight: 600;
+}
+.conversation-policy-help {
+  margin: 0;
+  color: var(--secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  max-width: 52rem;
+}
+.conversation-policy-cloud {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  cursor: pointer;
+}
+.conversation-policy-cloud input {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+.conversation-policy-cloud span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.conversation-policy-cloud strong {
+  font-size: 12px;
+}
+.conversation-policy-cloud small {
+  color: var(--secondary);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.callout--warning {
+  border-color: color-mix(in srgb, var(--warning, #c47b00) 45%, var(--border));
+  background: color-mix(in srgb, var(--warning, #c47b00) 10%, var(--surface));
+}
+
 .segmented-control button.is-active {
   background: color-mix(in srgb, var(--accent) 15%, var(--surface));
   color: var(--text);

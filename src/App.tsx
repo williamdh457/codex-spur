@@ -41,6 +41,7 @@ import {
   renameCredential,
   renameProviderInstance,
   restorePreviousCodexConfig,
+  setConversationPolicy,
   setDiagnosticsMaxEvents,
   setModelEnabled,
   setProviderReasoningProfile,
@@ -58,6 +59,7 @@ import type {
 } from "./api";
 import type {
   AppSnapshot,
+  ConversationPolicy,
   CredentialSummary,
   ModelRouteSummary,
   NavigationSection,
@@ -115,10 +117,14 @@ function Overview({
   snapshot,
   onAddProvider,
   onEditProvider,
+  onConversationPolicyChange,
+  policyBusy,
 }: {
   snapshot: AppSnapshot;
   onAddProvider: () => void;
   onEditProvider: (provider: ProviderSummary) => void;
+  onConversationPolicyChange: (policy: ConversationPolicy) => void;
+  policyBusy: boolean;
 }) {
   const visibility = snapshot.desktopVisibility;
   const [desktopOpen, setDesktopOpen] = useState(false);
@@ -128,6 +134,11 @@ function Overview({
   const failedChecks = visibility.checks.filter((check) => !check.ok);
   const passedChecks = visibility.checks.filter((check) => check.ok);
   const attentionCount = snapshot.attentionItems.length;
+  const policy: ConversationPolicy = snapshot.conversationPolicy ?? {
+    midThread: "allowSwitch",
+    openaiCloudCompact: false,
+  };
+  const allowSwitch = policy.midThread === "allowSwitch";
 
   return (
     <div className="page-stack">
@@ -141,6 +152,85 @@ function Overview({
         />
         <Metric label="已发布模型" value={String(snapshot.publishedModels)} note="右下角高级 → 模型" />
         <Metric label="健康账号" value={String(snapshot.healthyAccounts)} note="可参与调度" />
+      </section>
+
+      <section className="panel panel--policy" aria-label="会话策略">
+        <div className="panel__header">
+          <div>
+            <h2>会话策略</h2>
+            <p>决定同一对话里能不能中途换模型，以及 OpenAI 云端加密压缩。</p>
+          </div>
+        </div>
+        <div
+          className="segmented-control conversation-policy-control"
+          role="radiogroup"
+          aria-label="中途换模型"
+        >
+          <button
+            type="button"
+            role="radio"
+            aria-checked={allowSwitch}
+            className={allowSwitch ? "is-active" : undefined}
+            disabled={policyBusy}
+            onClick={() =>
+              onConversationPolicyChange({
+                midThread: "allowSwitch",
+                openaiCloudCompact: false,
+              })
+            }
+          >
+            允许中途换模型
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={!allowSwitch}
+            className={!allowSwitch ? "is-active" : undefined}
+            disabled={policyBusy}
+            onClick={() =>
+              onConversationPolicyChange({
+                midThread: "stickyNoSwitch",
+                openaiCloudCompact: policy.openaiCloudCompact,
+              })
+            }
+          >
+            不中途换模型
+          </button>
+        </div>
+        <p className="conversation-policy-help">
+          {allowSwitch
+            ? "默认推荐：OpenAI ↔ Grok ↔ Kimi 可同线程切换。压缩用可移植摘要（spur1），双方都能读；OpenAI 云端加密黑科技关闭。"
+            : "连续使用同一厂（尤其 GPT 族）。可开启下方云端压缩；换到其它厂请新开线程。"}
+        </p>
+        {!allowSwitch ? (
+          <label className="conversation-policy-cloud">
+            <input
+              type="checkbox"
+              checked={policy.openaiCloudCompact}
+              disabled={policyBusy}
+              onChange={(event) =>
+                onConversationPolicyChange({
+                  midThread: "stickyNoSwitch",
+                  openaiCloudCompact: event.target.checked,
+                })
+              }
+            />
+            <span>
+              <strong>启用 OpenAI 云端加密压缩</strong>
+              <small>
+                对齐 CC Switch：Apply 后 provider name=OpenAI，走服务端加密 compact。改完后请 Review &amp; Apply。
+              </small>
+            </span>
+          </label>
+        ) : null}
+        {policy.openaiCloudCompact && !allowSwitch ? (
+          <div className="callout callout--inline callout--warning">
+            <strong>云端压缩已开</strong>
+            <p>
+              请连续使用 OpenAI/GPT 模型。中途切到 Grok / Kimi / DeepSeek 会读不了加密摘要——请新开对话，或改回「允许中途换模型」。
+            </p>
+          </div>
+        ) : null}
       </section>
 
       <section className="panel">
@@ -3906,6 +3996,7 @@ export default function App() {
   const [editProvider, setEditProvider] = useState<ProviderSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
+  const [policyBusy, setPolicyBusy] = useState(false);
   const [appVersion, setAppVersion] = useState<string>("…");
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const toastIdRef = useRef(0);
@@ -3939,6 +4030,31 @@ export default function App() {
   const quietRefresh = useCallback(async () => {
     await refresh({ quiet: true });
   }, [refresh]);
+
+  const onConversationPolicyChange = useCallback(
+    async (policy: ConversationPolicy) => {
+      setPolicyBusy(true);
+      try {
+        const saved = await setConversationPolicy(policy);
+        setSnapshot((prev) => (prev ? { ...prev, conversationPolicy: saved } : prev));
+        if (saved.openaiCloudCompact) {
+          pushToast(
+            "warning",
+            "已开云端压缩：请 Review & Apply 写入 name=OpenAI；中途换厂请新开线程。",
+          );
+        } else if (saved.midThread === "allowSwitch") {
+          pushToast("success", "已允许中途换模型（可移植压缩）。改完后若曾开云端压缩请再 Apply。");
+        } else {
+          pushToast("success", "已切换为不中途换模型。可选开云端压缩后 Apply。");
+        }
+      } catch (error) {
+        pushToast("error", error instanceof Error ? error.message : String(error));
+      } finally {
+        setPolicyBusy(false);
+      }
+    },
+    [pushToast],
+  );
 
   useEffect(() => {
     let active = true;
@@ -4089,6 +4205,8 @@ export default function App() {
               snapshot={snapshot}
               onAddProvider={() => setAddOpen(true)}
               onEditProvider={(provider) => setEditProvider(provider)}
+              onConversationPolicyChange={(policy) => void onConversationPolicyChange(policy)}
+              policyBusy={policyBusy}
             />
           )}
           {section === "models" && <ModelsPage refreshSnapshot={refresh} />}

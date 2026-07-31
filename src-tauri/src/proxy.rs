@@ -268,13 +268,23 @@ async fn responses(
     if let Some(object) = parsed.as_object_mut() {
         object.insert("model".into(), Value::String(target.upstream_model.clone()));
     }
-    // All routes (including OpenAI): local portable Compact V2 shim.
-    // Normal turns still use Responses/Chat as before; only the compact beat is
-    // intercepted. Produces spur1: plaintext envelopes (same as Kimi/DeepSeek)
-    // instead of native OpenAI gAAAAA… ciphertext so mid-thread model switches
-    // can still read the summary. Desktop still sees a valid V2 compaction item.
+    // Compact policy:
+    // - Default / allow mid-thread switch: intercept ALL routes with spur1 portable
+    //   summary (including OpenAI) so OpenAI↔Grok can both read the envelope.
+    // - Sticky + OpenAI cloud compact: pass OpenAI compact through so Desktop's
+    //   Remote Compact V2 (gAAAAA…) works; non-OpenAI still use spur1.
     if is_remote_compaction_request(&parsed) {
-        return local_compact_v2_shim(&state, &target, parsed, &affinity).await;
+        let use_cloud = target.kind.eq_ignore_ascii_case("openai")
+            && state
+                .storage
+                .get_conversation_policy()
+                .await
+                .map(|p| p.uses_openai_cloud_compact())
+                .unwrap_or(false);
+        if !use_cloud {
+            return local_compact_v2_shim(&state, &target, parsed, &affinity).await;
+        }
+        // Fall through: native OpenAI Compact V2 via Responses path.
     }
     if route_uses_chat_completions(&target) {
         // Chat Completions conversion maps reasoning itself; do not pre-mutate

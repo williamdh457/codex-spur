@@ -2701,6 +2701,42 @@ impl Storage {
         .transpose()
     }
 
+    const CONVERSATION_POLICY_KEY: &'static str = "conversation_policy";
+
+    pub async fn get_conversation_policy(
+        &self,
+    ) -> Result<crate::domain::ConversationPolicy, sqlx::Error> {
+        let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = ?")
+            .bind(Self::CONVERSATION_POLICY_KEY)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(crate::domain::ConversationPolicy::default());
+        };
+        let json: String = row.get("value_json");
+        let parsed: crate::domain::ConversationPolicy = serde_json::from_str(&json)
+            .unwrap_or_default();
+        Ok(parsed.sanitized())
+    }
+
+    pub async fn set_conversation_policy(
+        &self,
+        policy: &crate::domain::ConversationPolicy,
+    ) -> Result<crate::domain::ConversationPolicy, sqlx::Error> {
+        let policy = policy.sanitized();
+        let json = serde_json::to_string(&policy)
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        sqlx::query(
+            "INSERT INTO app_settings (key, value_json) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(Self::CONVERSATION_POLICY_KEY)
+        .bind(json)
+        .execute(&self.pool)
+        .await?;
+        Ok(policy)
+    }
+
     pub async fn reserve_reset_credit_action(
         &self,
         credential_id: &str,
