@@ -198,6 +198,165 @@ pub fn extract_freeform_input(arguments: &str) -> String {
     trimmed.to_string()
 }
 
+/// Extract freeform input and normalize apply_patch dialect for Desktop.
+pub fn extract_freeform_input_for_tool(name: &str, arguments: &str) -> String {
+    let raw = extract_freeform_input(arguments);
+    if name == APPLY_PATCH_TOOL_NAME {
+        normalize_apply_patch_input(&raw)
+    } else {
+        raw
+    }
+}
+
+/// Normalize third-party / Grok apply_patch freeform bodies to Desktop's verifier.
+///
+/// Codex Desktop rejects patches whose first line is not exactly `*** Begin Patch`
+/// (no trailing ` ***`). Grok/xAI and some Chat bridges commonly emit:
+/// - `*** Begin Patch ***` / `***Begin Patch***`
+/// - path glued to stars: `…/file.ts***`
+/// - invented markers: `*** End of File ***`
+///
+/// Inspired by field failures on spur-route Grok sessions (44× verification failed).
+/// CC Switch routes Grok via Responses too but does not rewrite patch text; Spur
+/// must, because multi-vendor models reuse the same Desktop freeform executor.
+pub fn normalize_apply_patch_input(raw: &str) -> String {
+    let mut text = raw.replace("\r\n", "\n").replace('\r', "\n");
+    // Unwrap accidental JSON string envelopes again (double-encoded).
+    if text.trim_start().starts_with('{') {
+        text = extract_freeform_input(text.trim());
+        text = text.replace("\r\n", "\n").replace('\r', "\n");
+    }
+    if text.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut saw_begin = false;
+    let mut saw_end = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() && out_lines.is_empty() {
+            // Drop leading blank lines so "first line" is the begin marker.
+            continue;
+        }
+
+        // Invented marker — drop.
+        if is_end_of_file_marker(trimmed) {
+            continue;
+        }
+
+        // Begin markers (with/without spaces/trailing stars).
+        if is_begin_patch_marker(trimmed) {
+            if !saw_begin {
+                out_lines.push("*** Begin Patch".into());
+                saw_begin = true;
+            }
+            continue;
+        }
+
+        // End markers.
+        if is_end_patch_marker(trimmed) {
+            if saw_begin && !saw_end {
+                out_lines.push("*** End Patch".into());
+                saw_end = true;
+            }
+            continue;
+        }
+
+        // File action lines: "*** Update File: path***" / "***Update File:path"
+        if let Some(normalized) = normalize_file_action_line(trimmed) {
+            out_lines.push(normalized);
+            continue;
+        }
+
+        // Path glued to stars without a proper action prefix — leave as-is but
+        // strip a trailing *** that Grok often appends after the path.
+        if let Some(stripped) = trimmed.strip_suffix("***") {
+            let s = stripped.trim_end();
+            if s.contains('/') || s.ends_with(".ts") || s.ends_with(".tsx") || s.ends_with(".rs")
+            {
+                // Only if it looks like a bare path line under a file action — rare.
+                out_lines.push(line.to_string());
+                continue;
+            }
+        }
+
+        out_lines.push(line.to_string());
+    }
+
+    // If body clearly looks like a patch but begin was missing, prepend.
+    let joined_probe = out_lines.join("\n");
+    if !saw_begin
+        && (joined_probe.contains("*** Update File:")
+            || joined_probe.contains("*** Add File:")
+            || joined_probe.contains("*** Delete File:"))
+    {
+        out_lines.insert(0, "*** Begin Patch".into());
+        saw_begin = true;
+    }
+    if saw_begin && !saw_end {
+        out_lines.push("*** End Patch".into());
+    }
+
+    let mut result = out_lines.join("\n");
+    if !result.is_empty() && !result.ends_with('\n') {
+        // Desktop samples usually end with a trailing newline after End Patch.
+        if result.ends_with("*** End Patch") {
+            result.push('\n');
+        }
+    }
+    result
+}
+
+fn is_begin_patch_marker(line: &str) -> bool {
+    let compact: String = line
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '*')
+        .collect();
+    compact.eq_ignore_ascii_case("BeginPatch")
+}
+
+fn is_end_patch_marker(line: &str) -> bool {
+    let compact: String = line
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '*')
+        .collect();
+    compact.eq_ignore_ascii_case("EndPatch")
+}
+
+fn is_end_of_file_marker(line: &str) -> bool {
+    let compact: String = line
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '*')
+        .collect();
+    compact.eq_ignore_ascii_case("EndofFile") || compact.eq_ignore_ascii_case("EndOfFile")
+}
+
+fn normalize_file_action_line(line: &str) -> Option<String> {
+    // Accept: "*** Update File: path", "***Update File:path***", etc.
+    let stripped = line.trim().trim_matches('*').trim();
+    let lower = stripped.to_ascii_lowercase();
+    let action_label = if lower.starts_with("update file:") {
+        "Update File"
+    } else if lower.starts_with("add file:") {
+        "Add File"
+    } else if lower.starts_with("delete file:") {
+        "Delete File"
+    } else {
+        return None;
+    };
+    let path = stripped
+        .split_once(':')
+        .map(|(_, p)| p.trim().trim_end_matches('*').trim())
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+    Some(format!("*** {action_label}: {path}"))
+}
+
 /// Portable Responses-style function definition for a freeform Desktop tool (outbound).
 pub fn freeform_as_function_tool(name: &str) -> Value {
     // Schema-only portable shape. Prefer Desktop's original description when
@@ -206,8 +365,9 @@ pub fn freeform_as_function_tool(name: &str) -> Value {
     // when Desktop omitted description.
     let description = match name {
         APPLY_PATCH_TOOL_NAME => {
-            // Minimal structural hint only; Desktop description wins when present.
-            "Use apply_patch with a freeform patch document (*** Begin Patch … *** End Patch)."
+            // Exact Desktop dialect (first line must be `*** Begin Patch` with NO trailing stars).
+            // Grok often emits `*** Begin Patch ***` which Desktop rejects in a retry loop.
+            "Apply a freeform patch. First line MUST be exactly `*** Begin Patch` (no trailing stars). Then `*** Update File: path` or `*** Add File: path`, hunks with @@, and end with `*** End Patch`."
         }
         _ => "",
     };
@@ -272,7 +432,7 @@ pub fn desktop_tool_call_item(
     let id_stem = response_id.strip_prefix("resp_").unwrap_or(response_id);
     match profile.desktop_call {
         DesktopCallType::CustomToolCall if profile.freeform_input => {
-            let input = extract_freeform_input(arguments);
+            let input = extract_freeform_input_for_tool(name, arguments);
             let item_id = if call_id.starts_with("ctc_") {
                 call_id.to_string()
             } else {
@@ -326,10 +486,25 @@ pub fn uses_custom_tool_sse(name: &str) -> bool {
 /// items already in the official shape.
 pub fn restore_freeform_output_item(item: &Value) -> Value {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+
+    // Already Desktop-shaped: still normalize apply_patch body (Grok dialect).
+    if item_type == "custom_tool_call" && name == APPLY_PATCH_TOOL_NAME {
+        let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+        let normalized = normalize_apply_patch_input(input);
+        if normalized == input {
+            return item.clone();
+        }
+        let mut out = item.clone();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("input".into(), Value::String(normalized));
+        }
+        return out;
+    }
+
     if item_type != "function_call" {
         return item.clone();
     }
-    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
     if !is_freeform_desktop_tool(name) {
         return item.clone();
     }
@@ -346,7 +521,7 @@ pub fn restore_freeform_output_item(item: &Value) -> Value {
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
-    let input = extract_freeform_input(arguments);
+    let input = extract_freeform_input_for_tool(name, arguments);
     // Keep upstream item id when present so SSE item_id continuity is preserved;
     // prefer ctc_ prefix for gold-sample readability when we must invent an id.
     let item_id = match item.get("id").and_then(Value::as_str) {
@@ -414,6 +589,51 @@ mod tests {
     fn extract_keeps_raw_begin_patch() {
         let raw = "*** Begin Patch\n*** End Patch";
         assert_eq!(extract_freeform_input(raw), raw);
+    }
+
+    #[test]
+    fn normalize_strips_trailing_stars_on_begin_patch_like_grok() {
+        // Session 019fb8d7: Desktop requires first line exactly `*** Begin Patch`.
+        let dirty = "*** Begin Patch ***\n*** Update File: /tmp/a.ts***\n@@\n export const x = 1;\n+export const y = 2;\n*** End Patch ***\n*** End of File ***\n";
+        let clean = normalize_apply_patch_input(dirty);
+        let first = clean.lines().next().unwrap_or("");
+        assert_eq!(first, "*** Begin Patch");
+        assert!(clean.contains("*** Update File: /tmp/a.ts\n"));
+        assert!(!clean.contains("index.ts***") && !clean.contains(".ts***"));
+        assert!(clean.contains("*** End Patch"));
+        assert!(!clean.to_ascii_lowercase().contains("end of file"));
+    }
+
+    #[test]
+    fn normalize_begin_without_spaces() {
+        let dirty = "***Begin Patch***\n***Update File: pkg/a.ts***\n@@\n-a\n+b\n***End Patch***\n";
+        let clean = normalize_apply_patch_input(dirty);
+        assert_eq!(clean.lines().next().unwrap_or(""), "*** Begin Patch");
+        assert!(clean.contains("*** Update File: pkg/a.ts\n"));
+    }
+
+    #[test]
+    fn extract_for_apply_patch_normalizes() {
+        let args = r#"{"input":"*** Begin Patch ***\n*** Update File: a.py\n+hi\n*** End Patch ***"}"#;
+        let input = extract_freeform_input_for_tool(APPLY_PATCH_TOOL_NAME, args);
+        assert_eq!(input.lines().next().unwrap_or(""), "*** Begin Patch");
+    }
+
+    #[test]
+    fn restore_custom_tool_call_normalizes_apply_patch_body() {
+        let item = json!({
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "call_id": "call_1",
+            "id": "ctc_1",
+            "status": "completed",
+            "input": "*** Begin Patch ***\n*** Update File: a.ts\n*** End Patch ***"
+        });
+        let restored = restore_freeform_output_item(&item);
+        assert_eq!(
+            restored.get("input").and_then(Value::as_str).unwrap().lines().next().unwrap(),
+            "*** Begin Patch"
+        );
     }
 
     #[test]
@@ -598,7 +818,7 @@ mod tests {
             "status": "completed",
             "call_id": "call_1",
             "name": "apply_patch",
-            "input": "*** Begin Patch\n*** End Patch"
+            "input": "*** Begin Patch\n*** End Patch\n"
         });
         let restored = restore_freeform_output_item(&gold);
         assert_eq!(restored, gold);

@@ -1364,6 +1364,7 @@ struct FreeformSseRestorer {
 }
 
 struct PendingFreeformCall {
+    name: String,
     call_id: String,
     output_index: Value,
     /// Accumulated JSON arguments (or extracted freeform input after args.done).
@@ -1478,6 +1479,7 @@ impl FreeformSseRestorer {
         self.pending.insert(
             key,
             PendingFreeformCall {
+                name: name.to_string(),
                 call_id: call_id.clone(),
                 output_index: data
                     .get("output_index")
@@ -1523,7 +1525,10 @@ impl FreeformSseRestorer {
                 pending.args = arguments.to_string();
             }
         }
-        let input = crate::tool_roundtrip::extract_freeform_input(&pending.args);
+        let input = crate::tool_roundtrip::extract_freeform_input_for_tool(
+            &pending.name,
+            &pending.args,
+        );
         let desktop_item_id = pending.desktop_item_id.clone();
         let output_index = pending.output_index.clone();
         pending.args = input.clone();
@@ -1572,9 +1577,10 @@ impl FreeformSseRestorer {
                     // p.args is freeform body after args.done; if never streamed,
                     // it still holds JSON arguments — extract again for safety.
                     let input = if p.input_events_emitted {
+                        // Already normalized in on_function_args_done.
                         p.args
                     } else {
-                        crate::tool_roundtrip::extract_freeform_input(&p.args)
+                        crate::tool_roundtrip::extract_freeform_input_for_tool(&p.name, &p.args)
                     };
                     object.insert("input".into(), Value::String(input));
                     object.insert("id".into(), Value::String(p.desktop_item_id));

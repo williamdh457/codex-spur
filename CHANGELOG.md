@@ -4,6 +4,10 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Grok/third-party apply_patch dialect (Desktop verification loop)**: Codex Desktop requires the freeform body first line to be exactly `*** Begin Patch` (no trailing stars). Grok and some bridges emit `*** Begin Patch ***`, path glued as `file.ts***`, or invented `*** End of File ***`, causing endless `apply_patch verification failed` retries (session 019fb8d7 ×44). Spur now normalizes apply_patch freeform input on the inbound tool-roundtrip path (JSON + SSE + already-shaped custom_tool_call) and tightens the portable tool description to the Desktop dialect. CC Switch routes Grok via Responses but does not rewrite patch text — this is a Spur multi-vendor fix.
+
 ### Features
 
 - **Overview session policy (mid-thread switch)**: main UI segmented control — **允许中途换模型** (default, portable `spur1` compact so OpenAI↔Grok can both read summaries) vs **不中途换模型** with optional **OpenAI 云端加密压缩** (Apply writes `name = "OpenAI"`, proxy passes OpenAI Compact V2). Changing policy requires Review & Apply when cloud compact is involved.
