@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -275,7 +276,7 @@ async fn responses(
     if is_remote_compaction_request(&parsed) {
         return local_compact_v2_shim(&state, &target, parsed, &affinity).await;
     }
-    if target.protocol.to_ascii_lowercase().contains("chat") {
+    if route_uses_chat_completions(&target) {
         // Chat Completions conversion maps reasoning itself; do not pre-mutate
         // reasoning.effort into provider-internal tokens like "disabled"/"enabled".
         if media_sanitizer::should_strip_images(&target.kind, &target.upstream_model) {
@@ -285,13 +286,27 @@ async fn responses(
     } else {
         map_reasoning(&target, &mut parsed);
         // OpenAI kind (官方订阅 / JSON 多账号 / API Key) keeps Codex-native tools.
-        // All other kinds (xAI, MiniMax, custom Responses, …) must be ported.
+        // All other kinds (xAI, MiniMax, DeepSeek Responses, custom, …) must be ported.
         sanitize_responses_request_for_upstream(&target.kind, &mut parsed);
         if media_sanitizer::should_strip_images(&target.kind, &target.upstream_model) {
             media_sanitizer::replace_images_with_marker(&mut parsed);
         }
         forward_responses_compatible(&state, &target, parsed, &affinity).await
     }
+}
+
+/// Choose Chat Completions vs native Responses for this route.
+///
+/// DeepSeek V4 Flash/Pro always use native Responses (official 2026-07-31 Codex
+/// path), even when a legacy provider row still says "Chat Completions".
+fn route_uses_chat_completions(target: &RouteTarget) -> bool {
+    if target.kind.eq_ignore_ascii_case("deepseek") {
+        return providers::deepseek_route_uses_chat_completions(
+            &target.protocol,
+            &target.upstream_model,
+        );
+    }
+    target.protocol.to_ascii_lowercase().contains("chat")
 }
 
 /// Local Remote Compaction V2 for every route (including OpenAI): summarize with
@@ -363,7 +378,7 @@ async fn summarize_for_local_compact(
     auth: &UpstreamAuth,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let use_chat = target.protocol.to_ascii_lowercase().contains("chat");
+    let use_chat = route_uses_chat_completions(target);
     if use_chat {
         let chat_body = json!({
             "model": target.upstream_model,
@@ -750,7 +765,8 @@ async fn forward_chat_compatible(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // Codex Desktop talks Responses API; DeepSeek/Kimi expose Chat Completions only.
+    // Codex Desktop talks Responses API. Kimi (and legacy DeepSeek chat ids) use
+    // Chat Completions; DeepSeek V4 Flash/Pro use native Responses (official path).
     // Naive passthrough of Responses `tools` (type/name/parameters, local_shell, …)
     // makes upstream reject with 400. Convert like Nice Switch's transform_codex_chat.
     let chat_body =
@@ -1252,6 +1268,7 @@ fn tool_calls_from_chat_message(message: Option<&Value>) -> Vec<AssembledToolCal
     out
 }
 
+#[allow(dead_code)] // kept for callers/tests that still build fc_* item ids
 fn function_call_item_id(response_id: &str, index: usize) -> String {
     let stem = response_id.strip_prefix("resp_").unwrap_or(response_id);
     format!("fc_{stem}_{index}")
@@ -1266,6 +1283,9 @@ fn function_call_call_id(assembled: &AssembledToolCall, response_id: &str, index
 }
 
 /// Build Responses `output[]` from Chat Completions parts (non-stream path).
+///
+/// Freeform tools (e.g. `apply_patch`) are restored to official Desktop
+/// `custom_tool_call` items — never left as `function_call` or Desktop aborts.
 fn chat_parts_to_responses_output(
     response_id: &str,
     text: &str,
@@ -1285,14 +1305,20 @@ fn chat_parts_to_responses_output(
         if tc.name.is_empty() {
             continue;
         }
-        output.push(json!({
-            "id": function_call_item_id(response_id, index),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": function_call_call_id(tc, response_id, index),
-            "name": tc.name,
-            "arguments": if tc.arguments.is_empty() { "{}" } else { tc.arguments.as_str() }
-        }));
+        let call_id = function_call_call_id(tc, response_id, index);
+        let arguments = if tc.arguments.is_empty() {
+            "{}"
+        } else {
+            tc.arguments.as_str()
+        };
+        output.push(crate::tool_roundtrip::desktop_tool_call_item(
+            response_id,
+            index,
+            &tc.name,
+            &call_id,
+            arguments,
+            "completed",
+        ));
     }
     // Always emit a message when there is text, or when there were no tools
     // (empty reply still needs a completed message for Desktop lifecycle).
@@ -1313,6 +1339,334 @@ fn sse_event(event: &str, data: &Value) -> String {
         "event: {event}\ndata: {}\n\n",
         serde_json::to_string(data).unwrap_or_else(|_| "{}".into())
     )
+}
+
+/// Stateful transform: Responses SSE freeform tools as `function_call` → official
+/// Desktop `custom_tool_call` lifecycle (all providers: xAI/Grok, custom, …).
+///
+/// Chat Completions already restores via `chat_parsed_to_responses_sse`; this
+/// covers the Responses passthrough path that previously aborted apply_patch.
+#[derive(Default)]
+struct FreeformSseRestorer {
+    carry: Vec<u8>,
+    /// Keyed by upstream item_id (as sent in argument events).
+    pending: HashMap<String, PendingFreeformCall>,
+}
+
+struct PendingFreeformCall {
+    call_id: String,
+    output_index: Value,
+    /// Accumulated JSON arguments (or extracted freeform input after args.done).
+    args: String,
+    desktop_item_id: String,
+    /// True after we emitted custom_tool_call_input.* for this call.
+    input_events_emitted: bool,
+}
+
+impl FreeformSseRestorer {
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if chunk.is_empty() {
+            return self.finish();
+        }
+        self.carry.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(boundary) = find_sse_event_boundary(&self.carry) {
+            let raw = self.carry.drain(..boundary).collect::<Vec<u8>>();
+            // `boundary` includes the blank-line separator; strip it for parsing.
+            let block = trim_sse_block_separator(&raw);
+            let block_str = String::from_utf8_lossy(block);
+            out.extend_from_slice(self.transform_event_block(&block_str).as_bytes());
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.carry.is_empty() {
+            return Vec::new();
+        }
+        let block = std::mem::take(&mut self.carry);
+        let block_str = String::from_utf8_lossy(&block);
+        self.transform_event_block(&block_str).into_bytes()
+    }
+
+    fn transform_event_block(&mut self, block: &str) -> String {
+        if block.trim().is_empty() {
+            return String::new();
+        }
+        let mut data_str: Option<&str> = None;
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_str = Some(rest.trim_start());
+            }
+        }
+        let Some(data_str) = data_str else {
+            return format!("{block}\n\n");
+        };
+        let Ok(data) = serde_json::from_str::<Value>(data_str) else {
+            return format!("{block}\n\n");
+        };
+        let ev = data.get("type").and_then(Value::as_str).unwrap_or("");
+        match ev {
+            "response.output_item.added" => self.on_output_item_added(&data),
+            "response.function_call_arguments.delta" => self.on_function_args_delta(&data),
+            "response.function_call_arguments.done" => self.on_function_args_done(&data),
+            "response.output_item.done" => self.on_output_item_done(&data),
+            "response.completed" => {
+                let mut data = data;
+                if let Some(response) = data.get_mut("response") {
+                    crate::tool_roundtrip::restore_freeform_in_responses_body(response);
+                } else {
+                    crate::tool_roundtrip::restore_freeform_in_responses_body(&mut data);
+                }
+                let name = data
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("response.completed");
+                sse_event(name, &data)
+            }
+            _ => format!("{block}\n\n"),
+        }
+    }
+
+    fn on_output_item_added(&mut self, data: &Value) -> String {
+        let Some(item) = data.get("item") else {
+            return sse_event("response.output_item.added", data);
+        };
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return sse_event("response.output_item.added", data);
+        }
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        if !crate::tool_roundtrip::is_freeform_desktop_tool(name) {
+            return sse_event("response.output_item.added", data);
+        }
+        let original_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let args = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let restored = crate::tool_roundtrip::restore_freeform_output_item(item);
+        let desktop_item_id = restored
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let key = if !original_id.is_empty() {
+            original_id.clone()
+        } else {
+            desktop_item_id.clone()
+        };
+        self.pending.insert(
+            key,
+            PendingFreeformCall {
+                call_id: call_id.clone(),
+                output_index: data
+                    .get("output_index")
+                    .cloned()
+                    .unwrap_or(Value::from(0)),
+                args,
+                desktop_item_id: desktop_item_id.clone(),
+                input_events_emitted: false,
+            },
+        );
+        let mut in_progress = restored;
+        if let Some(object) = in_progress.as_object_mut() {
+            object.insert("status".into(), Value::String("in_progress".into()));
+            // Args may still stream; start with empty freeform input.
+            object.insert("input".into(), Value::String(String::new()));
+        }
+        let mut rewritten = data.clone();
+        if let Some(object) = rewritten.as_object_mut() {
+            object.insert("item".into(), in_progress);
+        }
+        sse_event("response.output_item.added", &rewritten)
+    }
+
+    fn on_function_args_delta(&mut self, data: &Value) -> String {
+        let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
+        let Some(pending) = self.pending.get_mut(item_id) else {
+            return sse_event("response.function_call_arguments.delta", data);
+        };
+        if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+            pending.args.push_str(delta);
+        }
+        // Suppress raw function deltas for freeform; emit custom input after done.
+        String::new()
+    }
+
+    fn on_function_args_done(&mut self, data: &Value) -> String {
+        let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
+        let Some(pending) = self.pending.get_mut(item_id) else {
+            return sse_event("response.function_call_arguments.done", data);
+        };
+        if let Some(arguments) = data.get("arguments").and_then(Value::as_str) {
+            if !arguments.is_empty() {
+                pending.args = arguments.to_string();
+            }
+        }
+        let input = crate::tool_roundtrip::extract_freeform_input(&pending.args);
+        let desktop_item_id = pending.desktop_item_id.clone();
+        let output_index = pending.output_index.clone();
+        pending.args = input.clone();
+        pending.input_events_emitted = true;
+        let mut out = String::new();
+        out.push_str(&sse_event(
+            "response.custom_tool_call_input.delta",
+            &json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": desktop_item_id,
+                "output_index": output_index,
+                "delta": input
+            }),
+        ));
+        out.push_str(&sse_event(
+            "response.custom_tool_call_input.done",
+            &json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": desktop_item_id,
+                "output_index": output_index,
+                "input": input
+            }),
+        ));
+        out
+    }
+
+    fn on_output_item_done(&mut self, data: &Value) -> String {
+        let Some(item) = data.get("item") else {
+            return sse_event("response.output_item.done", data);
+        };
+        let original_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        let is_freeform_fc = item.get("type").and_then(Value::as_str) == Some("function_call")
+            && crate::tool_roundtrip::is_freeform_desktop_tool(name);
+        let pending = self.pending.remove(original_id);
+        if !is_freeform_fc && pending.is_none() {
+            // Also try desktop id key if upstream already used ctc_ (unlikely).
+            return sse_event("response.output_item.done", data);
+        }
+        let mut restored = crate::tool_roundtrip::restore_freeform_output_item(item);
+        let mut input_events_emitted = false;
+        if let Some(p) = pending {
+            input_events_emitted = p.input_events_emitted;
+            if !p.args.is_empty() {
+                if let Some(object) = restored.as_object_mut() {
+                    // p.args is freeform body after args.done; if never streamed,
+                    // it still holds JSON arguments — extract again for safety.
+                    let input = if p.input_events_emitted {
+                        p.args
+                    } else {
+                        crate::tool_roundtrip::extract_freeform_input(&p.args)
+                    };
+                    object.insert("input".into(), Value::String(input));
+                    object.insert("id".into(), Value::String(p.desktop_item_id));
+                    if !p.call_id.is_empty() {
+                        object.insert("call_id".into(), Value::String(p.call_id));
+                    }
+                }
+            }
+        }
+        if let Some(object) = restored.as_object_mut() {
+            object.insert("status".into(), Value::String("completed".into()));
+        }
+        let input = restored
+            .get("input")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let item_id = restored
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let output_index = data
+            .get("output_index")
+            .cloned()
+            .unwrap_or(Value::from(0));
+        let mut out = String::new();
+        if !input_events_emitted && !input.is_empty() {
+            out.push_str(&sse_event(
+                "response.custom_tool_call_input.delta",
+                &json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": input
+                }),
+            ));
+            out.push_str(&sse_event(
+                "response.custom_tool_call_input.done",
+                &json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "input": input
+                }),
+            ));
+        }
+        let mut rewritten = data.clone();
+        if let Some(object) = rewritten.as_object_mut() {
+            object.insert("item".into(), restored);
+        }
+        out.push_str(&sse_event("response.output_item.done", &rewritten));
+        out
+    }
+}
+
+/// Find end of one SSE event. Returns byte length including blank-line separator.
+fn find_sse_event_boundary(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i + 2);
+        }
+        if i + 3 < buf.len()
+            && buf[i] == b'\r'
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some(i + 4);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn trim_sse_block_separator(raw: &[u8]) -> &[u8] {
+    if raw.ends_with(b"\r\n\r\n") {
+        &raw[..raw.len() - 4]
+    } else if raw.ends_with(b"\n\n") {
+        &raw[..raw.len() - 2]
+    } else {
+        raw
+    }
+}
+
+/// Restore freeform tools in a fully buffered Responses body (JSON or SSE text).
+fn restore_freeform_in_buffered_responses_bytes(bytes: &Bytes, is_sse: bool) -> Bytes {
+    if is_sse {
+        let mut restorer = FreeformSseRestorer::default();
+        let mut out = restorer.push(bytes.as_ref());
+        out.extend(restorer.finish());
+        return Bytes::from(out);
+    }
+    let Ok(mut body) = serde_json::from_slice::<Value>(bytes) else {
+        return bytes.clone();
+    };
+    crate::tool_roundtrip::restore_freeform_in_responses_body(&mut body);
+    match serde_json::to_vec(&body) {
+        Ok(v) => Bytes::from(v),
+        Err(_) => bytes.clone(),
+    }
 }
 
 /// Normalize Chat Completions ids into Responses response ids (`resp_…`).
@@ -1516,12 +1870,11 @@ fn chat_parsed_to_responses_sse(
         output_items.push(reasoning_item);
     }
 
-    // Function calls — required for Codex agent turns over Chat Completions.
+    // Tool calls — restore official Desktop shapes (freeform apply_patch → custom_tool_call).
     for (index, tc) in tool_calls.iter().enumerate() {
         if tc.name.is_empty() {
             continue;
         }
-        let item_id = function_call_item_id(response_id, index);
         let call_id = function_call_call_id(tc, response_id, index);
         let arguments = if tc.arguments.is_empty() {
             "{}"
@@ -1530,56 +1883,118 @@ fn chat_parsed_to_responses_sse(
         };
         let output_index = next_output_index;
         next_output_index += 1;
-        let item = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "in_progress",
-            "call_id": call_id,
-            "name": tc.name,
-            "arguments": ""
-        });
-        out.push_str(&sse_event(
-            "response.output_item.added",
-            &json!({
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": item
-            }),
-        ));
-        out.push_str(&sse_event(
-            "response.function_call_arguments.delta",
-            &json!({
-                "type": "response.function_call_arguments.delta",
-                "item_id": item_id,
-                "output_index": output_index,
-                "delta": arguments
-            }),
-        ));
-        out.push_str(&sse_event(
-            "response.function_call_arguments.done",
-            &json!({
-                "type": "response.function_call_arguments.done",
-                "item_id": item_id,
-                "output_index": output_index,
-                "arguments": arguments
-            }),
-        ));
-        let done_item = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call_id,
-            "name": tc.name,
-            "arguments": arguments
-        });
-        out.push_str(&sse_event(
-            "response.output_item.done",
-            &json!({
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": done_item
-            }),
-        ));
+        let done_item = crate::tool_roundtrip::desktop_tool_call_item(
+            response_id,
+            index,
+            &tc.name,
+            &call_id,
+            arguments,
+            "completed",
+        );
+        let item_id = done_item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let desktop_call_id = done_item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or(call_id.as_str())
+            .to_string();
+
+        if crate::tool_roundtrip::uses_custom_tool_sse(&tc.name) {
+            // Official freeform lifecycle: custom_tool_call + input (not function_call).
+            let input = done_item
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut in_progress = done_item.clone();
+            if let Some(object) = in_progress.as_object_mut() {
+                object.insert("status".into(), Value::String("in_progress".into()));
+                object.insert("input".into(), Value::String(String::new()));
+            }
+            out.push_str(&sse_event(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": in_progress
+                }),
+            ));
+            // Mirror function_call_arguments.* with custom input events when present;
+            // always complete with full freeform input on the item.
+            out.push_str(&sse_event(
+                "response.custom_tool_call_input.delta",
+                &json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": input
+                }),
+            ));
+            out.push_str(&sse_event(
+                "response.custom_tool_call_input.done",
+                &json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "input": input
+                }),
+            ));
+            out.push_str(&sse_event(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": done_item
+                }),
+            ));
+            let _ = desktop_call_id;
+        } else {
+            let item = json!({
+                "id": item_id,
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": desktop_call_id,
+                "name": tc.name,
+                "arguments": ""
+            });
+            out.push_str(&sse_event(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": item
+                }),
+            ));
+            out.push_str(&sse_event(
+                "response.function_call_arguments.delta",
+                &json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": arguments
+                }),
+            ));
+            out.push_str(&sse_event(
+                "response.function_call_arguments.done",
+                &json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "arguments": arguments
+                }),
+            ));
+            out.push_str(&sse_event(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": done_item
+                }),
+            ));
+        }
         output_items.push(done_item);
     }
 
@@ -2352,10 +2767,52 @@ fn keeps_codex_native_tools(kind: &str) -> bool {
 fn responses_tool_types_for_kind(kind: &str) -> &'static [&'static str] {
     match kind.to_ascii_lowercase().as_str() {
         "xai" => XAI_RESPONSES_TOOL_TYPES,
-        // kimi / deepseek use Chat Completions (handled elsewhere); if a route
+        // kimi / legacy deepseek-chat use Chat Completions (handled elsewhere); if a route
         // is mis-stamped as Responses, still use the conservative set.
         _ => GENERIC_RESPONSES_TOOL_TYPES,
     }
+}
+
+use crate::tool_roundtrip::APPLY_PATCH_TOOL_NAME;
+
+fn tool_name(tool: &Value) -> Option<&str> {
+    tool.get("name")
+        .and_then(Value::as_str)
+        .or_else(|| tool.pointer("/function/name").and_then(Value::as_str))
+        .filter(|name| !name.is_empty())
+}
+
+/// Portable function-shaped freeform tool for non-OpenAI hosts (outbound only).
+///
+/// Protocol translation only: Chat Completions cannot carry `type=custom` freeform.
+/// When Desktop already supplied description/parameters, those win over registry
+/// fallbacks — we do not invent product policy text over the official tool row.
+fn freeform_tool_as_function(source: &Value, name: &str) -> Value {
+    let mut portable = crate::tool_roundtrip::freeform_as_function_tool(name);
+    let Some(object) = portable.as_object_mut() else {
+        return portable;
+    };
+    // Non-empty Desktop description is authoritative (official runtime surface).
+    if let Some(description) = source
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        object.insert("description".into(), Value::String(description.to_string()));
+    }
+    if let Some(parameters) = source
+        .get("parameters")
+        .or_else(|| source.get("input_schema"))
+        .or_else(|| source.pointer("/function/parameters"))
+        .filter(|v| !v.is_null())
+    {
+        object.insert("parameters".into(), parameters.clone());
+    }
+    // Keep Desktop name exactly (including freeform names like apply_patch / exec).
+    object.insert("name".into(), Value::String(name.to_string()));
+    object.insert("type".into(), Value::String("function".into()));
+    portable
 }
 
 /// Port Codex Desktop `tools[]` rows into an allow-list for a third-party host.
@@ -2363,11 +2820,38 @@ fn responses_tool_types_for_kind(kind: &str) -> &'static [&'static str] {
 /// - keeps rows whose `type` is in `allowed`
 /// - remaps `local_shell` → `shell` when `shell` is allowed
 /// - flattens nested tools under Codex `namespace` groups
-/// - drops `custom` / empty namespaces / other Codex-only kinds
+/// - rewrites registry freeform/custom tools → portable `function` (never drop by name)
+/// - drops other `custom` / empty namespaces / unknown kinds that upstream would 422 on
+///
+/// Does **not** hide freeform `exec` or other Desktop-advertised freeform tools.
 fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
     let mut kept = Vec::with_capacity(tools.len());
     for tool in tools {
         let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+
+        // Official freeform tools (apply_patch, exec, …) → portable function for third-party.
+        if let Some(name) = tool_name(tool) {
+            if crate::tool_roundtrip::is_freeform_desktop_tool(name) && allowed.contains(&"function")
+            {
+                if tool.get("function").is_some() {
+                    let mut row = tool.clone();
+                    if tool_type.is_empty() {
+                        if let Some(object) = row.as_object_mut() {
+                            object.insert("type".into(), Value::String("function".into()));
+                        }
+                    }
+                    kept.push(row);
+                } else if tool_type == "function"
+                    && tool.get("parameters").is_some()
+                    && tool.get("name").is_some()
+                {
+                    kept.push(tool.clone());
+                } else {
+                    kept.push(freeform_tool_as_function(tool, name));
+                }
+                continue;
+            }
+        }
 
         if tool_type == "local_shell" && allowed.contains(&"shell") {
             let mut remapped = tool.clone();
@@ -2418,7 +2902,7 @@ fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
             }
             kept.push(row);
         }
-        // Drop: custom, apply_patch, empty namespace, unknown kinds.
+        // Drop: other custom, empty namespace, unknown kinds.
     }
     kept
 }
@@ -2564,19 +3048,23 @@ fn sanitize_openai_input_message_ids(request: &mut Value) {
 /// Observed failure (xAI): `unknown variant namespace, expected one of function,
 /// web_search, x_search, image_generation, collections_search, file_search,
 /// code_execution, code_interpreter, mcp, shell`.
+///
+/// Always re-injects portable `apply_patch` (function) so non-OpenAI hosts see
+/// the official edit tool even when Desktop omitted freeform injection.
 fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
     if keeps_codex_native_tools(kind) {
         return;
     }
     let allowed = responses_tool_types_for_kind(kind);
-    let Some(items) = request
+    let items = request
         .get_mut("tools")
         .and_then(Value::as_array_mut)
         .map(std::mem::take)
-    else {
-        return;
-    };
-    let kept = port_codex_tools(&items, allowed);
+        .unwrap_or_default();
+    let mut kept = port_codex_tools(&items, allowed);
+    if allowed.contains(&"function") {
+        ensure_responses_apply_patch_tool(&mut kept);
+    }
     let Some(object) = request.as_object_mut() else {
         return;
     };
@@ -3071,6 +3559,20 @@ fn test_route_target(kind: &str) -> RouteTarget {
     }
 }
 
+#[cfg(test)]
+fn test_route_target_with_model(kind: &str, model: &str, protocol: &str) -> RouteTarget {
+    RouteTarget {
+        provider_id: "test".into(),
+        kind: kind.into(),
+        upstream_model: model.into(),
+        base_url: "https://api.deepseek.com/v1".into(),
+        protocol: protocol.into(),
+        reasoning_profile_id: crate::reasoning_map::ReasoningProfileId::default_for_kind(kind)
+            .as_str()
+            .into(),
+    }
+}
+
 fn instruction_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.trim().to_string(),
@@ -3226,9 +3728,70 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         let text = compact_shim::compaction_item_to_text(encrypted);
                         messages.push(json!({"role": "user", "content": text}));
                     }
-                    "custom_tool_call" | "custom_tool_call_output" => {
-                        // Not mapped in v1; drop rather than poison history.
-                        continue;
+                    "custom_tool_call" => {
+                        // Desktop freeform apply_patch (and other custom tools) → Chat tool_calls.
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if call_id.is_empty() || name.is_empty() {
+                            continue;
+                        }
+                        let arguments = match item
+                            .get("input")
+                            .or_else(|| item.get("arguments"))
+                        {
+                            Some(Value::String(s)) if name == APPLY_PATCH_TOOL_NAME => {
+                                // Freeform body → JSON object the function schema expects.
+                                serde_json::to_string(&json!({ "input": s }))
+                                    .unwrap_or_else(|_| format!(r#"{{"input":{}}}"#, json!(s)))
+                            }
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) => v.to_string(),
+                            None => "{}".into(),
+                        };
+                        pending_tool_calls.push(json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments
+                            }
+                        }));
+                    }
+                    "custom_tool_call_output" => {
+                        // Same shape as function_call_output for Chat Completions.
+                        flush_assistant_turn(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_assistant_text,
+                        );
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if call_id.is_empty() {
+                            continue;
+                        }
+                        let output = match item.get("output").or_else(|| item.get("result")) {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) => v.to_string(),
+                            None => String::new(),
+                        };
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": output
+                        }));
                     }
                     "function_call" => {
                         let call_id = item
@@ -3365,19 +3928,21 @@ fn content_text(content: &Value) -> String {
 
 /// Map Codex Responses tools → Chat Completions `tools[].function` shape.
 ///
-/// Used for Kimi / DeepSeek / other Chat Completions routes. Applies the same
-/// Codex porting rules as non-OpenAI Responses (flatten `namespace`, drop
-/// `local_shell` / `custom` / …) then rewrites freeform function rows into the
-/// nested `function` object Chat Completions expects.
+/// Used for Kimi / DeepSeek / other Chat Completions routes. Protocol-only:
+/// flatten namespace, remap local_shell when allowed, rewrite freeform/custom
+/// registry tools to nested `function` rows. Preserves Desktop name/description
+/// /parameters whenever present. Ensures `apply_patch` is listed when catalog
+/// freeform expects it but Desktop omitted the row.
 fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Vec<Value> {
-    let Some(Value::Array(items)) = tools else {
-        return Vec::new();
+    let items = match tools {
+        Some(Value::Array(items)) => items.as_slice(),
+        _ => &[],
     };
     // Chat Completions only accepts function tools; shell/web_search are not portable.
     let portable = port_codex_tools(items, CHAT_COMPLETIONS_TOOL_TYPES);
-    let mut out = Vec::with_capacity(portable.len());
+    let mut out = Vec::with_capacity(portable.len() + 1);
     for tool in portable {
-        // Already Chat Completions shaped.
+        // Already Chat Completions shaped — keep as-is (description fidelity).
         if tool.get("function").is_some() {
             let mut row = tool;
             if row
@@ -3393,7 +3958,7 @@ fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Vec<Value> {
             out.push(row);
             continue;
         }
-        // Responses freeform function: {type:function, name, description, parameters}
+        // Responses-shaped function or freeform rewrite: {type:function, name, description, parameters}
         let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
@@ -3418,7 +3983,38 @@ fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Vec<Value> {
             }
         }));
     }
+    ensure_chat_apply_patch_tool(&mut out);
     out
+}
+
+fn chat_tools_have_apply_patch(tools: &[Value]) -> bool {
+    tools.iter().any(|tool| {
+        tool.pointer("/function/name").and_then(Value::as_str) == Some(APPLY_PATCH_TOOL_NAME)
+            || tool.get("name").and_then(Value::as_str) == Some(APPLY_PATCH_TOOL_NAME)
+    })
+}
+
+/// Guarantee Chat Completions `tools` includes nested `function.apply_patch`.
+fn ensure_chat_apply_patch_tool(tools: &mut Vec<Value>) {
+    if chat_tools_have_apply_patch(tools) {
+        return;
+    }
+    tools.push(crate::tool_roundtrip::apply_patch_as_chat_function_tool());
+}
+
+/// Guarantee Responses-style tools include a function-shaped apply_patch.
+fn ensure_responses_apply_patch_tool(tools: &mut Vec<Value>) {
+    let has = tools.iter().any(|tool| {
+        tool_name(tool) == Some(APPLY_PATCH_TOOL_NAME)
+            || tool.pointer("/function/name").and_then(Value::as_str) == Some(APPLY_PATCH_TOOL_NAME)
+    });
+    if has {
+        return;
+    }
+    tools.push(freeform_tool_as_function(
+        &json!({"type": "custom", "name": APPLY_PATCH_TOOL_NAME}),
+        APPLY_PATCH_TOOL_NAME,
+    ));
 }
 
 fn endpoint(base_url: &str, kind: &str, path: &str) -> String {
@@ -3447,8 +4043,25 @@ fn live_compaction_index(request: &Value) -> Option<usize> {
         })
 }
 
+/// Remote Compact V2 only when the **last** compaction item is the live control
+/// carrier (no `encrypted_content`). Historical `spur1:` / `gAAAAA…` rows alone
+/// must NOT re-enter the compact shim — they belong on the normal turn path so
+/// they can expand into readable summary text for the current model.
 fn is_remote_compaction_request(request: &Value) -> bool {
-    live_compaction_index(request).is_some()
+    let Some(index) = live_compaction_index(request) else {
+        return false;
+    };
+    let Some(items) = request.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(item) = items.get(index) else {
+        return false;
+    };
+    match item.get("encrypted_content").and_then(Value::as_str) {
+        None => true,
+        Some(s) if s.trim().is_empty() => true,
+        Some(_) => false,
+    }
 }
 
 fn compaction_output_count(response: &Value) -> usize {
@@ -3555,6 +4168,7 @@ async fn passthrough(
                 &message,
             );
         }
+        let bytes = restore_freeform_in_buffered_responses_bytes(&bytes, is_sse);
         let mut builder = Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -3572,7 +4186,8 @@ async fn passthrough(
     }
 
     // True streaming for normal Responses SSE: forward chunks as they arrive so Desktop
-    // sees first token promptly (avoid buffering the whole upstream stream).
+    // sees first token promptly. Rewrite freeform function_call → custom_tool_call so
+    // every provider matches official Desktop freeform shape (Grok 019fb6c5 abort).
     if is_sse && status.is_success() {
         // Usage is approximate for live streams (full JSON parse only on buffered paths).
         metrics.output_tokens.fetch_add(1, Ordering::Relaxed);
@@ -3590,10 +4205,17 @@ async fn passthrough(
                 },
             )
             .await;
-        let stream = response.bytes_stream();
-        let mapped = futures_util::StreamExt::map(stream, |chunk| {
+        use futures_util::{stream, StreamExt};
+        let mut restorer = FreeformSseRestorer::default();
+        let upstream = response.bytes_stream().map(|chunk| {
             chunk.map_err(|error| std::io::Error::other(error.to_string()))
         });
+        // Empty trailing chunk flushes incomplete SSE remainder through restorer.finish().
+        let mapped = upstream
+            .chain(stream::once(async { Ok(Bytes::new()) }))
+            .map(move |chunk| {
+                chunk.map(|bytes| Bytes::from(restorer.push(bytes.as_ref())))
+            });
         let mut builder = Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -3611,8 +4233,9 @@ async fn passthrough(
     match response.bytes().await {
         Ok(bytes) => {
             // Non-SSE success that is still a JSON error envelope (some gateways).
+            let mut response_bytes = bytes;
             if status.is_success() {
-                if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                if let Ok(mut body) = serde_json::from_slice::<Value>(&response_bytes) {
                     if body.get("error").is_some() && body.get("output").is_none() {
                         let message = body
                             .pointer("/error/message")
@@ -3624,6 +4247,11 @@ async fn passthrough(
                             "upstream_error_envelope",
                             message,
                         );
+                    }
+                    // Official Desktop freeform shape for all Responses JSON hosts.
+                    crate::tool_roundtrip::restore_freeform_in_responses_body(&mut body);
+                    if let Ok(rewritten) = serde_json::to_vec(&body) {
+                        response_bytes = Bytes::from(rewritten);
                     }
                     metrics.record_response(&body);
                     let (output_tokens, cache_observations, cache_hits) = response_usage(&body);
@@ -3642,7 +4270,7 @@ async fn passthrough(
                         )
                         .await;
                 } else {
-                    let output_tokens = bytes.len() as i64 / 4;
+                    let output_tokens = response_bytes.len() as i64 / 4;
                     metrics
                         .output_tokens
                         .fetch_add(output_tokens as u64, Ordering::Relaxed);
@@ -3661,7 +4289,7 @@ async fn passthrough(
                         )
                         .await;
                 }
-            } else if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+            } else if let Ok(body) = serde_json::from_slice::<Value>(&response_bytes) {
                 metrics.record_response(&body);
                 let _ = storage
                     .record_usage(
@@ -3682,13 +4310,15 @@ async fn passthrough(
             if let Some(content_type) = content_type {
                 builder = builder.header(header::CONTENT_TYPE, content_type);
             }
-            builder.body(Body::from(bytes)).unwrap_or_else(|_| {
-                error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "proxy_response_error",
-                    "Failed to build proxy response",
-                )
-            })
+            builder
+                .body(Body::from(response_bytes))
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "proxy_response_error",
+                        "Failed to build proxy response",
+                    )
+                })
         }
         Err(error) => error_response(
             StatusCode::BAD_GATEWAY,
@@ -4640,6 +5270,26 @@ data: [DONE]
     }
 
     #[test]
+    fn deepseek_v4_flash_prefers_native_responses_over_legacy_chat_protocol() {
+        let flash = test_route_target_with_model(
+            "deepseek",
+            "deepseek-v4-flash",
+            "Chat Completions",
+        );
+        assert!(
+            !route_uses_chat_completions(&flash),
+            "official V4 Flash must use Responses even if provider row still says Chat"
+        );
+        let legacy = test_route_target_with_model("deepseek", "deepseek-chat", "Responses");
+        assert!(
+            route_uses_chat_completions(&legacy),
+            "legacy deepseek-chat stays on Chat Completions bridge"
+        );
+        let kimi = test_route_target("kimi");
+        assert!(route_uses_chat_completions(&kimi));
+    }
+
+    #[test]
     fn maps_codex_developer_role_to_system_for_deepseek() {
         // Desktop "carefully think" turns inject developer instruction blocks.
         let messages = response_input_to_messages(Some(&json!([
@@ -4754,10 +5404,12 @@ data: [DONE]
                 }
             }
         ])));
-        assert_eq!(tools.len(), 3);
+        // Portable tools + ensure_chat_apply_patch_tool when Desktop omitted freeform.
+        assert_eq!(tools.len(), 4);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
         assert_eq!(tools[1]["function"]["name"], "open_url");
         assert_eq!(tools[2]["function"]["name"], "already_chat");
+        assert_eq!(tools[3]["function"]["name"], "apply_patch");
         assert!(tools.iter().all(|t| t["type"] == "function"));
         assert!(tools.iter().all(|t| t["function"]["name"] != "codex"));
     }
@@ -4798,9 +5450,11 @@ data: [DONE]
             .iter()
             .map(|tool| tool["type"].as_str().unwrap())
             .collect();
-        assert_eq!(types, vec!["function", "shell", "function"]);
+        // open_url, shell, get_weather, apply_patch(as function)
+        assert_eq!(types, vec!["function", "shell", "function", "function"]);
         assert_eq!(tools[0]["name"], "open_url");
         assert_eq!(tools[2]["name"], "get_weather");
+        assert_eq!(tools[3]["name"], "apply_patch");
         assert!(!types.contains(&"namespace"));
         assert!(!types.contains(&"local_shell"));
         assert!(!types.contains(&"custom"));
@@ -4835,7 +5489,242 @@ data: [DONE]
                     .any(|t| t["name"] == "get_weather" || t["function"]["name"] == "get_weather"),
                 "{kind} should keep freeform function tools"
             );
+            assert!(
+                tools.iter().any(|t| {
+                    t["name"] == "apply_patch"
+                        || t["function"]["name"] == "apply_patch"
+                }),
+                "{kind} must rewrite custom apply_patch to portable function"
+            );
         }
+    }
+
+    #[test]
+    fn chat_tools_include_apply_patch_as_nested_function() {
+        let tools = responses_tools_to_chat_tools(Some(&sample_codex_tools()));
+        let apply = tools
+            .iter()
+            .find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("apply_patch"))
+            .expect("apply_patch function for Chat Completions");
+        assert_eq!(apply["type"], "function");
+        assert!(
+            apply
+                .pointer("/function/parameters/properties/input")
+                .is_some(),
+            "apply_patch must expose an input string parameter"
+        );
+    }
+
+    #[test]
+    fn chat_tools_inject_apply_patch_when_desktop_omitted_it() {
+        let tools = responses_tools_to_chat_tools(Some(&json!([
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        ])));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("apply_patch")),
+            "proxy must inject apply_patch when Desktop did not send freeform"
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("get_weather"))
+        );
+    }
+
+    #[test]
+    fn chat_tools_inject_apply_patch_when_tools_array_missing() {
+        let tools = responses_tools_to_chat_tools(None);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "apply_patch");
+    }
+
+    #[test]
+    fn chat_history_maps_custom_apply_patch_call_and_output() {
+        let messages = response_input_to_messages(Some(&json!([
+            {
+                "type": "custom_tool_call",
+                "call_id": "ctc_1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "ctc_1",
+                "output": "Success"
+            }
+        ])));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        let tool_calls = messages[0]["tool_calls"].as_array().expect("tool_calls");
+        assert_eq!(tool_calls[0]["function"]["name"], "apply_patch");
+        let args = tool_calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments string");
+        assert!(args.contains("Begin Patch"), "args={args}");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "ctc_1");
+        assert_eq!(messages[1]["content"], "Success");
+    }
+
+    #[test]
+    fn chat_inbound_restores_apply_patch_as_custom_tool_call_not_function_call() {
+        // Kimi returns function-shaped tool_calls; Desktop freeform needs custom_tool_call.
+        let assembled = [AssembledToolCall {
+            id: "tool_kimi_1".into(),
+            name: "apply_patch".into(),
+            arguments: r#"{"input":"*** Begin Patch\n*** Update File: a.py\n@@\n-old\n+new\n*** End Patch"}"#.into(),
+        }];
+        let output = chat_parts_to_responses_output("resp_roundtrip", "", "", &assembled);
+        let item = output
+            .iter()
+            .find(|v| v.get("name").and_then(Value::as_str) == Some("apply_patch"))
+            .expect("apply_patch item");
+        assert_eq!(
+            item["type"], "custom_tool_call",
+            "must restore official freeform type, got {item}"
+        );
+        assert_eq!(item["call_id"], "tool_kimi_1");
+        let input = item["input"].as_str().expect("freeform input");
+        assert!(input.starts_with("*** Begin Patch"));
+        assert!(input.contains("Update File: a.py"));
+        assert!(item.get("arguments").is_none());
+    }
+
+    #[test]
+    fn responses_json_restores_function_call_apply_patch_to_custom_tool_call() {
+        let mut body = json!({
+            "id": "resp_xai",
+            "output": [{
+                "id": "fc_1",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "arguments": "{\"input\":\"*** Begin Patch\\n*** Update File: /tmp/x\\n@@\\n-a\\n+b\\n*** End Patch\"}"
+            }, {
+                "id": "fc_2",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": "call_shell",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"pwd\"}"
+            }]
+        });
+        crate::tool_roundtrip::restore_freeform_in_responses_body(&mut body);
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert!(body["output"][0]["input"]
+            .as_str()
+            .unwrap()
+            .starts_with("*** Begin Patch"));
+        assert!(body["output"][0].get("arguments").is_none());
+        assert_eq!(body["output"][1]["type"], "function_call");
+        assert_eq!(body["output"][1]["name"], "exec_command");
+    }
+
+    #[test]
+    fn responses_sse_restorer_rewrites_freeform_function_call_lifecycle() {
+        let patch = r#"{"input":"*** Begin Patch\n*** End Patch"}"#;
+        let sse = format!(
+            "event: response.output_item.added\n\
+data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":\"\"}}}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":{delta}}}\n\
+\n\
+event: response.function_call_arguments.done\n\
+data: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":{args}}}\n\
+\n\
+event: response.output_item.done\n\
+data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":{args}}}}}\n\
+\n",
+            delta = serde_json::to_string(patch).unwrap(),
+            args = serde_json::to_string(patch).unwrap(),
+        );
+        let mut restorer = FreeformSseRestorer::default();
+        let out = String::from_utf8(restorer.push(sse.as_bytes())).unwrap();
+        let out = out + &String::from_utf8(restorer.finish()).unwrap();
+        assert!(
+            out.contains("custom_tool_call"),
+            "must restore custom_tool_call: {out}"
+        );
+        assert!(
+            out.contains("response.custom_tool_call_input.done"),
+            "must emit freeform input lifecycle: {out}"
+        );
+        assert!(
+            out.contains("*** Begin Patch"),
+            "freeform body must appear: {out}"
+        );
+        // Freeform must not remain as a completed function_call item for Desktop.
+        assert!(
+            !out.contains("\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"apply_patch\""),
+            "completed freeform function_call must be rewritten: {out}"
+        );
+        // Non-freeform path still uses function_call_arguments for other tools — N/A here.
+    }
+
+    #[test]
+    fn responses_sse_restorer_leaves_exec_command_function_call() {
+        let sse = r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_s","type":"function_call","status":"in_progress","call_id":"c1","name":"exec_command","arguments":""}}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_s","output_index":0,"arguments":"{\"cmd\":\"pwd\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","type":"function_call","status":"completed","call_id":"c1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}
+
+"#;
+        let mut restorer = FreeformSseRestorer::default();
+        let out = String::from_utf8(restorer.push(sse.as_bytes())).unwrap();
+        assert!(out.contains("function_call_arguments.done"));
+        assert!(out.contains("exec_command"));
+        assert!(!out.contains("custom_tool_call"));
+    }
+
+    #[test]
+    fn chat_stream_sse_uses_custom_tool_call_for_apply_patch() {
+        let assembled = [AssembledToolCall {
+            id: "tool_stream_1".into(),
+            name: "apply_patch".into(),
+            arguments: r#"{"input":"*** Begin Patch\n*** End Patch"}"#.into(),
+        }];
+        let sse = chat_parsed_to_responses_sse(
+            "resp_sse",
+            "kimi-k2.7",
+            1_700_000_000,
+            "",
+            "",
+            &assembled,
+            None,
+        );
+        assert!(
+            sse.contains("custom_tool_call"),
+            "SSE must mention custom_tool_call"
+        );
+        assert!(
+            !sse.contains("response.function_call_arguments.delta"),
+            "apply_patch must not use function_call_arguments lifecycle"
+        );
+        assert!(
+            sse.contains("*** Begin Patch"),
+            "freeform body must appear in SSE"
+        );
+        assert!(
+            sse.contains("response.custom_tool_call_input.done"),
+            "custom input lifecycle missing"
+        );
+        assert!(
+            sse.contains("\"type\":\"custom_tool_call\"")
+                || sse.contains("\"type\": \"custom_tool_call\""),
+            "item type custom_tool_call missing"
+        );
     }
 
     #[test]
@@ -4855,7 +5744,7 @@ data: [DONE]
     }
 
     #[test]
-    fn xai_responses_tools_omit_key_when_all_unsupported() {
+    fn xai_responses_tools_inject_apply_patch_when_all_other_tools_unsupported() {
         let mut body = json!({
             "tools": [
                 {"type": "namespace", "name": "codex"},
@@ -4863,7 +5752,139 @@ data: [DONE]
             ]
         });
         sanitize_responses_request_for_upstream("xai", &mut body);
-        assert!(body.get("tools").is_none());
+        let tools = body["tools"].as_array().expect("apply_patch injected");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "apply_patch");
+        assert_eq!(tools[0]["type"], "function");
+    }
+
+    #[test]
+    fn xai_keeps_only_apply_patch_custom_as_function() {
+        let mut body = json!({
+            "tools": [
+                {"type": "namespace", "name": "codex"},
+                {"type": "custom", "name": "apply_patch"}
+            ]
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+        let tools = body["tools"].as_array().expect("apply_patch kept");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "apply_patch");
+    }
+
+    #[test]
+    fn xai_rewrites_freeform_exec_custom_instead_of_dropping() {
+        let mut body = json!({
+            "tools": [
+                {"type": "custom", "name": "exec", "description": "legacy freeform exec"}
+            ]
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+        let tools = body["tools"].as_array().expect("tools kept");
+        // exec rewritten + apply_patch ensured for non-OpenAI coding routes.
+        let exec = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("exec"))
+            .expect("exec must not be dropped");
+        assert_eq!(exec["type"], "function");
+        assert!(
+            exec.pointer("/parameters/properties/input").is_some(),
+            "exec freeform must expose input parameter"
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(Value::as_str) == Some("apply_patch")),
+            "apply_patch still ensured on non-OpenAI Responses"
+        );
+    }
+
+    #[test]
+    fn chat_inbound_restores_exec_as_custom_tool_call() {
+        let assembled = [AssembledToolCall {
+            id: "tool_exec_kimi".into(),
+            name: "exec".into(),
+            arguments: r#"{"input":"echo hi"}"#.into(),
+        }];
+        let output = chat_parts_to_responses_output("resp_exec", "", "", &assembled);
+        let item = output
+            .iter()
+            .find(|v| v.get("name").and_then(Value::as_str) == Some("exec"))
+            .expect("exec item");
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["input"], "echo hi");
+    }
+
+    #[test]
+    fn chat_outbound_preserves_desktop_freeform_description() {
+        // Desktop freeform row with official description must not be replaced by a weaker stub.
+        let tools = responses_tools_to_chat_tools(Some(&json!([
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "OFFICIAL_DESKTOP_APPLY_PATCH_DESCRIPTION *** Begin Patch"
+            },
+            {
+                "type": "custom",
+                "name": "exec",
+                "description": "OFFICIAL_DESKTOP_EXEC_DESCRIPTION"
+            },
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "OFFICIAL_SHELL",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }
+        ])));
+        let apply = tools
+            .iter()
+            .find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("apply_patch"))
+            .expect("apply_patch present");
+        assert!(
+            apply["function"]["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("OFFICIAL_DESKTOP_APPLY_PATCH_DESCRIPTION"),
+            "Desktop description must win: {apply}"
+        );
+        let exec = tools
+            .iter()
+            .find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("exec"))
+            .expect("freeform exec must not be dropped");
+        assert!(
+            exec["function"]["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("OFFICIAL_DESKTOP_EXEC_DESCRIPTION"),
+            "exec description must be preserved: {exec}"
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("exec_command")),
+            "exec_command must remain"
+        );
+    }
+
+    #[test]
+    fn chat_outbound_keeps_exec_and_exec_command_together() {
+        // Official surface may advertise both; we must not hide freeform exec.
+        let tools = responses_tools_to_chat_tools(Some(&json!([
+            {"type": "custom", "name": "exec"},
+            {
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        ])));
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"exec"), "names={names:?}");
+        assert!(names.contains(&"exec_command"), "names={names:?}");
+        assert!(names.contains(&"apply_patch"), "apply_patch still ensured");
     }
 
     #[test]
@@ -4910,8 +5931,10 @@ data: [DONE]
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
         let tools = body["tools"].as_array().expect("function tool kept");
-        assert_eq!(tools.len(), 1);
+        // Desktop tool kept + apply_patch ensured for non-OpenAI coding routes.
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "lookup");
+        assert_eq!(tools[1]["name"], "apply_patch");
     }
 
     /// Accident replay: official GPT-5.4-Mini → Grok mid-thread (thread 019f8111…).
@@ -5132,6 +6155,29 @@ data: [DONE]
             !is_remote_compaction_request(&normal_turn),
             "everyday OpenAI Responses turns must not be treated as compact"
         );
+
+        // Historical portable summary only — normal turn path (expand + answer).
+        let with_history_only = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type":"compaction","encrypted_content":"spur1:dGVzdA=="},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]},
+            ]
+        });
+        assert!(
+            !is_remote_compaction_request(&with_history_only),
+            "historical spur1 must not re-trigger compact shim"
+        );
+
+        // Compact turn may still replay historical spur1 before the live carrier.
+        let compact_with_history = json!({
+            "input": [
+                {"type":"compaction","encrypted_content":"spur1:dGVzdA=="},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"x"}]},
+                {"type":"compaction"}
+            ]
+        });
+        assert!(is_remote_compaction_request(&compact_with_history));
     }
 
     #[test]
@@ -5233,7 +6279,10 @@ data: [DONE]
             "deepseek-chat",
             &test_route_target("deepseek"),
         );
-        assert!(chat.get("tools").is_none() || chat["tools"].as_array().unwrap().is_empty());
+        // Empty namespace dropped; apply_patch still ensured for Chat coding hosts.
+        let tools = chat["tools"].as_array().expect("apply_patch injected");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "apply_patch");
         assert!(chat.get("tool_choice").is_none());
     }
 
@@ -5249,9 +6298,10 @@ data: [DONE]
             &test_route_target("kimi"),
         );
         let tools = chat["tools"].as_array().expect("function tools kept");
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0]["function"]["name"], "open_url");
         assert_eq!(tools[1]["function"]["name"], "get_weather");
+        assert_eq!(tools[2]["function"]["name"], "apply_patch");
         assert!(tools.iter().all(|t| t["type"] == "function"));
     }
 
@@ -5273,10 +6323,10 @@ data: [DONE]
         assert_eq!(chat["model"], "deepseek-v4-flash");
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][1]["content"], "Hi");
-        assert!(
-            chat.get("tools").is_none(),
-            "unsupported tools must be dropped"
-        );
+        // local_shell dropped; apply_patch injected for Chat coding hosts.
+        let tools = chat["tools"].as_array().expect("apply_patch injected");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "apply_patch");
         assert_eq!(chat["reasoning_effort"], "high");
         assert_eq!(chat["thinking"]["type"], "enabled");
 

@@ -4,12 +4,27 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- **DeepSeek V4 native Responses (official Codex path)**: new DeepSeek instances default to **`protocol = Responses`** (no longer Chat Completions). `deepseek-v4-flash` / `deepseek-v4-pro` always forward to upstream **`/responses`** even if a legacy provider row still says Chat — matching DeepSeek’s 2026-07-31 Codex script (`wire_api = "responses"`). Legacy ids such as `deepseek-chat` stay on the Chat Completions bridge. Catalog rows for DeepSeek align with the official script: **1M** context, `effective_context_window_percent = 95`, `truncation_policy.mode = tokens`, `default_reasoning_summary = none`, `apply_patch_tool_type = freeform`, `model_messages.instructions_template` dual-write of the lean `base_instructions`. Still published under Spur’s `codex_select` provider (does **not** monopolize `model_provider = deepseek`).
+
+### Fixed
+
+- **Official context bar / auto-compact alignment**: catalog `effective_context_window_percent` defaults to **95** (Codex official usable UI window). Auto-compact stays **~90% of raw `context_window`** (same clamp as `codex-rs`), i.e. about **~95% of the Desktop context bar**. Legacy Spur rows with 90% are healed on normalize / Apply.
+- **Official `apply_patch` for third-party routes (Kimi/DeepSeek/xAI/…)**: catalog rows advertise `apply_patch_tool_type: freeform` so Desktop registers client-side apply_patch required by official lean `base_instructions`. **Do not force `tool_mode=code_mode_only`** (that primary freeform `exec` JS path caused weaker models to thrash on nested `tools.*`); matches Nice Switch GPT-5.5 freeform-only ads and live native gpt-5.6 top-level `exec_command`. Proxy **always injects** a portable Chat/Responses `function` named `apply_patch` for non-OpenAI hosts (even when Desktop omits freeform), rewrites freeform/custom rows, and maps `custom_tool_call` history into Chat tool turns. Kill switch: `SPUR_DISABLE_APPLY_PATCH=1`. `web_search` stays off until a separate A/B; DeepSeek may advertise `supports_parallel_tool_calls` per official catalog.
+- **Stop inventing freeform `exec` descriptions**: outbound freeform port uses Desktop description when present; registry fallback for non-`apply_patch` freeform tools is an empty description + `input` schema only (no “legacy freeform exec” product copy).
+- **Responses passthrough freeform restore (all providers)**: Grok/xAI and other Responses-native hosts return freeform tools as `function_call` after portable outbound ads — Desktop freeform executor **aborted** (session 019fb6c5). SSE + JSON Responses passthrough now rewrites freeform names (`apply_patch` / `exec`) to official **`custom_tool_call` + freeform `input`** (same gold shape as the Chat Completions bridge). Non-freeform tools unchanged; already-custom items are idempotent. Chat path unchanged.
+- **Tool round-trip contract (fix aborted apply_patch)**: Kimi was calling `apply_patch` as Chat `function`, but Spur returned Desktop `function_call` — freeform executor **aborted** with zero output. New `tool_roundtrip` registry restores freeform tools to official **`custom_tool_call` + freeform `input`** (gold sample from native successful sessions) on both stream and non-stream paths. Outbound may adapt; inbound must match Desktop.
+- **Full tool registry from local rollouts**: freeform set is exactly **`apply_patch` + `exec`** (custom_tool_call); all other observed tools (`exec_command`, plan/goal, multi-agent, Codex App thread tools, computer-use, common MCP names) are explicit **function_call** profiles. Outbound ports any freeform custom tool (not only apply_patch); unknown names still default to function symmetry.
+- **Tool outbound fidelity (official surface)**: when rewriting freeform/custom tools for Chat Completions, **Desktop-supplied name/description/parameters win** over registry stubs. Freeform `exec` is never dropped when listed alongside `exec_command`. No proxy-side tool-catalog nudge or identity rewrite — protocol translation only.
+
 ## [0.1.12] - 2026-07-30
 
 ### Fixed
 
 - **Official lean `base_instructions` from openai/codex `models.json`**: catalog rows no longer use the 117-char CC Switch stub. **Sol** resolves from the official `gpt-5.6-sol` entry; **Terra/Luna** from their official entries; **all other spur routes** map to the Terra/Luna lean body. Source: `codex-rs/models-manager/models.json` fixtures under `src-tauri/fixtures/official_prompts/`. Tool ads remain lean (no `apply_patch_tool_type`) so Desktop model list stays intact.
 - **OpenAI compact is portable (same as Kimi/DeepSeek)**: when Desktop issues Remote Compaction V2, Spur always runs the local summarizer on the **current** model and returns a `spur1:` plaintext envelope — including for OpenAI routes. Everyday OpenAI turns still use Responses as before; only the compact beat is intercepted. This avoids minting `gAAAAA…` ciphertext that other models cannot read after a mid-thread switch. Historical OpenAI ciphertext is still not decryptable; re-`/compact` under the new path to get a portable summary.
+- **Compact intercept only on live carrier**: historical `spur1:` / `gAAAAA…` compaction rows alone no longer re-enter the compact shim; only a trailing live `{type:compaction}` control item (no `encrypted_content`) counts as a compact request, so later turns can expand the portable summary and answer normally.
 
 ### Packaging
 

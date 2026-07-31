@@ -534,11 +534,16 @@ fn default_reasoning_summary_value() -> serde_json::Value {
     serde_json::Value::String("auto".into())
 }
 
-/// Keep compaction headroom aligned with Codex Desktop's default.
+/// Codex official catalog default for the UI / usable input window.
 ///
-/// The picker uses this percentage to decide when to compact a thread; 95%
-/// leaves too little room for a tool call or final response before overflow.
-pub const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 90;
+/// Matches `openai/codex` `ModelInfo.effective_context_window_percent` (95):
+/// fraction of `context_window` shown as the Desktop "background / context"
+/// bar after reserving headroom for system prompts, tools, and model output.
+///
+/// Auto-compact is separate: core derives it as **90% of the raw
+/// `context_window`** (clamped). With this 95% effective window, that lands at
+/// roughly **~95% of the UI bar** (0.90 / 0.95), which is the official feel.
+pub const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
 
 fn default_effective_context_window_percent() -> i64 {
     DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT

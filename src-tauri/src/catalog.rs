@@ -158,19 +158,25 @@ pub fn validate_catalog(catalog: &ModelsResponse) -> Result<()> {
             }
         }
 
-        // All custom-provider catalog rows must stay lean — including GPT-named ones.
-        // Working CC Switch catalogs keep experimental_supported_tools: [] for
-        // gpt-5.6-terra/sol/luna. Advertising shell/apply_patch has emptied Desktop's
-        // bottom-right model list in the field.
+        // experimental_supported_tools must stay [] — non-empty ads have emptied Desktop's
+        // model list. apply_patch freeform is allowed (official models_cache + Nice Switch
+        // GPT custom rows). web_search stays off until a dedicated A/B.
         if !model.experimental_supported_tools.is_empty() {
             bail!(
                 "catalog 第 {} 个模型不得广告 experimental_supported_tools（须为空数组，对齐 CC Switch）",
                 index + 1
             );
         }
-        if model.apply_patch_tool_type.is_some() || model.web_search_tool_type.is_some() {
+        match model.apply_patch_tool_type.as_deref() {
+            None | Some("freeform") => {}
+            Some(other) => bail!(
+                "catalog 第 {} 个模型 apply_patch_tool_type 仅允许 freeform 或省略，收到 {other}",
+                index + 1
+            ),
+        }
+        if model.web_search_tool_type.is_some() {
             bail!(
-                "catalog 第 {} 个模型不得设置 apply_patch/web_search tool type",
+                "catalog 第 {} 个模型不得设置 web_search tool type（未做 Desktop A/B）",
                 index + 1
             );
         }
@@ -577,9 +583,9 @@ mod tests {
                 "must advertise at least one reasoning level"
             );
             assert!(targets.contains_key(&model.slug));
-            // Custom-provider rows never advertise shell/apply_patch (CC Switch shape).
+            // experimental tools stay empty; apply_patch freeform is official parity.
             assert!(model.experimental_supported_tools.is_empty());
-            assert!(model.apply_patch_tool_type.is_none());
+            assert_eq!(model.apply_patch_tool_type.as_deref(), Some("freeform"));
             // DESIGN.md: every picker row is "供应商 · 模型".
             assert!(
                 model.display_name.contains('·'),
@@ -777,10 +783,13 @@ mod tests {
         assert!(healed.contains("\"experimental_supported_tools\""));
         assert!(!healed.contains("\"experimentalSupportedTools\""));
         assert!(healed.contains("spur-route-"));
-        // Third-party rows must not advertise GPT-native tools after heal.
+        // Heal keeps freeform apply_patch + empty experimental tools; still no web_search.
         let payload: RouteCatalogPayload = serde_json::from_str(&healed).expect("payload");
         assert!(payload.model.experimental_supported_tools.is_empty());
-        assert!(payload.model.apply_patch_tool_type.is_none());
+        assert_eq!(
+            payload.model.apply_patch_tool_type.as_deref(),
+            Some("freeform")
+        );
         assert!(payload.model.web_search_tool_type.is_none());
         assert_eq!(payload.model.shell_type, "shell_command");
         assert_eq!(
@@ -796,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_catalog_rejects_third_party_tool_ads() {
+    fn validate_catalog_rejects_experimental_tool_ads() {
         let mut model = placeholder_model("spur-route-kimi".into(), "Kimi · K3".into());
         model.experimental_supported_tools = vec!["shell".into()];
         let error = validate_catalog(&ModelsResponse {

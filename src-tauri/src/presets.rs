@@ -16,7 +16,8 @@ pub fn provider_presets() -> Vec<ProviderSummary> {
             id: "deepseek".into(),
             name: "DeepSeek".into(),
             region: "Global".into(),
-            protocol: "Chat Completions".into(),
+            // Official Codex script (2026-07-31): wire_api = "responses" for V4 Flash.
+            protocol: "Responses".into(),
             configured: false,
             selected_models: 0,
             discovered_models: 0,

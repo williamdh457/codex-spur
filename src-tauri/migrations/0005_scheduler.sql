@@ -5,7 +5,7 @@ ALTER TABLE providers ADD COLUMN fixed_credential_id TEXT;
 
 ALTER TABLE account_pools ADD COLUMN scheduler_config_json TEXT NOT NULL DEFAULT '{}';
 
-ALTER TABLE pool_members ADD COLUMN concurrency_limit INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE pool_members ADD COLUMN concurrency_limit INTEGER NOT NULL DEFAULT 5;
 
 ALTER TABLE credentials ADD COLUMN cooldown_until INTEGER;
 ALTER TABLE credentials ADD COLUMN schedule_state TEXT NOT NULL DEFAULT 'ready';

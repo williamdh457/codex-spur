@@ -1233,7 +1233,7 @@ impl Storage {
                 enabled: row.get::<i64, _>("enabled") != 0,
                 concurrency_limit: row
                     .try_get::<i64, _>("concurrency_limit")
-                    .unwrap_or(1)
+                    .unwrap_or(5)
                     .max(1),
                 upstream_cost_rate: {
                     let rate: f64 = row.try_get("upstream_cost_rate").unwrap_or(1.0);
@@ -1406,7 +1406,7 @@ impl Storage {
                 active_leases: row.get("active_leases"),
                 concurrency_limit: row
                     .try_get::<i64, _>("concurrency_limit")
-                    .unwrap_or(1)
+                    .unwrap_or(5)
                     .max(1),
                 error_rate_ewma: row.try_get("error_rate_ewma").unwrap_or(0.0),
                 ttft_ewma_ms: row.try_get("ttft_ewma_ms").unwrap_or(0.0),
@@ -1543,7 +1543,7 @@ impl Storage {
                             ),
                             cooldown_until: row.try_get("cooldown_until").unwrap_or(None),
                             active_leases: 0,
-                            concurrency_limit: 1,
+                            concurrency_limit: 5,
                             error_rate_ewma: row.try_get("error_rate_ewma").unwrap_or(0.0),
                             ttft_ewma_ms: row.try_get("ttft_ewma_ms").unwrap_or(0.0),
                             quota_remaining: None,
@@ -1765,12 +1765,12 @@ impl Storage {
             .fetch_one(&self.pool)
             .await?;
             let limit: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(concurrency_limit), 1) FROM pool_members WHERE credential_id = ? AND enabled = 1",
+                "SELECT COALESCE(MAX(concurrency_limit), 5) FROM pool_members WHERE credential_id = ? AND enabled = 1",
             )
             .bind(credential_id)
             .fetch_one(&self.pool)
             .await
-            .unwrap_or(1)
+            .unwrap_or(5)
             .max(1);
             if active < limit {
                 return Ok(true);

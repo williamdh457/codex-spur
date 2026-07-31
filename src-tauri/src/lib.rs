@@ -17,6 +17,7 @@ mod opencode_go;
 pub mod providers;
 mod proxy;
 mod reasoning_map;
+mod tool_roundtrip;
 mod quota;
 mod scheduler;
 pub mod storage;

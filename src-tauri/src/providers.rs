@@ -61,10 +61,12 @@ pub fn kind_meta(
             "Chat Completions",
             Some(crate::opencode_go::DEFAULT_BASE_URL),
         )),
+        // Official Codex integration (2026-07-31): wire_api = responses for V4 Flash.
+        // Chat Completions remains as a legacy fallback for old model ids only (proxy).
         "deepseek" => Some((
             "DeepSeek",
             "Global",
-            "Chat Completions",
+            "Responses",
             Some("https://api.deepseek.com/v1"),
         )),
         "minimax" => Some((
@@ -81,6 +83,33 @@ pub fn kind_meta(
 
 pub fn default_base_url_for_kind(kind: &str) -> Option<String> {
     kind_meta(kind).and_then(|(_, _, _, url)| url.map(str::to_string))
+}
+
+/// Official DeepSeek models that speak the **native Responses API** (Codex path).
+///
+/// As of 2026-07-31: only `deepseek-v4-flash` is documented for Codex/Responses.
+/// `deepseek-v4-pro` is expected early August 2026 — we still prefer Responses so
+/// the route is ready; upstream may 4xx until official support lands.
+pub fn deepseek_model_supports_native_responses(upstream_model: &str) -> bool {
+    let id = upstream_model.trim().to_ascii_lowercase();
+    let tail = id.rsplit(['/', ':']).next().unwrap_or(&id);
+    matches!(
+        tail,
+        "deepseek-v4-flash"
+            | "deepseek-v4-flash-0731"
+            | "deepseek-v4-pro"
+            | "deepseek-v4-pro-preview"
+    ) || tail.starts_with("deepseek-v4-flash")
+        || tail.starts_with("deepseek-v4-pro")
+}
+
+/// Whether a DeepSeek route should use Chat Completions instead of Responses.
+///
+/// V4 Flash/Pro → always Responses (official Codex path), ignoring a stale
+/// provider `protocol = "Chat Completions"` row so existing installs heal.
+/// Legacy ids (`deepseek-chat`, …) stay on Chat Completions.
+pub fn deepseek_route_uses_chat_completions(_protocol: &str, upstream_model: &str) -> bool {
+    !deepseek_model_supports_native_responses(upstream_model)
 }
 
 #[allow(dead_code)]
@@ -719,17 +748,27 @@ pub fn apply_reasoning_levels_for_profile(
 pub const CODEX_AGENT_BASE_INSTRUCTIONS: &str =
     crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS;
 
-/// Ensure a catalog row matches working third-party catalogs (CC Switch tool shape)
-/// while using **OpenAI official** lean `base_instructions` from models.json.
+/// Whether catalog rows should advertise Desktop freeform `apply_patch`.
 ///
-/// Stale SQLite `catalog_json` often carries OpenAI-only tool flags. ChatGPT's custom
-/// model picker has been observed to show an empty list when third-party rows advertise
-/// shell/apply_patch/web_search like native GPT rows. Tool ads stay lean.
+/// Official `models_cache` and Nice Switch GPT custom rows use `freeform`. Set
+/// `SPUR_DISABLE_APPLY_PATCH=1` to force the historical lean catalog (no ad).
+pub fn advertise_apply_patch_tool() -> bool {
+    !matches!(
+        std::env::var("SPUR_DISABLE_APPLY_PATCH")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Ensure a catalog row uses official lean `base_instructions` and tool ads that
+/// match official Codex Desktop behavior as closely as third-party catalogs allow.
 ///
-/// `base_instructions` mapping (openai/codex models.json):
-/// - GPT-5.6 Sol → official `gpt-5.6-sol` entry
-/// - GPT-5.6 Terra / Luna → official terra / luna entries
-/// - All other spur routes → official Terra/Luna shared lean body
+/// - `base_instructions` from openai/codex models.json (Sol / Terra / Luna)
+/// - `apply_patch_tool_type = freeform` so Desktop injects client-side apply_patch
+///   (required by those base instructions); kill switch: `SPUR_DISABLE_APPLY_PATCH=1`
+/// - `experimental_supported_tools` stays `[]`; web_search stays off until separate A/B
 ///
 /// Do not map `model_instructions_file` / UNRESTRICTED files into multi-route rows.
 /// Desktop still assembles Skills / Plan / MCP at request time on top of this lean base.
@@ -756,9 +795,9 @@ pub fn normalize_catalog_model_for_codex_with_kind(
         mode: "bytes".into(),
         limit: 10_000,
     };
-    // This is a Codex-facing safety boundary, not provider metadata. Rewrite
-    // persisted legacy rows too, so a pre-existing 95% catalog cannot keep
-    // postponing compaction after an app update.
+    // Codex-facing boundary (not provider metadata). Heal every catalog row to
+    // the official 95% effective window so legacy 90% Spur rows do not keep a
+    // smaller UI denominator (which made auto-compact look like "100% of bar").
     model.effective_context_window_percent =
         crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT;
     // Honest catalog levels come from the provider's reasoning template (caller may
@@ -787,12 +826,23 @@ pub fn normalize_catalog_model_for_codex_with_kind(
         || model.slug.contains("gpt")
         || is_desktop_native_model_slug(&model.slug);
 
-    // Critical Desktop invariant (verified against working CC Switch catalogs and the
-    // ChatGPT Desktop model picker): custom `model_catalog_json` rows must stay lean.
-    // Advertising shell/apply_patch/web_search on ANY custom-provider row — even GPT-named
-    // ones — has been observed to empty the bottom-right model list. CC Switch keeps
-    // experimental_supported_tools: [] for gpt-5.6-terra/sol/luna catalog rows.
-    model.apply_patch_tool_type = None;
+    // Desktop catalog tool ads (official parity for apply_patch):
+    // - experimental_supported_tools must stay [] (non-empty has emptied the picker).
+    // - web_search stays off until a separate A/B.
+    // - apply_patch freeform alone is enough for Desktop to register client-side
+    //   apply_patch (Nice Switch GPT-5.5 shape; required by lean base_instructions).
+    // - Do NOT force tool_mode=code_mode_only: that makes Desktop primary freeform
+    //   `exec` (JS) and steers weaker models into nested tools.* thrash. Live native
+    //   gpt-5.6 sessions primarily use top-level function_call exec_command.
+    // Kill switch: SPUR_DISABLE_APPLY_PATCH=1 forces lean (no freeform ad).
+    if advertise_apply_patch_tool() {
+        model.apply_patch_tool_type = Some("freeform".into());
+    } else {
+        model.apply_patch_tool_type = None;
+    }
+    // Always clear forced code_mode so heal rewrites legacy Spur rows that still
+    // carry code_mode_only from earlier catalog publishes.
+    model.tool_mode = None;
     model.web_search_tool_type = None;
     model.supports_parallel_tool_calls = false;
     model.experimental_supported_tools = Vec::new();
@@ -804,11 +854,11 @@ pub fn normalize_catalog_model_for_codex_with_kind(
     model.default_service_tier = None;
     model.availability_nux = None;
     model.upgrade = None;
+    // Default: clear model_messages; DeepSeek re-applies official dual-write below.
     model.model_messages = None;
     model.default_verbosity = None;
     model.comp_hash = None;
     model.auto_review_model_override = None;
-    model.tool_mode = None;
     model.multi_agent_version = None;
 
     if looks_openai {
@@ -818,6 +868,35 @@ pub fn normalize_catalog_model_for_codex_with_kind(
             model.auto_compact_token_limit = Some(244_800);
         }
         model.input_modalities = vec!["text".into(), "image".into()];
+    } else if kind == "deepseek"
+        || model.display_name.to_ascii_lowercase().contains("deepseek")
+        || model.slug.to_ascii_lowercase().contains("deepseek")
+    {
+        // Official DeepSeek Codex models.json gold shape (2026-07-31 script).
+        model.context_window = Some(1_048_576);
+        model.max_context_window = Some(1_048_576);
+        // Official auto_compact_token_limit is null; Codex core derives ~90% of raw window.
+        // Keep an explicit ~90% so Desktop bar math stays stable before core fills it.
+        model.auto_compact_token_limit = Some(943_718);
+        model.input_modalities = vec!["text".into()];
+        model.truncation_policy = TruncationPolicy {
+            mode: "tokens".into(),
+            limit: 10_000,
+        };
+        model.default_reasoning_summary = Value::String("none".into());
+        model.supports_parallel_tool_calls = true;
+        model.supports_image_detail_original = false;
+        if !model.base_instructions.is_empty() {
+            model.model_messages = Some(serde_json::json!({
+                "instructions_template": model.base_instructions,
+                "instructions_variables": {
+                    "personality_default": "",
+                    "personality_friendly": "",
+                    "personality_pragmatic": ""
+                },
+                "approvals": null
+            }));
+        }
     } else {
         model.input_modalities = vec!["text".into(), "image".into()];
         if kind == "kimi" || model.display_name.to_ascii_lowercase().contains("kimi") {
@@ -922,6 +1001,9 @@ pub fn catalog_model_with_profile(
     } else if kind == "kimi" {
         // Match working Nice Switch Kimi surface windows.
         (Some(262_144), Some(262_144))
+    } else if kind == "deepseek" {
+        // Official DeepSeek Codex models.json: 1M context for V4 Flash/Pro.
+        (Some(1_048_576), Some(1_048_576))
     } else if kind == "xai" {
         // Grok Build ~256k; Grok 4.5 ~500k — use the larger window so catalog
         // does not under-advertise; proxy does not enforce this client-side.
@@ -934,8 +1016,8 @@ pub fn catalog_model_with_profile(
         (Some(128_000), Some(128_000))
     };
     let auto_compact = context_window.map(|window| (window as f64 * 0.9) as i64);
-    // Match CC Switch: catalog rows never advertise shell/apply_patch tools. Prefer the
-    // Desktop-native public slug for terra/sol/luna so the power picker is non-empty.
+    // Prefer Desktop-native public slug for terra/sol/luna so the power picker is non-empty.
+    // apply_patch freeform is set in normalize (official parity); see advertise_apply_patch_tool.
     let slug = desktop_native_model_slug(&model.id)
         .map(str::to_string)
         .unwrap_or_else(|| opaque_route_slug(provider_id, &model.id));
@@ -960,16 +1042,32 @@ pub fn catalog_model_with_profile(
         include_skills_usage_instructions: false,
         supports_reasoning_summaries: true,
         supports_reasoning_summary_parameter: false,
-        default_reasoning_summary: Value::String("auto".into()),
+        // DeepSeek official models.json uses default_reasoning_summary = "none".
+        default_reasoning_summary: if kind == "deepseek" {
+            Value::String("none".into())
+        } else {
+            Value::String("auto".into())
+        },
         support_verbosity: false,
         default_verbosity: None,
-        apply_patch_tool_type: None,
+        apply_patch_tool_type: if advertise_apply_patch_tool() {
+            Some("freeform".into())
+        } else {
+            None
+        },
         web_search_tool_type: None,
+        // DeepSeek official catalog: tokens/10000; others keep historical bytes.
         truncation_policy: TruncationPolicy {
-            mode: "bytes".into(),
+            mode: if kind == "deepseek" {
+                "tokens".into()
+            } else {
+                "bytes".into()
+            },
             limit: 10_000,
         },
-        supports_parallel_tool_calls: false,
+        // Official DS models.json sets parallel true; other third-parties stay false
+        // until Desktop A/B (picker / gateway 400 risk).
+        supports_parallel_tool_calls: kind == "deepseek",
         supports_image_detail_original: false,
         context_window,
         max_context_window,
@@ -980,6 +1078,7 @@ pub fn catalog_model_with_profile(
         input_modalities: if is_openai_family || kind == "kimi" || kind == "xai" {
             vec!["text".into(), "image".into()]
         } else {
+            // DeepSeek official Codex catalog: text only.
             vec!["text".into()]
         },
         supports_search_tool: false,
@@ -988,9 +1087,9 @@ pub fn catalog_model_with_profile(
         tool_mode: None,
         multi_agent_version: None,
     };
-    // Always pass kind so Kimi/DeepSeek rows are healed lean (no shell/apply_patch
-    // ads that make ChatGPT Desktop show an empty model picker).
-    // Sets base_instructions from official openai/codex models.json (Sol / Terra / Luna).
+    // Always pass kind so reasoning/profile heal is correct for Kimi/DeepSeek/….
+    // Sets base_instructions from official openai/codex models.json (Sol / Terra / Luna)
+    // and apply_patch freeform (unless SPUR_DISABLE_APPLY_PATCH).
     normalize_catalog_model_for_codex_with_kind(&mut catalog, 1000, Some(kind));
     // Re-apply with upstream id so Sol/Terra/Luna display names + upstream map correctly
     // even when the published slug is already a native Desktop slug.
@@ -1000,6 +1099,18 @@ pub fn catalog_model_with_profile(
         &catalog.display_name,
         &model.id,
     );
+    // DeepSeek official models.json dual-writes instructions_template (= base_instructions).
+    if kind == "deepseek" && !catalog.base_instructions.is_empty() {
+        catalog.model_messages = Some(serde_json::json!({
+            "instructions_template": catalog.base_instructions,
+            "instructions_variables": {
+                "personality_default": "",
+                "personality_friendly": "",
+                "personality_pragmatic": ""
+            },
+            "approvals": null
+        }));
+    }
     apply_reasoning_levels_for_profile(&mut catalog, profile, Some(&model.id));
     catalog
 }
@@ -1092,7 +1203,11 @@ pub async fn test_credential(
     let client = reqwest::Client::builder()
         .user_agent("Codex-Spur/0.1")
         .build()?;
-    let mut request = if provider_id == "deepseek" {
+    // DeepSeek V4 Flash/Pro: native Responses (official Codex path). Legacy chat models
+    // still probe Chat Completions.
+    let mut request = if provider_id == "deepseek"
+        && deepseek_route_uses_chat_completions("Responses", model_id)
+    {
         client
             .post(format!("{endpoint_base}/chat/completions"))
             .json(&serde_json::json!({
@@ -1156,6 +1271,67 @@ mod tests {
             "expected max in {}",
             xhigh.upstream_effort
         );
+    }
+
+    #[test]
+    fn deepseek_kind_meta_defaults_to_responses() {
+        let meta = kind_meta("deepseek").expect("deepseek kind");
+        assert_eq!(meta.2, "Responses");
+        assert!(meta.3.unwrap_or("").contains("api.deepseek.com"));
+    }
+
+    #[test]
+    fn deepseek_v4_flash_uses_native_responses_even_if_protocol_says_chat() {
+        assert!(deepseek_model_supports_native_responses("deepseek-v4-flash"));
+        assert!(deepseek_model_supports_native_responses(
+            "deepseek/deepseek-v4-flash"
+        ));
+        assert!(!deepseek_route_uses_chat_completions(
+            "Chat Completions",
+            "deepseek-v4-flash"
+        ));
+        assert!(deepseek_route_uses_chat_completions(
+            "Responses",
+            "deepseek-chat"
+        ));
+        assert!(!deepseek_model_supports_native_responses("deepseek-chat"));
+    }
+
+    #[test]
+    fn deepseek_catalog_matches_official_codex_script_shape() {
+        let model = catalog_model(
+            "ds-instance",
+            "deepseek",
+            "DeepSeek",
+            &DiscoveredProviderModel {
+                id: "deepseek-v4-flash".into(),
+                display_name: "DeepSeek-V4-Flash".into(),
+                owned_by: None,
+                created_at: None,
+            },
+        );
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_context_window, Some(1_048_576));
+        assert_eq!(model.effective_context_window_percent, 95);
+        assert_eq!(model.apply_patch_tool_type.as_deref(), Some("freeform"));
+        assert!(model.tool_mode.is_none());
+        assert!(model.experimental_supported_tools.is_empty());
+        assert_eq!(model.truncation_policy.mode, "tokens");
+        assert_eq!(model.truncation_policy.limit, 10_000);
+        assert_eq!(
+            model.default_reasoning_summary,
+            Value::String("none".into())
+        );
+        assert!(model.supports_parallel_tool_calls);
+        assert_eq!(model.input_modalities, vec!["text".to_string()]);
+        assert!(model.base_instructions.contains("apply_patch"));
+        let template = model
+            .model_messages
+            .as_ref()
+            .and_then(|m| m.get("instructions_template"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert_eq!(template, model.base_instructions);
     }
 
     #[test]
@@ -1324,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizing_legacy_catalog_rows_resets_compaction_threshold_to_ninety_percent() {
+    fn normalizing_legacy_catalog_rows_heals_effective_window_to_official_ninety_five() {
         let mut model = catalog_model(
             "kimi-instance",
             "kimi",
@@ -1336,14 +1512,19 @@ mod tests {
                 created_at: None,
             },
         );
-        model.effective_context_window_percent = 95;
+        // Legacy Spur rows used 90%; official Codex default is 95%.
+        model.effective_context_window_percent = 90;
 
         normalize_catalog_model_for_codex_with_kind(&mut model, 1000, Some("kimi"));
 
+        assert_eq!(model.effective_context_window_percent, 95);
         assert_eq!(
             model.effective_context_window_percent,
             crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT
         );
+        // Auto-compact stays ~90% of raw context (official core clamp).
+        assert_eq!(model.auto_compact_token_limit, Some(235_929));
+        assert_eq!(model.context_window, Some(262_144));
     }
 
     #[test]
@@ -1376,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_catalog_rows_do_not_advertise_tools() {
+    fn openai_catalog_rows_advertise_freeform_apply_patch_not_web_search() {
         let model = catalog_model(
             "openai-instance",
             "openai",
@@ -1391,7 +1572,16 @@ mod tests {
         assert_eq!(model.slug, "gpt-5.6-terra");
         assert_eq!(model.display_name, "OpenAI 2 · GPT-5.6-Terra");
         assert!(model.experimental_supported_tools.is_empty());
-        assert!(model.apply_patch_tool_type.is_none());
+        assert_eq!(
+            model.apply_patch_tool_type.as_deref(),
+            Some("freeform"),
+            "official parity: Desktop injects client-side apply_patch"
+        );
+        assert!(
+            model.tool_mode.is_none(),
+            "do not force code_mode_only; freeform apply_patch alone is enough"
+        );
+        assert!(model.web_search_tool_type.is_none());
         assert!(!model.supports_parallel_tool_calls);
     }
 
