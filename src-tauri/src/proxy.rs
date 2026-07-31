@@ -305,18 +305,53 @@ async fn responses(
     }
 }
 
-/// Choose Chat Completions vs native Responses for this route.
+/// Choose Chat Completions bridge vs native Responses (CC Switch–aligned).
 ///
-/// DeepSeek V4 Flash/Pro always use native Responses (official 2026-07-31 Codex
-/// path), even when a legacy provider row still says "Chat Completions".
+/// Codex Desktop always speaks **Responses** to Spur (`/v1/responses`).
+/// Upstream protocol is decided here, matching CC Switch local routing:
+///
+/// | Kind | Upstream | Spur path |
+/// |---|---|---|
+/// | openai | Responses | passthrough (+ history sanitize) |
+/// | xai / Grok | Responses (`api.x.ai/v1/responses`) | passthrough |
+/// | deepseek-v4-flash/pro | Responses (official Codex script) | passthrough |
+/// | deepseek legacy chat ids | Chat Completions | Responses↔Chat bridge |
+/// | kimi | Chat Completions | bridge |
+/// | minimax | Chat Completions (CCS openai_chat presets) | bridge |
+/// | opencode-go | Chat Completions | bridge |
+/// | custom OpenAI-compatible | Chat unless protocol says Responses | bridge by default |
+///
+/// Do not invent extra product policies here (no retry circuit-breakers, etc.).
 fn route_uses_chat_completions(target: &RouteTarget) -> bool {
-    if target.kind.eq_ignore_ascii_case("deepseek") {
+    let kind = target.kind.to_ascii_lowercase();
+    let protocol = target.protocol.to_ascii_lowercase();
+
+    // DeepSeek V4 Flash/Pro: official native Responses; legacy ids stay on Chat.
+    if kind == "deepseek" {
         return providers::deepseek_route_uses_chat_completions(
             &target.protocol,
             &target.upstream_model,
         );
     }
-    target.protocol.to_ascii_lowercase().contains("chat")
+
+    // CCS Responses-native (no Chat rewrite).
+    if kind == "openai" || kind == "xai" {
+        return false;
+    }
+
+    // CCS "Needs Local Routing" / openai_chat style kinds.
+    if matches!(kind.as_str(), "kimi" | "minimax" | "opencode-go") {
+        return true;
+    }
+
+    // Custom OpenAI-compatible: default Chat bridge (CCS apiFormat=openai_chat).
+    // Only skip the bridge when the user explicitly stored a Responses protocol.
+    if kind == "custom" {
+        return !protocol.contains("response");
+    }
+
+    // Fallback: protocol string from kind_meta / user DB.
+    protocol.contains("chat")
 }
 
 /// Local Remote Compaction V2 for every route (including OpenAI): summarize with
@@ -5303,6 +5338,51 @@ data: [DONE]
         );
         let kimi = test_route_target("kimi");
         assert!(route_uses_chat_completions(&kimi));
+    }
+
+    #[test]
+    fn ccs_aligned_chat_vs_responses_routing() {
+        // Responses passthrough (no Chat rewrite)
+        assert!(!route_uses_chat_completions(&test_route_target_with_model(
+            "openai",
+            "gpt-5.6-terra",
+            "Responses"
+        )));
+        assert!(!route_uses_chat_completions(&test_route_target_with_model(
+            "xai", "grok-4.5", "Responses"
+        )));
+        assert!(!route_uses_chat_completions(&test_route_target_with_model(
+            "deepseek",
+            "deepseek-v4-flash",
+            "Responses"
+        )));
+
+        // CCS openai_chat / Needs Local Routing kinds → Chat bridge
+        assert!(route_uses_chat_completions(&test_route_target_with_model(
+            "kimi", "k3", "Chat Completions"
+        )));
+        assert!(route_uses_chat_completions(&test_route_target_with_model(
+            "minimax",
+            "MiniMax-M2",
+            "Responses preferred" // legacy label still bridges
+        )));
+        assert!(route_uses_chat_completions(&test_route_target_with_model(
+            "opencode-go",
+            "deepseek-v4-flash",
+            "Chat Completions"
+        )));
+        // Custom OpenAI-compatible defaults to Chat bridge
+        assert!(route_uses_chat_completions(&test_route_target_with_model(
+            "custom",
+            "some-model",
+            "OpenAI-compatible"
+        )));
+        // Explicit Responses on custom skips bridge
+        assert!(!route_uses_chat_completions(&test_route_target_with_model(
+            "custom",
+            "some-model",
+            "Responses"
+        )));
     }
 
     #[test]

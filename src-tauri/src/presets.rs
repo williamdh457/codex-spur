@@ -27,7 +27,8 @@ pub fn provider_presets() -> Vec<ProviderSummary> {
             id: "minimax".into(),
             name: "MiniMax".into(),
             region: "中国 / Global".into(),
-            protocol: "Responses preferred".into(),
+            // Align with CC Switch Codex Chat Completions routing presets.
+            protocol: "Chat Completions".into(),
             configured: false,
             selected_models: 0,
             discovered_models: 0,

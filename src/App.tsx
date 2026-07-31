@@ -2742,7 +2742,11 @@ function DiagnosticsPage({ snapshot }: { snapshot: AppSnapshot }) {
       </div>
       <div className="callout">
         <strong>协议覆盖状态</strong>
-        <p>Responses 路由支持透传；Chat Completions 已提供非流式转换骨架，流式 SSE 工具调用转换仍会明确返回未实现错误，不会静默伪装为成功。</p>
+        <p>
+          与 CC Switch 一致：Codex 始终打本地 Responses；Kimi / MiniMax / OpenCode Go / 自定义
+          Chat 上游走 Responses↔Chat Completions 桥（含流式 tool_calls）；OpenAI / Grok /
+          DeepSeek V4 Flash 走 Responses 透传。
+        </p>
       </div>
     </div>
   );

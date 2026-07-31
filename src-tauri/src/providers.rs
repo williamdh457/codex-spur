@@ -69,14 +69,20 @@ pub fn kind_meta(
             "Responses",
             Some("https://api.deepseek.com/v1"),
         )),
+        // CC Switch Codex Chat-routing presets treat MiniMax as openai_chat
+        // (Responses→Chat bridge), not a native Responses host.
         "minimax" => Some((
             "MiniMax",
             "中国 / Global",
-            "Responses preferred",
+            "Chat Completions",
             Some("https://api.minimaxi.com/v1"),
         )),
+        // xAI Grok: native Responses (same as CCS Grok/xAI Responses path).
         "xai" => Some(("Grok", "Global", "Responses", Some("https://api.x.ai/v1"))),
-        "custom" => Some(("自定义供应商", "Custom", "OpenAI-compatible", None)),
+        // Custom OpenAI-compatible gateways are Chat by default (CCS openai_chat).
+        // Users who truly have a Responses-compatible custom host can set protocol
+        // to contain "Responses" on the provider row later.
+        "custom" => Some(("自定义供应商", "Custom", "Chat Completions", None)),
         _ => None,
     }
 }
