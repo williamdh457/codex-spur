@@ -154,23 +154,24 @@ function Overview({
         <Metric label="健康账号" value={String(snapshot.healthyAccounts)} note="可参与调度" />
       </section>
 
-      <section className="policy-card" aria-label="会话策略">
-        <header className="policy-card__head">
-          <h2>会话策略</h2>
-          <p>同一对话里能不能换模型，以及是否启用 OpenAI 云端压缩</p>
-        </header>
-
-        <div className="policy-card__body">
-          <div
-            className="policy-switch"
-            role="radiogroup"
-            aria-label="中途换模型"
-          >
+      <section className="policy-bar" aria-label="会话策略">
+        <div className="policy-bar__row">
+          <div className="policy-bar__label">
+            <strong>会话策略</strong>
+            <span>
+              {allowSwitch
+                ? "同线程可换厂 · 可移植压缩"
+                : policy.openaiCloudCompact
+                  ? "固定同厂 · 云端压缩"
+                  : "固定同厂 · 本地压缩"}
+            </span>
+          </div>
+          <div className="policy-bar__switch" role="radiogroup" aria-label="中途换模型">
             <button
               type="button"
               role="radio"
               aria-checked={allowSwitch}
-              className={`policy-switch__option${allowSwitch ? " is-active" : ""}`}
+              className={allowSwitch ? "is-active" : undefined}
               disabled={policyBusy}
               onClick={() =>
                 onConversationPolicyChange({
@@ -179,14 +180,13 @@ function Overview({
                 })
               }
             >
-              <span className="policy-switch__title">允许中途换</span>
-              <span className="policy-switch__hint">可移植压缩 · 推荐</span>
+              允许中途换
             </button>
             <button
               type="button"
               role="radio"
               aria-checked={!allowSwitch}
-              className={`policy-switch__option${!allowSwitch ? " is-active" : ""}`}
+              className={!allowSwitch ? "is-active" : undefined}
               disabled={policyBusy}
               onClick={() =>
                 onConversationPolicyChange({
@@ -195,33 +195,13 @@ function Overview({
                 })
               }
             >
-              <span className="policy-switch__title">不中途换</span>
-              <span className="policy-switch__hint">固定同厂 · 可开云压缩</span>
+              不中途换
             </button>
           </div>
-
-          <div className="policy-summary" data-mode={allowSwitch ? "portable" : "sticky"}>
-            {allowSwitch ? (
-              <>
-                <p className="policy-summary__lead">同线程可切换 OpenAI / Grok / Kimi / DeepSeek</p>
-                <p className="policy-summary__meta">
-                  压缩摘要双方可读 · 云端加密压缩关闭
-                </p>
-              </>
-            ) : (
-              <>
-                <p className="policy-summary__lead">本会话连续使用同一厂（尤其 GPT）</p>
-                <p className="policy-summary__meta">
-                  换厂请新开线程 · 可选下方云端压缩
-                </p>
-              </>
-            )}
-          </div>
-
-          {!allowSwitch ? (
-            <label
-              className={`policy-cloud${policy.openaiCloudCompact ? " is-on" : ""}`}
-            >
+        </div>
+        {!allowSwitch ? (
+          <div className="policy-bar__extra">
+            <label className={`policy-bar__cloud${policy.openaiCloudCompact ? " is-on" : ""}`}>
               <input
                 type="checkbox"
                 checked={policy.openaiCloudCompact}
@@ -233,21 +213,16 @@ function Overview({
                   })
                 }
               />
-              <span className="policy-cloud__text">
-                <span className="policy-cloud__title">OpenAI 云端加密压缩</span>
-                <span className="policy-cloud__desc">
-                  改完后请 Review &amp; Apply · 仅适合连续 GPT
-                </span>
-              </span>
+              <span>OpenAI 云端加密压缩</span>
+              <small>Apply 后生效 · 仅连续 GPT</small>
             </label>
-          ) : null}
-
-          {policy.openaiCloudCompact && !allowSwitch ? (
-            <p className="policy-warn" role="status">
-              云端压缩已开：切到 Grok / Kimi / DeepSeek 前请新开对话
-            </p>
-          ) : null}
-        </div>
+            {policy.openaiCloudCompact ? (
+              <p className="policy-bar__warn" role="status">
+                换厂前请新开对话
+              </p>
+            ) : null}
+          </div>
+        ) : null}
       </section>
 
       <section className="panel">
