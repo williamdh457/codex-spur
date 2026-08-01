@@ -478,6 +478,112 @@ pub fn uses_custom_tool_sse(name: &str) -> bool {
     is_freeform_desktop_tool(name)
 }
 
+/// Build a portable Responses `function_call` arguments string from a Desktop
+/// freeform/custom history row.
+///
+/// CCS-style: freeform `input` becomes JSON `{"input":"…"}` so third-party
+/// Responses hosts (xAI Grok, MiniMax, …) that only accept `function` tools
+/// can replay the call without a Chat Completions bridge.
+fn portable_function_arguments_from_custom(item: &Value, name: &str) -> String {
+    // Prefer explicit arguments when already JSON-shaped.
+    if let Some(args) = item.get("arguments") {
+        match args {
+            Value::String(s) if !s.trim().is_empty() => return s.clone(),
+            Value::String(_) => {}
+            other => {
+                return other.to_string();
+            }
+        }
+    }
+    match item.get("input") {
+        Some(Value::String(s)) if is_freeform_desktop_tool(name) || name == APPLY_PATCH_TOOL_NAME => {
+            serde_json::to_string(&json!({ "input": s }))
+                .unwrap_or_else(|_| format!(r#"{{"input":{}}}"#, json!(s)))
+        }
+        Some(Value::String(s)) => {
+            // Non-freeform custom with a plain string body — still wrap so the
+            // portable function schema `{input: string}` can accept it.
+            serde_json::to_string(&json!({ "input": s }))
+                .unwrap_or_else(|_| format!(r#"{{"input":{}}}"#, json!(s)))
+        }
+        Some(v) => v.to_string(),
+        None => "{}".into(),
+    }
+}
+
+/// Rewrite Desktop `custom_tool_call` → portable Responses `function_call`.
+///
+/// Used on the **Responses** outbound path for non-OpenAI hosts (Grok CCS-style).
+/// This is **not** a Chat Completions bridge: the item stays in Responses
+/// `input[]` as `function_call` with JSON `arguments`.
+///
+/// Returns `None` when name/call_id are missing (row cannot be replayed).
+pub fn custom_tool_call_to_function_call(item: &Value) -> Option<Value> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if item_type != "custom_tool_call" {
+        return None;
+    }
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() || call_id.is_empty() {
+        return None;
+    }
+    let arguments = portable_function_arguments_from_custom(item, &name);
+    let mut out = json!({
+        "type": "function_call",
+        "name": name,
+        "call_id": call_id,
+        "arguments": arguments,
+    });
+    if let Some(obj) = out.as_object_mut() {
+        if let Some(id) = item.get("id").cloned() {
+            obj.insert("id".into(), id);
+        }
+        if let Some(status) = item.get("status").cloned() {
+            obj.insert("status".into(), status);
+        }
+    }
+    Some(out)
+}
+
+/// Rewrite Desktop `custom_tool_call_output` → portable Responses `function_call_output`.
+pub fn custom_tool_call_output_to_function_call_output(item: &Value) -> Option<Value> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if item_type != "custom_tool_call_output" {
+        return None;
+    }
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if call_id.is_empty() {
+        return None;
+    }
+    let output = match item.get("output").or_else(|| item.get("result")) {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    };
+    let mut out = json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output,
+    });
+    if let Some(obj) = out.as_object_mut() {
+        if let Some(id) = item.get("id").cloned() {
+            obj.insert("id".into(), id);
+        }
+    }
+    Some(out)
+}
+
 /// Rewrite one Responses `output[]` item so freeform tools match official Desktop.
 ///
 /// Third-party hosts (and portable outbound ads) emit freeform tools as
@@ -731,6 +837,68 @@ mod tests {
             "completed",
         );
         assert_eq!(item["type"], "function_call");
+    }
+
+    #[test]
+    fn custom_tool_call_rewrites_to_function_call_with_input_json() {
+        // CCS Responses outbound: Desktop freeform history → function_call (not drop).
+        let item = json!({
+            "type": "custom_tool_call",
+            "id": "ctc_abc",
+            "status": "completed",
+            "call_id": "call_abc",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Update File: a.ts\n+x\n*** End Patch"
+        });
+        let fc = custom_tool_call_to_function_call(&item).expect("rewrite");
+        assert_eq!(fc["type"], "function_call");
+        assert_eq!(fc["name"], "apply_patch");
+        assert_eq!(fc["call_id"], "call_abc");
+        assert_eq!(fc["id"], "ctc_abc");
+        assert_eq!(fc["status"], "completed");
+        let args = fc["arguments"].as_str().expect("arguments string");
+        let parsed: Value = serde_json::from_str(args).expect("json args");
+        assert!(
+            parsed["input"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("*** Begin Patch"),
+            "args={args}"
+        );
+        assert!(fc.get("input").is_none(), "portable row must not keep freeform input key");
+    }
+
+    #[test]
+    fn custom_tool_call_output_rewrites_to_function_call_output() {
+        let item = json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call_abc",
+            "output": "Success. Updated a.ts"
+        });
+        let out = custom_tool_call_output_to_function_call_output(&item).expect("rewrite");
+        assert_eq!(out["type"], "function_call_output");
+        assert_eq!(out["call_id"], "call_abc");
+        assert_eq!(out["output"], "Success. Updated a.ts");
+    }
+
+    #[test]
+    fn custom_tool_call_roundtrip_with_restore() {
+        // Outbound rewrite + inbound restore must preserve freeform apply_patch.
+        let desktop = json!({
+            "type": "custom_tool_call",
+            "call_id": "call_rt",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch",
+            "status": "completed"
+        });
+        let portable = custom_tool_call_to_function_call(&desktop).unwrap();
+        let restored = restore_freeform_output_item(&portable);
+        assert_eq!(restored["type"], "custom_tool_call");
+        assert_eq!(restored["name"], "apply_patch");
+        assert_eq!(restored["call_id"], "call_rt");
+        let input = restored["input"].as_str().unwrap_or("");
+        assert!(input.starts_with("*** Begin Patch"), "input={input}");
+        assert!(input.contains("*** End Patch"), "input={input}");
     }
 
     #[test]

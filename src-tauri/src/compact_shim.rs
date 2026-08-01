@@ -157,8 +157,26 @@ pub fn portable_transcript_for_compact(request: &Value) -> String {
                     .unwrap_or_default();
                 lines.push(format!("[tool_call {name}]\n{args}"));
             }
-            "function_call_output" => {
-                let out = match item.get("output") {
+            // Desktop freeform history (apply_patch / exec) — must not vanish from
+            // local compact. Compact runs *before* Responses sanitize rewrites these
+            // to function_call, so we accept the official Desktop shapes here.
+            "custom_tool_call" => {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let body = item
+                    .get("input")
+                    .or_else(|| item.get("arguments"))
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                lines.push(format!("[tool_call {name}]\n{body}"));
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                let out = match item
+                    .get("output")
+                    .or_else(|| item.get("result"))
+                {
                     Some(Value::String(s)) => s.clone(),
                     Some(v) => v.to_string(),
                     None => String::new(),
@@ -386,6 +404,35 @@ mod tests {
         assert!(text.contains("cannot read"));
         // Live carrier last is skipped.
         assert!(!text.contains("\"type\":\"compaction\"}"));
+    }
+
+    #[test]
+    fn portable_transcript_keeps_desktop_freeform_tool_trail() {
+        // Compact runs before Responses sanitize rewrites custom_tool_call →
+        // function_call. Freeform apply_patch history must still enter the
+        // summarizer transcript for every provider (Grok/Kimi/DeepSeek/…).
+        let body = json!({
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"fix a.ts"}]},
+                {
+                    "type":"custom_tool_call",
+                    "call_id":"call_1",
+                    "name":"apply_patch",
+                    "input":"*** Begin Patch\n*** Update File: a.ts\n+x\n*** End Patch"
+                },
+                {
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_1",
+                    "output":"Success. Updated a.ts"
+                },
+                {"type":"compaction"}
+            ]
+        });
+        let text = portable_transcript_for_compact(&body);
+        assert!(text.contains("[tool_call apply_patch]"), "text={text}");
+        assert!(text.contains("Begin Patch"), "text={text}");
+        assert!(text.contains("[tool_result]"), "text={text}");
+        assert!(text.contains("Success. Updated a.ts"), "text={text}");
     }
 
     #[test]

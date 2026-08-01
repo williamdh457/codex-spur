@@ -3169,10 +3169,14 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value], allowed: &[&str]) ->
 /// - replayed `reasoning` / `compaction` items: their encrypted state is not portable
 ///   across providers (official GPT → Grok fails with "Could not decrypt encrypted_content")
 /// - the final live Remote Compaction V2 carrier is preserved verbatim
+/// - Desktop freeform history (`custom_tool_call` / `_output`) is **rewritten** to
+///   portable Responses `function_call` / `function_call_output` (CCS-style tool
+///   conversion on the Responses lane — **not** a Chat Completions bridge)
 /// - unknown history carriers are dropped via a portable allow-list (fail closed)
 /// - `item_reference` is never portable to a third-party host
-/// - If anything was dropped, strip `previous_response_id` so affinity does not chase
-///   an OpenAI (or other foreign) response id on xAI/MiniMax/etc.
+/// - If anything was dropped or custom-tool-rewritten, strip `previous_response_id`
+///   so affinity does not chase an OpenAI (or other foreign) response id on
+///   xAI/MiniMax/etc.
 fn sanitize_responses_input_for_upstream(request: &mut Value) {
     let live_compaction = live_compaction_index(request);
     let mut dropped_any = false;
@@ -3190,6 +3194,10 @@ fn sanitize_responses_input_for_upstream(request: &mut Value) {
         // Live compact is intercepted by local_compact_v2_shim for non-OpenAI
         // kinds before this runs; if we still see a live carrier here (native
         // path edge), keep it. Historical spur1:/ocx1: expand to messages.
+        //
+        // CCS-style: Desktop freeform tools live as `custom_tool_call` in
+        // rollouts. xAI/Grok only accept `function_call` on Responses — rewrite
+        // in place (stay on Responses; do not Chat-bridge).
         let portable = matches!(
             item_type,
             "message" | "function_call" | "function_call_output"
@@ -3212,6 +3220,30 @@ fn sanitize_responses_input_for_upstream(request: &mut Value) {
                     "content": [{"type": "input_text", "text": text}]
                 }));
                 dropped_any = true;
+            }
+            "custom_tool_call" => {
+                // CCS Responses tool rewrite: freeform history → function_call.
+                match crate::tool_roundtrip::custom_tool_call_to_function_call(&item) {
+                    Some(rewritten) => {
+                        next.push(rewritten);
+                        dropped_any = true; // shape changed → drop sticky response id
+                    }
+                    None => {
+                        dropped_any = true;
+                    }
+                }
+            }
+            "custom_tool_call_output" => {
+                match crate::tool_roundtrip::custom_tool_call_output_to_function_call_output(&item)
+                {
+                    Some(rewritten) => {
+                        next.push(rewritten);
+                        dropped_any = true;
+                    }
+                    None => {
+                        dropped_any = true;
+                    }
+                }
             }
             "additional_tools" | "reasoning" => {
                 dropped_any = true;
@@ -3760,12 +3792,20 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         if call_id.is_empty() || name.is_empty() {
                             continue;
                         }
+                        // Freeform Desktop tools (`apply_patch`, `exec`, …) store a
+                        // plain `input` body. Chat Completions function schema expects
+                        // JSON `{"input":"…"}` — same wrap as Responses rewrite path.
+                        // Non-freeform custom tools with a string body still wrap so
+                        // the portable `{input:string}` schema accepts them.
                         let arguments = match item
                             .get("input")
                             .or_else(|| item.get("arguments"))
                         {
-                            Some(Value::String(s)) if name == APPLY_PATCH_TOOL_NAME => {
-                                // Freeform body → JSON object the function schema expects.
+                            Some(Value::String(s))
+                                if crate::tool_roundtrip::is_freeform_desktop_tool(&name)
+                                    || name == APPLY_PATCH_TOOL_NAME
+                                    || item.get("input").is_some() =>
+                            {
                                 serde_json::to_string(&json!({ "input": s }))
                                     .unwrap_or_else(|_| format!(r#"{{"input":{}}}"#, json!(s)))
                             }
@@ -5663,9 +5703,38 @@ data: [DONE]
             .as_str()
             .expect("arguments string");
         assert!(args.contains("Begin Patch"), "args={args}");
+        assert!(
+            args.trim_start().starts_with('{'),
+            "freeform body must be JSON-wrapped for Chat tools schema, args={args}"
+        );
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "ctc_1");
         assert_eq!(messages[1]["content"], "Success");
+    }
+
+    #[test]
+    fn chat_history_wraps_freeform_exec_input_as_json() {
+        // Same freeform dialect as apply_patch — must not leave bare "ls" as arguments.
+        let messages = response_input_to_messages(Some(&json!([
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "ls -la"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": "ok"
+            }
+        ])));
+        let tool_calls = messages[0]["tool_calls"].as_array().expect("tool_calls");
+        assert_eq!(tool_calls[0]["function"]["name"], "exec");
+        let args = tool_calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments");
+        let parsed: Value = serde_json::from_str(args).expect("json args");
+        assert_eq!(parsed["input"], "ls -la");
     }
 
     #[test]
@@ -6031,6 +6100,95 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "lookup");
         assert_eq!(tools[1]["name"], "apply_patch");
+    }
+
+    /// CCS-style Responses tool rewrite for Grok: Desktop freeform history must
+    /// become `function_call` / `function_call_output` — never dropped, and
+    /// never Chat-bridged off the Responses lane.
+    #[test]
+    fn xai_rewrites_custom_tool_call_history_to_function_call() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "previous_response_id": "resp_grok_prev",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fix a.ts"}]
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "status": "completed",
+                    "call_id": "call_patch_1",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** End Patch"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_patch_1",
+                    "output": "Success"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续"}]
+                }
+            ],
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a freeform patch."
+                },
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            ]
+        });
+        sanitize_responses_request_for_upstream("xai", &mut body);
+
+        // Still Responses path shape: input[] with function_call, not chat messages.
+        assert!(body.get("messages").is_none());
+        let input = body["input"].as_array().expect("input");
+        assert_eq!(input.len(), 4, "all history rows kept (rewritten, not dropped): {input:?}");
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["name"], "apply_patch");
+        assert_eq!(input[1]["call_id"], "call_patch_1");
+        let args = input[1]["arguments"].as_str().expect("arguments");
+        assert!(args.contains("Begin Patch"), "args={args}");
+        assert!(
+            input[1].get("input").is_none(),
+            "freeform input key must not leak to xAI ModelInput"
+        );
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_patch_1");
+        assert_eq!(input[2]["output"], "Success");
+        assert_eq!(input[3]["type"], "message");
+        assert!(
+            body.get("previous_response_id").is_none(),
+            "sticky id stripped after custom→function rewrite"
+        );
+
+        // Catalog: freeform apply_patch advertised as portable function tool.
+        let tools = body["tools"].as_array().expect("tools");
+        let apply = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("apply_patch"))
+            .expect("apply_patch tool");
+        assert_eq!(apply["type"], "function");
+        assert!(
+            apply
+                .pointer("/parameters/properties/input")
+                .is_some(),
+            "portable function schema must expose input: {apply}"
+        );
+        // No Desktop custom_tool_call residue in the outbound body.
+        let serialized = body.to_string();
+        assert!(!serialized.contains("custom_tool_call"));
     }
 
     /// Accident replay: official GPT-5.4-Mini → Grok mid-thread (thread 019f8111…).
