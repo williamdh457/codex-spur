@@ -207,10 +207,12 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
             anyhow::anyhow!("模型路由 {} 的 catalog_json 无法解析：{}", route.id, error)
         })?,
     };
-    crate::providers::normalize_catalog_model_for_codex_with_kind(
+    crate::providers::normalize_catalog_model_for_codex_full(
         &mut model,
         1000,
         Some(route.kind.as_str()),
+        Some(route.protocol.as_str()),
+        Some(route.upstream_model.as_str()),
     );
     let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
         .unwrap_or_else(|| crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind));
@@ -311,10 +313,12 @@ pub fn build_from_routes(
             let mut model = model;
             // Heal stale SQLite rows (camelCase era, technical effort copy, weak meta)
             // so ChatGPT always receives a Nice/CC Switch–compatible catalog shape.
-            crate::providers::normalize_catalog_model_for_codex_with_kind(
+            crate::providers::normalize_catalog_model_for_codex_full(
                 &mut model,
                 1000 + enabled_index,
                 Some(route.kind.as_str()),
+                Some(route.protocol.as_str()),
+                Some(route.upstream_model.as_str()),
             );
             let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
                 .unwrap_or_else(|| {
@@ -583,9 +587,15 @@ mod tests {
                 "must advertise at least one reasoning level"
             );
             assert!(targets.contains_key(&model.slug));
-            // experimental tools stay empty; apply_patch freeform is official parity.
+            // experimental tools stay empty.
             assert!(model.experimental_supported_tools.is_empty());
-            assert_eq!(model.apply_patch_tool_type.as_deref(), Some("freeform"));
+            // CCS profile: Chat-bridge (Kimi) keeps freeform; OpenAI keeps freeform.
+            // (This fixture is OpenAI + Kimi only.)
+            assert_eq!(
+                model.apply_patch_tool_type.as_deref(),
+                Some("freeform"),
+                "OpenAI/Kimi fixture must keep freeform apply_patch"
+            );
             // DESIGN.md: every picker row is "供应商 · 模型".
             assert!(
                 model.display_name.contains('·'),

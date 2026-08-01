@@ -3065,8 +3065,12 @@ fn sanitize_openai_input_message_ids(request: &mut Value) {
 /// web_search, x_search, image_generation, collections_search, file_search,
 /// code_execution, code_interpreter, mcp, shell`.
 ///
-/// Always re-injects portable `apply_patch` (function) so non-OpenAI hosts see
-/// the official edit tool even when Desktop omitted freeform injection.
+/// Port tools for non-OpenAI Responses hosts.
+///
+/// CC Switch **NativeResponses** profile: freeform `apply_patch` is not in the
+/// catalog and must not be re-injected here — edits use `shell_command`. Chat
+/// Completions bridge (ProxyChat) still injects portable apply_patch on its own
+/// path (`responses_tools_to_chat_tools`).
 fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
     if keeps_codex_native_tools(kind) {
         return;
@@ -3078,7 +3082,18 @@ fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
         .map(std::mem::take)
         .unwrap_or_default();
     let mut kept = port_codex_tools(&items, allowed);
-    if allowed.contains(&"function") {
+    // CCS NativeResponses: drop freeform tools if a stale Desktop session still
+    // advertised them; never ensure-inject apply_patch on this path.
+    if responses_native_strips_freeform_apply_patch(kind) {
+        kept.retain(|tool| {
+            tool_name(tool)
+                .map(|n| !crate::tool_roundtrip::is_freeform_desktop_tool(n))
+                .unwrap_or(true)
+        });
+    }
+    // Legacy: only inject portable apply_patch when this kind would still use
+    // freeform (should not happen for Responses-native kinds after catalog heal).
+    if allowed.contains(&"function") && !responses_native_strips_freeform_apply_patch(kind) {
         ensure_responses_apply_patch_tool(&mut kept);
     }
     let Some(object) = request.as_object_mut() else {
@@ -3088,6 +3103,22 @@ fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
         object.remove("tools");
     } else {
         object.insert("tools".into(), Value::Array(kept));
+    }
+}
+
+/// True for kinds that always land on Responses-native lane (CCS NativeResponses).
+///
+/// DeepSeek chat models use the Chat bridge and keep freeform; only Flash/Pro
+/// are Responses-native — without a model id we treat `deepseek` as strip-happy
+/// on this Responses sanitize path (chat models never call this function).
+fn responses_native_strips_freeform_apply_patch(kind: &str) -> bool {
+    let k = kind.to_ascii_lowercase();
+    match k.as_str() {
+        "openai" | "kimi" | "minimax" | "opencode-go" => false,
+        // xai is always ResponsesNative; deepseek on this path is Flash/Pro only.
+        "xai" | "deepseek" => true,
+        // custom / unknown on Responses path → strip freeform (CCS native style).
+        _ => true,
     }
 }
 
@@ -5586,11 +5617,11 @@ data: [DONE]
             .iter()
             .map(|tool| tool["type"].as_str().unwrap())
             .collect();
-        // open_url, shell, get_weather, apply_patch(as function)
-        assert_eq!(types, vec!["function", "shell", "function", "function"]);
+        // CCS NativeResponses: open_url, shell, get_weather — freeform apply_patch stripped.
+        assert_eq!(types, vec!["function", "shell", "function"]);
         assert_eq!(tools[0]["name"], "open_url");
         assert_eq!(tools[2]["name"], "get_weather");
-        assert_eq!(tools[3]["name"], "apply_patch");
+        assert!(tools.iter().all(|t| t["name"] != "apply_patch"));
         assert!(!types.contains(&"namespace"));
         assert!(!types.contains(&"local_shell"));
         assert!(!types.contains(&"custom"));
@@ -5623,15 +5654,21 @@ data: [DONE]
                 tools
                     .iter()
                     .any(|t| t["name"] == "get_weather" || t["function"]["name"] == "get_weather"),
-                "{kind} should keep freeform function tools"
+                "{kind} should keep ordinary function tools"
             );
-            assert!(
-                tools.iter().any(|t| {
-                    t["name"] == "apply_patch"
-                        || t["function"]["name"] == "apply_patch"
-                }),
-                "{kind} must rewrite custom apply_patch to portable function"
-            );
+            let has_apply = tools.iter().any(|t| {
+                t["name"] == "apply_patch" || t["function"]["name"] == "apply_patch"
+            });
+            // Responses-native kinds (xai/deepseek/custom/minimax-if-mislabeled): strip freeform.
+            // Note: minimax/kimi normally use Chat bridge; if they hit Responses sanitize, strip too.
+            if responses_native_strips_freeform_apply_patch(kind) {
+                assert!(
+                    !has_apply,
+                    "{kind} CCS NativeResponses must strip freeform apply_patch"
+                );
+            } else {
+                assert!(has_apply, "{kind} ProxyChat-style must keep apply_patch");
+            }
         }
     }
 
@@ -5909,7 +5946,8 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
     }
 
     #[test]
-    fn xai_responses_tools_inject_apply_patch_when_all_other_tools_unsupported() {
+    fn xai_responses_tools_do_not_inject_apply_patch_when_only_unsupported_remain() {
+        // CCS NativeResponses: no freeform apply_patch injection when namespace/custom drop out.
         let mut body = json!({
             "tools": [
                 {"type": "namespace", "name": "codex"},
@@ -5917,51 +5955,67 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
             ]
         });
         sanitize_responses_request_for_upstream("xai", &mut body);
-        let tools = body["tools"].as_array().expect("apply_patch injected");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "apply_patch");
-        assert_eq!(tools[0]["type"], "function");
+        assert!(
+            body.get("tools").is_none()
+                || body["tools"]
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true),
+            "xAI must not invent apply_patch after stripping Codex-only tools: {body}"
+        );
     }
 
     #[test]
-    fn xai_keeps_only_apply_patch_custom_as_function() {
+    fn xai_strips_freeform_apply_patch_custom_tool() {
         let mut body = json!({
             "tools": [
                 {"type": "namespace", "name": "codex"},
-                {"type": "custom", "name": "apply_patch"}
+                {"type": "custom", "name": "apply_patch"},
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }
             ]
         });
         sanitize_responses_request_for_upstream("xai", &mut body);
-        let tools = body["tools"].as_array().expect("apply_patch kept");
+        let tools = body["tools"].as_array().expect("function tool kept");
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["name"], "apply_patch");
+        assert_eq!(tools[0]["name"], "lookup");
+        assert!(tools.iter().all(|t| t["name"] != "apply_patch"));
     }
 
     #[test]
-    fn xai_rewrites_freeform_exec_custom_instead_of_dropping() {
+    fn xai_strips_freeform_exec_custom_instead_of_rewriting() {
         let mut body = json!({
             "tools": [
-                {"type": "custom", "name": "exec", "description": "legacy freeform exec"}
+                {"type": "custom", "name": "exec", "description": "legacy freeform exec"},
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object", "properties": {}}
+                }
             ]
         });
         sanitize_responses_request_for_upstream("xai", &mut body);
-        let tools = body["tools"].as_array().expect("tools kept");
-        // exec rewritten + apply_patch ensured for non-OpenAI coding routes.
-        let exec = tools
-            .iter()
-            .find(|t| t.get("name").and_then(Value::as_str) == Some("exec"))
-            .expect("exec must not be dropped");
-        assert_eq!(exec["type"], "function");
+        let tools = body["tools"].as_array().expect("tools");
         assert!(
-            exec.pointer("/parameters/properties/input").is_some(),
-            "exec freeform must expose input parameter"
+            tools
+                .iter()
+                .all(|t| t.get("name").and_then(Value::as_str) != Some("exec")),
+            "freeform exec stripped on xAI NativeResponses"
         );
         assert!(
             tools
                 .iter()
-                .any(|t| t.get("name").and_then(Value::as_str) == Some("apply_patch")),
-            "apply_patch still ensured on non-OpenAI Responses"
+                .any(|t| t.get("name").and_then(Value::as_str) == Some("exec_command")),
+            "ordinary function tools remain"
+        );
+        assert!(
+            tools
+                .iter()
+                .all(|t| t.get("name").and_then(Value::as_str) != Some("apply_patch")),
+            "apply_patch must not be ensured on xAI"
         );
     }
 
@@ -6096,10 +6150,9 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
         let tools = body["tools"].as_array().expect("function tool kept");
-        // Desktop tool kept + apply_patch ensured for non-OpenAI coding routes.
-        assert_eq!(tools.len(), 2);
+        // CCS NativeResponses: only the ordinary function tool; no freeform inject.
+        assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "lookup");
-        assert_eq!(tools[1]["name"], "apply_patch");
     }
 
     /// CCS-style Responses tool rewrite for Grok: Desktop freeform history must
@@ -6173,18 +6226,20 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
             "sticky id stripped after custom→function rewrite"
         );
 
-        // Catalog: freeform apply_patch advertised as portable function tool.
+        // CCS NativeResponses: freeform apply_patch not in tools[] (shell edits).
+        // History may still rewrite legacy custom_tool_call for mid-thread resume.
         let tools = body["tools"].as_array().expect("tools");
-        let apply = tools
-            .iter()
-            .find(|t| t.get("name").and_then(Value::as_str) == Some("apply_patch"))
-            .expect("apply_patch tool");
-        assert_eq!(apply["type"], "function");
         assert!(
-            apply
-                .pointer("/parameters/properties/input")
-                .is_some(),
-            "portable function schema must expose input: {apply}"
+            tools
+                .iter()
+                .all(|t| t.get("name").and_then(Value::as_str) != Some("apply_patch")),
+            "xAI tools must not advertise freeform apply_patch: {tools:?}"
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(Value::as_str) == Some("exec_command")),
+            "ordinary tools remain"
         );
         // No Desktop custom_tool_call residue in the outbound body.
         let serialized = body.to_string();
