@@ -95,10 +95,50 @@ pub struct ModelRouteSummary {
     pub provider_name: String,
     pub upstream_model: String,
     pub display_name: String,
+    /// Publish into Codex App model catalog / picker.
     pub enabled: bool,
+    /// Expose via the local API relay (Responses reverse-proxy).
+    pub relay_enabled: bool,
     pub protocol: String,
     pub base_url: String,
     pub reasoning_profile: ReasoningProfile,
+}
+
+/// Local third-party API relay status (separate from Codex proxy).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiRelayStatus {
+    pub running: bool,
+    pub base_url: Option<String>,
+    pub lan_base_url: Option<String>,
+    pub port: u16,
+    pub bind_lan: bool,
+    pub relay_model_count: u32,
+    pub key_count: u32,
+    pub last_error: Option<String>,
+}
+
+/// One client API key for the Responses relay surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayApiKeySummary {
+    pub id: String,
+    pub label: String,
+    pub key_prefix: String,
+    pub enabled: bool,
+    /// Empty = all `relay_enabled` models.
+    pub allowed_models: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_used_at: Option<String>,
+}
+
+/// Returned only on create / regenerate so the plaintext can be copied once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayApiKeyCreated {
+    pub key: RelayApiKeySummary,
+    pub secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -74,10 +74,41 @@ export type ModelRouteSummary = {
   providerName: string;
   upstreamModel: string;
   displayName: string;
+  /** Publish into Codex App model picker. */
   enabled: boolean;
+  /** Expose via local API relay (Responses reverse-proxy). */
+  relayEnabled: boolean;
   protocol: string;
   baseUrl: string;
   reasoningProfile: ReasoningProfile;
+};
+
+export type ApiRelayStatus = {
+  running: boolean;
+  baseUrl: string | null;
+  lanBaseUrl: string | null;
+  port: number;
+  bindLan: boolean;
+  relayModelCount: number;
+  keyCount: number;
+  lastError: string | null;
+};
+
+export type RelayApiKeySummary = {
+  id: string;
+  label: string;
+  keyPrefix: string;
+  enabled: boolean;
+  /** Empty = all relay-enabled models. */
+  allowedModels: string[];
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string | null;
+};
+
+export type RelayApiKeyCreated = {
+  key: RelayApiKeySummary;
+  secret: string;
 };
 
 export type CredentialSummary = {

@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("没有已启用的模型路由。请先在 Codex Spur 里勾选模型。");
     }
 
-    let (catalog, _targets) = catalog::build_from_routes(&routes)?;
+    let (catalog, _relay, _targets) = catalog::build_from_routes(&routes)?;
     println!("enabled_models={}", catalog.models.len());
     for model in &catalog.models {
         println!("  - {} | {}", model.slug, model.display_name);

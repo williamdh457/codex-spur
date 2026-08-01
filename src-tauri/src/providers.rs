@@ -126,9 +126,9 @@ pub fn deepseek_route_uses_chat_completions(_protocol: &str, upstream_model: &st
 /// upstream dialect + which reference we follow:
 ///
 /// 1. [`OpenAiOfficial`] — OpenAI / ChatGPT Codex backend (OpenAI product path).
-/// 2. [`ResponsesNative`] — pure Responses hosts (DeepSeek Flash, xAI Grok, …).
-///    Protocol is `/responses` passthrough. Catalog follows CCS **NativeResponses**:
-///    **no** freeform `apply_patch_tool_type` (edit via `shell_command`).
+/// 2. [`ResponsesNative`] — pure Responses hosts. Protocol is `/responses`
+///    passthrough. **DeepSeek Flash** keeps freeform apply_patch (official Codex
+///    script). **xAI/Grok** and similar CCS-style natives strip freeform (shell).
 /// 3. [`ChatCompletionsBridge`] — CC Switch `openai_chat` / **ProxyChat**: rewrite
 ///    Responses↔Chat Completions for Kimi / MiniMax / OpenCode Go / most custom
 ///    OpenAI-compatible gateways; catalog **keeps** freeform `apply_patch`.
@@ -850,15 +850,15 @@ pub fn advertise_apply_patch_tool() -> bool {
     )
 }
 
-/// CC Switch `CodexCatalogToolProfile` analogue for Spur catalog rows.
+/// Freeform `apply_patch` catalog ad policy (Desktop injects the client tool).
 ///
-/// - **ProxyChat** (Chat Completions bridge): keep Desktop freeform `apply_patch`
-///   so the proxy can rewrite custom↔function (CCS `transform_codex_chat`).
-/// - **OpenAI official**: keep freeform (native Desktop tool surface).
-/// - **NativeResponses** (xAI/Grok, DeepSeek Flash, custom Responses, …): **strip**
-///   `apply_patch_tool_type` and rely on `shell_type = shell_command` for edits —
-///   same as CCS `NativeResponses` (MiMo/MiniMax-style gateways reject freeform
-///   custom tools; Grok freeform dialect also breaks Desktop verification).
+/// - **OpenAI Official** (`kind=openai`, any entry: OAuth / API Key / JSON):
+///   always freeform — CCS ChatGPT Official parity.
+/// - **Chat Completions bridge** (Kimi / MiniMax / …): freeform (CCS ProxyChat).
+/// - **DeepSeek V4 Flash/Pro** (Responses native): freeform — **DeepSeek official
+///   Codex script** (`apply_patch_tool_type: freeform`), not CCS NativeResponses strip.
+/// - **Other Responses-native** (e.g. xAI/Grok): strip freeform (CCS NativeResponses
+///   / shell_command edits) — unchanged outside OpenAI+DeepSeek scope.
 ///
 /// Kill switch [`advertise_apply_patch_tool`] forces false for every profile.
 pub fn catalog_advertises_freeform_apply_patch(
@@ -869,10 +869,18 @@ pub fn catalog_advertises_freeform_apply_patch(
     if !advertise_apply_patch_tool() {
         return false;
     }
+    let kind_l = kind.to_ascii_lowercase();
+    // ChatGPT Official family: never strip freeform regardless of entry method.
+    if kind_l == "openai" {
+        return true;
+    }
+    // DeepSeek official Codex Responses path requires freeform apply_patch.
+    if kind_l == "deepseek" && deepseek_model_supports_native_responses(upstream_model) {
+        return true;
+    }
     match upstream_protocol_lane(kind, protocol, upstream_model) {
-        // CCS ProxyChat + OpenAI product path: freeform apply_patch stays.
         UpstreamProtocolLane::OpenAiOfficial | UpstreamProtocolLane::ChatCompletionsBridge => true,
-        // CCS NativeResponses: no freeform apply_patch; edit via shell.
+        // Remaining Responses-native (xAI, custom Responses, …): no freeform ad.
         UpstreamProtocolLane::ResponsesNative => false,
     }
 }
@@ -1512,10 +1520,11 @@ mod tests {
         assert_eq!(model.context_window, Some(1_048_576));
         assert_eq!(model.max_context_window, Some(1_048_576));
         assert_eq!(model.effective_context_window_percent, 95);
-        // CCS NativeResponses: DeepSeek Flash has no freeform apply_patch ad.
-        assert!(
-            model.apply_patch_tool_type.is_none(),
-            "Responses-native DeepSeek must strip freeform apply_patch"
+        // DeepSeek official Codex script: freeform apply_patch + shell_command.
+        assert_eq!(
+            model.apply_patch_tool_type.as_deref(),
+            Some("freeform"),
+            "DeepSeek V4 Flash must advertise freeform apply_patch (official script)"
         );
         assert_eq!(model.shell_type, "shell_command");
         assert!(model.tool_mode.is_none());
@@ -1790,31 +1799,61 @@ mod tests {
     }
 
     #[test]
-    fn ccs_native_responses_kinds_strip_freeform_apply_patch() {
-        // xAI / DeepSeek Flash → ResponsesNative → no freeform ad (CCS NativeResponses).
-        for (kind, model_id, label) in [
-            ("xai", "grok-4.5", "Grok"),
-            ("deepseek", "deepseek-v4-flash", "DeepSeek"),
-        ] {
-            let model = catalog_model(
-                "inst",
-                kind,
-                label,
-                &DiscoveredProviderModel {
-                    id: model_id.into(),
-                    display_name: model_id.into(),
-                    owned_by: None,
-                    created_at: None,
-                },
-            );
-            assert!(
-                model.apply_patch_tool_type.is_none(),
-                "{kind} must strip freeform apply_patch, got {:?}",
-                model.apply_patch_tool_type
-            );
-            assert_eq!(model.shell_type, "shell_command");
-        }
-        // Kimi stays ProxyChat → freeform kept.
+    fn freeform_apply_patch_policy_openai_deepseek_xai() {
+        // ChatGPT Official (any entry is kind=openai) → freeform.
+        let openai = catalog_model(
+            "o",
+            "openai",
+            "OpenAI",
+            &DiscoveredProviderModel {
+                id: "gpt-5.6-terra".into(),
+                display_name: "GPT-5.6-Terra".into(),
+                owned_by: None,
+                created_at: None,
+            },
+        );
+        assert_eq!(openai.apply_patch_tool_type.as_deref(), Some("freeform"));
+        assert_eq!(
+            upstream_protocol_lane("openai", "Responses", "gpt-5.6-terra"),
+            UpstreamProtocolLane::OpenAiOfficial
+        );
+
+        // DeepSeek V4 Flash official → freeform + Responses.
+        let flash = catalog_model(
+            "ds",
+            "deepseek",
+            "DeepSeek",
+            &DiscoveredProviderModel {
+                id: "deepseek-v4-flash".into(),
+                display_name: "DeepSeek-V4-Flash".into(),
+                owned_by: None,
+                created_at: None,
+            },
+        );
+        assert_eq!(flash.apply_patch_tool_type.as_deref(), Some("freeform"));
+        assert_eq!(
+            upstream_protocol_lane("deepseek", "Responses", "deepseek-v4-flash"),
+            UpstreamProtocolLane::ResponsesNative
+        );
+
+        // xAI still strips freeform (CCS NativeResponses / shell edits).
+        let grok = catalog_model(
+            "g",
+            "xai",
+            "Grok",
+            &DiscoveredProviderModel {
+                id: "grok-4.5".into(),
+                display_name: "Grok 4.5".into(),
+                owned_by: None,
+                created_at: None,
+            },
+        );
+        assert!(
+            grok.apply_patch_tool_type.is_none(),
+            "xAI keeps freeform stripped"
+        );
+
+        // Kimi ProxyChat → freeform.
         let kimi = catalog_model(
             "k",
             "kimi",
@@ -1827,23 +1866,6 @@ mod tests {
             },
         );
         assert_eq!(kimi.apply_patch_tool_type.as_deref(), Some("freeform"));
-        // DeepSeek legacy chat id → Chat bridge → freeform kept.
-        let ds_chat = catalog_model(
-            "ds",
-            "deepseek",
-            "DeepSeek",
-            &DiscoveredProviderModel {
-                id: "deepseek-chat".into(),
-                display_name: "DeepSeek Chat".into(),
-                owned_by: None,
-                created_at: None,
-            },
-        );
-        assert_eq!(
-            ds_chat.apply_patch_tool_type.as_deref(),
-            Some("freeform"),
-            "legacy deepseek-chat stays ProxyChat freeform"
-        );
     }
 
     #[test]

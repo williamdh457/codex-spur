@@ -26,14 +26,14 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    catalog::{RouteTarget, SharedCatalog, SharedRoutes},
+    catalog::{RouteTarget, SharedCatalog, SharedRelayCatalog, SharedRoutes},
     compact_shim,
     content_encoding::{decode_request_body, get_content_encoding},
     credentials::SecretMaterial,
     domain::ProxyRequestEvent,
     media_sanitizer, providers,
     scheduler::{ScheduleState, SelectionLayer},
-    storage::{Lease, Storage, UsageDelta},
+    storage::{Lease, StoredRelayApiKey, Storage, UsageDelta},
     upstream_errors::{
         body_is_usage_or_rate_limit, content_session_seed, is_failover_status_with_options,
         now_unix, resolve_rate_limit_cooldown, status_category,
@@ -41,15 +41,27 @@ use crate::{
     vault::SecretVault,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxySurface {
+    /// Codex App / install bearer.
+    Codex,
+    /// Third-party Responses reverse-proxy (client API keys).
+    Relay,
+}
+
 #[derive(Clone)]
 struct ProxyState {
     catalog: SharedCatalog,
+    /// Used for Codex surface; unused on Relay (keys live in SQLite).
     secret: Arc<String>,
     routes: SharedRoutes,
+    /// Relay-only catalog (`relay_enabled` models). Codex surface ignores this.
+    relay_catalog: SharedRelayCatalog,
     storage: Arc<Storage>,
     vault: Arc<SecretVault>,
     metrics: Arc<UsageMetrics>,
     client: reqwest::Client,
+    surface: ProxySurface,
 }
 
 pub struct UsageMetrics {
@@ -123,44 +135,155 @@ impl ProxyRuntime {
     }
 }
 
-fn authorized(headers: &HeaderMap, secret: &str) -> bool {
-    headers
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == format!("Bearer {secret}").as_str())
+        .and_then(|value| value.to_str().ok())?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .unwrap_or(value)
+        .trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn authorized_codex(headers: &HeaderMap, secret: &str) -> bool {
+    bearer_token(headers).is_some_and(|token| token == secret)
+}
+
+fn hash_relay_key(secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Generate a client API key for the relay surface (`sk-spur-…`).
+pub fn generate_relay_api_key_secret() -> String {
+    format!("sk-spur-{}", Uuid::new_v4().simple())
+}
+
+pub fn relay_key_prefix(secret: &str) -> String {
+    let chars: String = secret.chars().take(14).collect();
+    format!("{chars}…")
+}
+
+pub fn relay_key_hash(secret: &str) -> String {
+    hash_relay_key(secret)
+}
+
+async fn authorize_request(
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> Result<Option<StoredRelayApiKey>, Response> {
+    match state.surface {
+        ProxySurface::Codex => {
+            if authorized_codex(headers, &state.secret) {
+                Ok(None)
+            } else {
+                Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Invalid local proxy token",
+                ))
+            }
+        }
+        ProxySurface::Relay => {
+            let Some(token) = bearer_token(headers) else {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Invalid proxy api key",
+                ));
+            };
+            let hash = hash_relay_key(&token);
+            match state.storage.find_relay_api_key_by_hash(&hash).await {
+                Ok(Some(key)) => {
+                    let _ = state.storage.touch_relay_api_key(&key.id).await;
+                    Ok(Some(key))
+                }
+                Ok(None) => Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Invalid proxy api key",
+                )),
+                Err(error) => {
+                    tracing::warn!(%error, "relay key lookup failed");
+                    Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "Failed to validate proxy api key",
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn model_allowed_by_key(key: &StoredRelayApiKey, model: &str, route_id: &str) -> bool {
+    if key.allowed_models.is_empty() {
+        return true;
+    }
+    key.allowed_models
+        .iter()
+        .any(|item| item == model || item == route_id)
 }
 
 async fn health(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &state.secret) {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Invalid local proxy token",
-        );
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
     }
-    let catalog = state.catalog.read().await;
+    let catalog_len = if state.surface == ProxySurface::Relay {
+        state.relay_catalog.read().await.models.len()
+    } else {
+        state.catalog.read().await.models.len()
+    };
     Json(json!({
         "ok": true,
-        "catalogRevision": catalog.models.len(),
-        "instance": "codex-spur"
+        "catalogRevision": catalog_len,
+        "instance": if state.surface == ProxySurface::Relay {
+            "codex-spur-relay"
+        } else {
+            "codex-spur"
+        }
     }))
     .into_response()
 }
 
 async fn models(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &state.secret) {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Invalid local proxy token",
-        );
+    let key = match authorize_request(&state, &headers).await {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let mut catalog = if state.surface == ProxySurface::Relay {
+        state.relay_catalog.read().await.clone()
+    } else {
+        state.catalog.read().await.clone()
+    };
+    if let Some(key) = key.as_ref() {
+        if !key.allowed_models.is_empty() {
+            let routes = state.routes.read().await;
+            catalog.models.retain(|model| {
+                let route_id = routes
+                    .get(&model.slug)
+                    .map(|target| target.route_id.as_str())
+                    .unwrap_or("");
+                model_allowed_by_key(key, &model.slug, route_id)
+            });
+        }
     }
-    let catalog = state.catalog.read().await.clone();
     if catalog.models.is_empty() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "model_catalog_empty",
-            "No selected models have been published yet.",
+            if state.surface == ProxySurface::Relay {
+                "No models are enabled for API relay yet."
+            } else {
+                "No selected models have been published yet."
+            },
         );
     }
     Json(catalog).into_response()
@@ -194,13 +317,10 @@ async fn responses(
     mut headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorized(&headers, &state.secret) {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Invalid local proxy token",
-        );
-    }
+    let relay_key = match authorize_request(&state, &headers).await {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
     // ChatGPT Desktop (logged-in) often sends zstd-compressed JSON bodies.
     // Parse only after Content-Encoding has been applied.
     let body = match decode_request_body(&mut headers, body) {
@@ -242,6 +362,24 @@ async fn responses(
             &format!("No Codex Spur route is published for model `{model}`."),
         );
     };
+    if state.surface == ProxySurface::Relay {
+        if !target.relay_enabled {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "model_not_allowed",
+                &format!("Model `{model}` is not enabled for API relay."),
+            );
+        }
+        if let Some(key) = relay_key.as_ref() {
+            if !model_allowed_by_key(key, &model, &target.route_id) {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "model_not_allowed",
+                    &format!("API key is not allowed to use model `{model}`."),
+                );
+            }
+        }
+    }
     if target.base_url.is_empty() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2774,7 +2912,9 @@ const GENERIC_RESPONSES_TOOL_TYPES: &[&str] = &[
 /// Chat Completions only understands function tools (DeepSeek / Kimi / most gateways).
 const CHAT_COMPLETIONS_TOOL_TYPES: &[&str] = &["function"];
 
-/// OpenAI kind covers 官方订阅 / JSON 多账号导入 / API Key — keep Codex-native shapes.
+/// ChatGPT Official family (`kind=openai`): OAuth / API Key / multi-account JSON
+/// all share this path — keep Codex-native tools (incl. freeform apply_patch).
+/// Aligns with CC Switch OpenAI Official (not third-party NativeResponses strip).
 fn keeps_codex_native_tools(kind: &str) -> bool {
     kind.eq_ignore_ascii_case("openai")
 }
@@ -3106,17 +3246,18 @@ fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
     }
 }
 
-/// True for kinds that always land on Responses-native lane (CCS NativeResponses).
+/// Whether Responses-path tool sanitization should **drop** freeform tools and
+/// skip apply_patch ensure-inject.
 ///
-/// DeepSeek chat models use the Chat bridge and keep freeform; only Flash/Pro
-/// are Responses-native — without a model id we treat `deepseek` as strip-happy
-/// on this Responses sanitize path (chat models never call this function).
+/// - **openai**: Official — never strip (should not hit this path for tool port).
+/// - **deepseek**: Official Flash Responses — **keep** freeform (DeepSeek Codex script).
+/// - **xai** / other third-party Responses-native: strip freeform (CCS NativeResponses).
+/// - Chat-bridge kinds (kimi/minimax/…): false (they use chat tools path).
 fn responses_native_strips_freeform_apply_patch(kind: &str) -> bool {
     let k = kind.to_ascii_lowercase();
     match k.as_str() {
-        "openai" | "kimi" | "minimax" | "opencode-go" => false,
-        // xai is always ResponsesNative; deepseek on this path is Flash/Pro only.
-        "xai" | "deepseek" => true,
+        "openai" | "kimi" | "minimax" | "opencode-go" | "deepseek" => false,
+        "xai" => true,
         // custom / unknown on Responses path → strip freeform (CCS native style).
         _ => true,
     }
@@ -3627,6 +3768,7 @@ fn responses_to_chat_completions(
 #[cfg(test)]
 fn test_route_target(kind: &str) -> RouteTarget {
     RouteTarget {
+        route_id: "test/model".into(),
         provider_id: "test".into(),
         kind: kind.into(),
         upstream_model: "model".into(),
@@ -3635,12 +3777,15 @@ fn test_route_target(kind: &str) -> RouteTarget {
         reasoning_profile_id: crate::reasoning_map::ReasoningProfileId::default_for_kind(kind)
             .as_str()
             .into(),
+        codex_enabled: true,
+        relay_enabled: true,
     }
 }
 
 #[cfg(test)]
 fn test_route_target_with_model(kind: &str, model: &str, protocol: &str) -> RouteTarget {
     RouteTarget {
+        route_id: format!("test/{model}"),
         provider_id: "test".into(),
         kind: kind.into(),
         upstream_model: model.into(),
@@ -3649,6 +3794,8 @@ fn test_route_target_with_model(kind: &str, model: &str, protocol: &str) -> Rout
         reasoning_profile_id: crate::reasoning_map::ReasoningProfileId::default_for_kind(kind)
             .as_str()
             .into(),
+        codex_enabled: true,
+        relay_enabled: true,
     }
 }
 
@@ -4440,7 +4587,7 @@ async fn kimi_coding_chat_completions_inner(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorized(&headers, &state.secret) {
+    if !authorized_codex(&headers, &state.secret) {
         return error_response(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -4674,8 +4821,10 @@ pub fn load_or_create_secret(data_dir: &std::path::Path) -> anyhow::Result<Strin
     Ok(secret)
 }
 
+#[allow(dead_code)]
 pub async fn start(
     catalog: SharedCatalog,
+    relay_catalog: SharedRelayCatalog,
     routes: SharedRoutes,
     storage: Arc<Storage>,
     vault: Arc<SecretVault>,
@@ -4683,6 +4832,7 @@ pub async fn start(
 ) -> anyhow::Result<ProxyRuntime> {
     start_with_secret(
         catalog,
+        relay_catalog,
         routes,
         storage,
         vault,
@@ -4692,21 +4842,79 @@ pub async fn start(
     .await
 }
 
+/// Start the Codex-facing localhost proxy (install bearer).
 pub async fn start_with_secret(
     catalog: SharedCatalog,
+    relay_catalog: SharedRelayCatalog,
     routes: SharedRoutes,
     storage: Arc<Storage>,
     vault: Arc<SecretVault>,
     preferred_port: u16,
     secret: String,
 ) -> anyhow::Result<ProxyRuntime> {
+    start_listener(
+        catalog,
+        relay_catalog,
+        routes,
+        storage,
+        vault,
+        preferred_port,
+        secret,
+        ProxySurface::Codex,
+        false,
+    )
+    .await
+}
+
+/// Start the third-party API relay listener (Responses + multi client keys).
+pub async fn start_relay(
+    catalog: SharedCatalog,
+    relay_catalog: SharedRelayCatalog,
+    routes: SharedRoutes,
+    storage: Arc<Storage>,
+    vault: Arc<SecretVault>,
+    preferred_port: u16,
+    bind_lan: bool,
+) -> anyhow::Result<ProxyRuntime> {
+    start_listener(
+        catalog,
+        relay_catalog,
+        routes,
+        storage,
+        vault,
+        preferred_port,
+        String::new(),
+        ProxySurface::Relay,
+        bind_lan,
+    )
+    .await
+}
+
+async fn start_listener(
+    catalog: SharedCatalog,
+    relay_catalog: SharedRelayCatalog,
+    routes: SharedRoutes,
+    storage: Arc<Storage>,
+    vault: Arc<SecretVault>,
+    preferred_port: u16,
+    secret: String,
+    surface: ProxySurface,
+    bind_lan: bool,
+) -> anyhow::Result<ProxyRuntime> {
     let secret = Arc::new(secret);
+    let host = if bind_lan { "0.0.0.0" } else { "127.0.0.1" };
     let mut selected_port = preferred_port;
     let listener = loop {
-        match TcpListener::bind(("127.0.0.1", selected_port)).await {
+        match TcpListener::bind((host, selected_port)).await {
             Ok(listener) => break listener,
             Err(error) if selected_port < preferred_port + 32 => {
-                tracing::warn!(port = selected_port, %error, "proxy port occupied, trying next port");
+                tracing::warn!(
+                    port = selected_port,
+                    %host,
+                    surface = ?surface,
+                    %error,
+                    "proxy port occupied, trying next port"
+                );
                 selected_port += 1;
             }
             Err(error) => return Err(error.into()),
@@ -4717,42 +4925,52 @@ pub async fn start_with_secret(
         catalog,
         secret: Arc::clone(&secret),
         routes,
+        relay_catalog,
         storage,
         vault,
         metrics: Arc::clone(&metrics),
         client: reqwest::Client::builder()
             .user_agent("Codex-Spur/0.1")
             .build()?,
+        surface,
     };
     // Axum's default body buffer is 2 MiB. Codex Desktop long threads (tool
     // outputs, multi-turn history, images) routinely exceed that and surface as
     // HTTP 413 "Failed to buffer the request body: length limit exceeded".
     // Localhost-only proxy: allow large agent payloads while still capping RAM.
     const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024; // 64 MiB
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
-        .route("/v1/responses", post(responses))
+        .route("/v1/responses", post(responses));
+    if surface == ProxySurface::Codex {
         // Experimental Kimi Desktop agent-gw compatible surface (config injection path).
-        .route("/coding/healthz", get(kimi_coding_health))
-        .route(
-            "/coding/v1/chat/completions",
-            post(kimi_coding_chat_completions),
-        )
-        .route(
-            "/coding/v1/v1/chat/completions",
-            post(kimi_coding_chat_completions_v1),
-        )
+        router = router
+            .route("/coding/healthz", get(kimi_coding_health))
+            .route(
+                "/coding/v1/chat/completions",
+                post(kimi_coding_chat_completions),
+            )
+            .route(
+                "/coding/v1/v1/chat/completions",
+                post(kimi_coding_chat_completions_v1),
+            );
+    }
+    let router = router
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .with_state(state);
     let address: SocketAddr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let surface_label = match surface {
+        ProxySurface::Codex => "codex",
+        ProxySurface::Relay => "relay",
+    };
     let task = tokio::spawn(async move {
         let server = axum::serve(listener, router).with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
         });
         if let Err(error) = server.await {
-            tracing::error!(%error, "proxy server stopped unexpectedly");
+            tracing::error!(%error, surface = surface_label, "proxy server stopped unexpectedly");
         }
     });
     Ok(ProxyRuntime {
@@ -4768,6 +4986,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn relay_api_key_hash_is_stable_and_prefix_masks() {
+        let secret = "sk-spur-0123456789abcdef0123456789abcdef";
+        assert_eq!(relay_key_hash(secret), hash_relay_key(secret));
+        assert_eq!(relay_key_hash(secret), relay_key_hash(secret));
+        assert_ne!(relay_key_hash(secret), relay_key_hash("other"));
+        let prefix = relay_key_prefix(secret);
+        assert!(prefix.ends_with('…'));
+        assert!(prefix.starts_with("sk-spur-"));
+    }
+
+    #[test]
+    fn model_allowed_by_key_accepts_slug_or_route_id() {
+        let key = StoredRelayApiKey {
+            id: "k1".into(),
+            label: "t".into(),
+            key_prefix: "sk…".into(),
+            key_hash: "h".into(),
+            enabled: true,
+            allowed_models: vec!["route-1".into()],
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_used_at: None,
+        };
+        assert!(model_allowed_by_key(&key, "spur-route-abc", "route-1"));
+        assert!(model_allowed_by_key(&key, "route-1", "other"));
+        assert!(!model_allowed_by_key(&key, "spur-route-abc", "route-2"));
+        let open = StoredRelayApiKey {
+            allowed_models: vec![],
+            ..key.clone()
+        };
+        assert!(model_allowed_by_key(&open, "anything", "x"));
+    }
 
     #[test]
     fn load_or_create_secret_is_stable_across_calls() {
@@ -5659,17 +5911,44 @@ data: [DONE]
             let has_apply = tools.iter().any(|t| {
                 t["name"] == "apply_patch" || t["function"]["name"] == "apply_patch"
             });
-            // Responses-native kinds (xai/deepseek/custom/minimax-if-mislabeled): strip freeform.
-            // Note: minimax/kimi normally use Chat bridge; if they hit Responses sanitize, strip too.
+            // xAI / custom Responses: strip freeform. DeepSeek official + chat-bridge
+            // kinds that hit this path: keep/ensure apply_patch.
             if responses_native_strips_freeform_apply_patch(kind) {
                 assert!(
                     !has_apply,
-                    "{kind} CCS NativeResponses must strip freeform apply_patch"
+                    "{kind} must strip freeform apply_patch"
                 );
             } else {
-                assert!(has_apply, "{kind} ProxyChat-style must keep apply_patch");
+                assert!(has_apply, "{kind} must keep/ensure apply_patch");
             }
         }
+    }
+
+    #[test]
+    fn deepseek_responses_keeps_and_ensures_freeform_apply_patch() {
+        let mut body = json!({
+            "tools": [
+                {"type": "namespace", "name": "codex"},
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        });
+        sanitize_responses_request_for_upstream("deepseek", &mut body);
+        let tools = body["tools"].as_array().expect("tools");
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(Value::as_str) == Some("apply_patch")),
+            "DeepSeek official Responses must ensure portable apply_patch: {tools:?}"
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(Value::as_str) == Some("lookup"))
+        );
     }
 
     #[test]

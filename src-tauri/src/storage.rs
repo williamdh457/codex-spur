@@ -34,6 +34,8 @@ pub struct StoredRoute {
     pub upstream_model: String,
     pub display_name: String,
     pub enabled: bool,
+    /// Third-party API relay surface (independent of Codex catalog publish).
+    pub relay_enabled: bool,
     pub catalog_json: String,
     pub protocol: String,
     pub base_url: String,
@@ -41,6 +43,19 @@ pub struct StoredRoute {
     pub entry_category: Option<String>,
     /// User-selected reasoning mapping template (see `reasoning_map::ReasoningProfileId`).
     pub reasoning_profile_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredRelayApiKey {
+    pub id: String,
+    pub label: String,
+    pub key_prefix: String,
+    pub key_hash: String,
+    pub enabled: bool,
+    pub allowed_models: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_used_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -493,9 +508,9 @@ impl Storage {
 
     pub async fn list_routes(&self, enabled_only: bool) -> Result<Vec<StoredRoute>, sqlx::Error> {
         let query = if enabled_only {
-            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, COALESCE(mr.relay_enabled, 0) AS relay_enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
         } else {
-            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, COALESCE(mr.relay_enabled, 0) AS relay_enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
         };
         let rows = sqlx::query(query).fetch_all(&self.pool).await?;
         Ok(rows
@@ -517,6 +532,7 @@ impl Storage {
                     upstream_model: row.get("upstream_model"),
                     display_name: row.get("display_name"),
                     enabled: row.get::<i64, _>("enabled") != 0,
+                    relay_enabled: row.get::<i64, _>("relay_enabled") != 0,
                     catalog_json: row.get("catalog_json"),
                     protocol: row.get("protocol"),
                     base_url: row.get("base_url"),
@@ -524,6 +540,15 @@ impl Storage {
                     reasoning_profile_id,
                 }
             })
+            .collect())
+    }
+
+    /// Routes that must be present in the live proxy route map (Codex and/or API relay).
+    pub async fn list_proxy_routes(&self) -> Result<Vec<StoredRoute>, sqlx::Error> {
+        let all = self.list_routes(false).await?;
+        Ok(all
+            .into_iter()
+            .filter(|route| route.enabled || route.relay_enabled)
             .collect())
     }
 
@@ -570,12 +595,13 @@ impl Storage {
         for (id, display_name, catalog_json) in models {
             let route_id = route_id(provider_id, id);
             sqlx::query(
-                "INSERT INTO model_routes (id, provider_id, upstream_model, display_name, enabled, catalog_json) VALUES (?, ?, ?, ?, COALESCE((SELECT enabled FROM model_routes WHERE id = ?), 0), ?) ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name, catalog_json = excluded.catalog_json, updated_at = CURRENT_TIMESTAMP",
+                "INSERT INTO model_routes (id, provider_id, upstream_model, display_name, enabled, relay_enabled, catalog_json) VALUES (?, ?, ?, ?, COALESCE((SELECT enabled FROM model_routes WHERE id = ?), 0), COALESCE((SELECT relay_enabled FROM model_routes WHERE id = ?), 0), ?) ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name, catalog_json = excluded.catalog_json, updated_at = CURRENT_TIMESTAMP",
             )
             .bind(&route_id)
             .bind(provider_id)
             .bind(id)
             .bind(display_name)
+            .bind(&route_id)
             .bind(&route_id)
             .bind(catalog_json)
             .execute(&mut *transaction)
@@ -646,6 +672,252 @@ impl Storage {
             .bind(route_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    pub async fn set_route_relay_enabled(
+        &self,
+        route_id: &str,
+        relay_enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE model_routes SET relay_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(relay_enabled as i64)
+        .bind(route_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn count_relay_enabled_routes(&self) -> Result<u32, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_routes WHERE COALESCE(relay_enabled, 0) = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as u32)
+    }
+
+    fn parse_relay_key_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredRelayApiKey, sqlx::Error> {
+        let allowed_raw: String = row.get("allowed_models_json");
+        let allowed_models: Vec<String> = serde_json::from_str(&allowed_raw).unwrap_or_default();
+        Ok(StoredRelayApiKey {
+            id: row.get("id"),
+            label: row.get("label"),
+            key_prefix: row.get("key_prefix"),
+            key_hash: row.get("key_hash"),
+            enabled: row.get::<i64, _>("enabled") != 0,
+            allowed_models,
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+            last_used_at: row.try_get("last_used_at").ok().flatten(),
+        })
+    }
+
+    pub async fn list_relay_api_keys(&self) -> Result<Vec<StoredRelayApiKey>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, label, key_prefix, key_hash, enabled, allowed_models_json, created_at, updated_at, last_used_at
+             FROM relay_api_keys ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::parse_relay_key_row).collect()
+    }
+
+    pub async fn find_relay_api_key_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<StoredRelayApiKey>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, label, key_prefix, key_hash, enabled, allowed_models_json, created_at, updated_at, last_used_at
+             FROM relay_api_keys WHERE key_hash = ? AND enabled = 1 LIMIT 1",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Self::parse_relay_key_row).transpose()
+    }
+
+    pub async fn insert_relay_api_key(
+        &self,
+        id: &str,
+        label: &str,
+        key_prefix: &str,
+        key_hash: &str,
+        allowed_models: &[String],
+    ) -> Result<StoredRelayApiKey, sqlx::Error> {
+        let allowed_json = serde_json::to_string(allowed_models)
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        sqlx::query(
+            "INSERT INTO relay_api_keys (id, label, key_prefix, key_hash, enabled, allowed_models_json)
+             VALUES (?, ?, ?, ?, 1, ?)",
+        )
+        .bind(id)
+        .bind(label)
+        .bind(key_prefix)
+        .bind(key_hash)
+        .bind(allowed_json)
+        .execute(&self.pool)
+        .await?;
+        self.get_relay_api_key(id)
+            .await?
+            .ok_or_else(|| sqlx::Error::RowNotFound)
+    }
+
+    pub async fn get_relay_api_key(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredRelayApiKey>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, label, key_prefix, key_hash, enabled, allowed_models_json, created_at, updated_at, last_used_at
+             FROM relay_api_keys WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Self::parse_relay_key_row).transpose()
+    }
+
+    pub async fn update_relay_api_key(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        enabled: Option<bool>,
+        allowed_models: Option<&[String]>,
+    ) -> Result<Option<StoredRelayApiKey>, sqlx::Error> {
+        let Some(existing) = self.get_relay_api_key(id).await? else {
+            return Ok(None);
+        };
+        let label = label.unwrap_or(existing.label.as_str());
+        let enabled = enabled.unwrap_or(existing.enabled);
+        let allowed_models = allowed_models.unwrap_or(existing.allowed_models.as_slice());
+        let allowed_json = serde_json::to_string(allowed_models)
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        sqlx::query(
+            "UPDATE relay_api_keys SET label = ?, enabled = ?, allowed_models_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(label)
+        .bind(enabled as i64)
+        .bind(allowed_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get_relay_api_key(id).await
+    }
+
+    pub async fn regenerate_relay_api_key(
+        &self,
+        id: &str,
+        key_prefix: &str,
+        key_hash: &str,
+    ) -> Result<Option<StoredRelayApiKey>, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE relay_api_keys SET key_prefix = ?, key_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(key_prefix)
+        .bind(key_hash)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_relay_api_key(id).await
+    }
+
+    pub async fn delete_relay_api_key(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM relay_api_keys WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn touch_relay_api_key(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE relay_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_relay_settings(&self) -> Result<(u16, bool), sqlx::Error> {
+        let port = self
+            .get_app_setting_u16("relay.port")
+            .await?
+            .unwrap_or(17_862);
+        let bind_lan = self
+            .get_app_setting_bool("relay.bind_lan")
+            .await?
+            .unwrap_or(false);
+        Ok((port, bind_lan))
+    }
+
+    pub async fn set_relay_settings(
+        &self,
+        port: Option<u16>,
+        bind_lan: Option<bool>,
+    ) -> Result<(u16, bool), sqlx::Error> {
+        let (mut cur_port, mut cur_lan) = self.get_relay_settings().await?;
+        if let Some(port) = port {
+            cur_port = port.max(1);
+            self.set_app_setting_json("relay.port", &cur_port).await?;
+        }
+        if let Some(bind_lan) = bind_lan {
+            cur_lan = bind_lan;
+            self.set_app_setting_json("relay.bind_lan", &cur_lan).await?;
+        }
+        Ok((cur_port, cur_lan))
+    }
+
+    async fn get_app_setting_u16(&self, key: &str) -> Result<Option<u16>, sqlx::Error> {
+        let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let json: String = row.get("value_json");
+        if let Ok(value) = serde_json::from_str::<u16>(&json) {
+            return Ok(Some(value));
+        }
+        if let Ok(value) = serde_json::from_str::<u64>(&json) {
+            return Ok(Some(value as u16));
+        }
+        Ok(None)
+    }
+
+    async fn get_app_setting_bool(&self, key: &str) -> Result<Option<bool>, sqlx::Error> {
+        let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let json: String = row.get("value_json");
+        Ok(serde_json::from_str(&json).ok())
+    }
+
+    async fn set_app_setting_json<T: serde::Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), sqlx::Error> {
+        let json =
+            serde_json::to_string(value).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        sqlx::query(
+            "INSERT INTO app_settings (key, value_json) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(key)
+        .bind(json)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2783,6 +3055,7 @@ impl Storage {
                     upstream_model: route.upstream_model,
                     display_name: route.display_name,
                     enabled: route.enabled,
+                    relay_enabled: route.relay_enabled,
                     protocol: route.protocol,
                     base_url: route.base_url,
                     reasoning_profile: profile,

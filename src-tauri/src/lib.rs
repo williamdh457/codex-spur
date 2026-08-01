@@ -31,10 +31,10 @@ use std::sync::Arc;
 
 use credentials::{CredentialImportSummary, SecretMaterial};
 use domain::{
-    AccountPoolSummary, AppSnapshot, ApplyPreview, CodexApplyOutcome, CodexBindingStatus,
-    CredentialSummary, DeleteCredentialResult, ModelRouteSummary, OpenAiQuotaSnapshot,
-    OpenCodeGoCredentialStatus, PoolMemberDetail, ProviderRouting, ProviderSummary,
-    ProxyRequestEvent, ProxyStatus,
+    AccountPoolSummary, ApiRelayStatus, AppSnapshot, ApplyPreview, CodexApplyOutcome,
+    CodexBindingStatus, CredentialSummary, DeleteCredentialResult, ModelRouteSummary,
+    OpenAiQuotaSnapshot, OpenCodeGoCredentialStatus, PoolMemberDetail, ProviderRouting,
+    ProviderSummary, ProxyRequestEvent, ProxyStatus, RelayApiKeyCreated, RelayApiKeySummary,
 };
 use scheduler::PoolSchedulerConfig;
 use tauri::{
@@ -46,12 +46,21 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+struct RelayRuntimeState {
+    runtime: Option<proxy::ProxyRuntime>,
+    port: u16,
+    bind_lan: bool,
+    last_error: Option<String>,
+}
+
 pub struct AppState {
     snapshot: RwLock<AppSnapshot>,
     pub(crate) catalog: catalog::SharedCatalog,
+    relay_catalog: catalog::SharedRelayCatalog,
     routes: catalog::SharedRoutes,
     storage: Arc<storage::Storage>,
     proxy: RwLock<proxy::ProxyRuntime>,
+    relay: RwLock<RelayRuntimeState>,
     vault: Arc<vault::SecretVault>,
     openai_oauth: openai_oauth::OpenAiOAuthManager,
     xai_oauth: xai_oauth::XaiOAuthManager,
@@ -77,13 +86,16 @@ impl AppState {
                 tracing::warn!(%error, "启动时 heal catalog_json 失败，将继续用运行时 heal")
             }
         }
-        let stored_routes = storage.list_routes(true).await?;
-        let (catalog_value, route_values) = catalog::build_from_routes(&stored_routes)?;
+        let stored_routes = storage.list_proxy_routes().await?;
+        let (catalog_value, relay_catalog_value, route_values) =
+            catalog::build_from_routes(&stored_routes)?;
         let catalog = Arc::new(RwLock::new(catalog_value));
+        let relay_catalog = Arc::new(RwLock::new(relay_catalog_value));
         let routes = Arc::new(RwLock::new(route_values));
         let proxy_secret = proxy::load_or_create_secret(&data_dir)?;
         let proxy = proxy::start_with_secret(
             Arc::clone(&catalog),
+            Arc::clone(&relay_catalog),
             Arc::clone(&routes),
             Arc::clone(&storage),
             Arc::clone(&vault),
@@ -91,6 +103,33 @@ impl AppState {
             proxy_secret,
         )
         .await?;
+        let (relay_port, relay_bind_lan) = storage.get_relay_settings().await.unwrap_or((17_862, false));
+        // Ensure at least one client key exists so users can copy a secret after first start.
+        if storage
+            .list_relay_api_keys()
+            .await
+            .map(|keys| keys.is_empty())
+            .unwrap_or(true)
+        {
+            let secret = proxy::generate_relay_api_key_secret();
+            let _ = storage
+                .insert_relay_api_key(
+                    &Uuid::new_v4().to_string(),
+                    "Default",
+                    &proxy::relay_key_prefix(&secret),
+                    &proxy::relay_key_hash(&secret),
+                    &[],
+                )
+                .await;
+            // Persist plaintext once to a 0600 file so the UI can reveal it until regenerate.
+            let key_path = data_dir.join("relay_default_api_key");
+            let _ = std::fs::write(&key_path, format!("{secret}\n"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
         let base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
         let providers = storage.list_providers().await?;
         let credentials = storage.list_credentials(None).await?;
@@ -131,9 +170,16 @@ impl AppState {
         let state = Self {
             snapshot: RwLock::new(snapshot),
             catalog,
+            relay_catalog,
             routes,
             storage,
             proxy: RwLock::new(proxy),
+            relay: RwLock::new(RelayRuntimeState {
+                runtime: None,
+                port: relay_port,
+                bind_lan: relay_bind_lan,
+                last_error: None,
+            }),
             vault,
             openai_oauth: openai_oauth::OpenAiOAuthManager::new(),
             xai_oauth: xai_oauth::XaiOAuthManager::new(),
@@ -148,10 +194,10 @@ impl AppState {
     async fn rebuild_runtime(&self) -> Result<(), String> {
         let stored_routes = self
             .storage
-            .list_routes(true)
+            .list_proxy_routes()
             .await
             .map_err(|error| error.to_string())?;
-        let (catalog_value, route_values) =
+        let (catalog_value, relay_catalog_value, route_values) =
             catalog::build_from_routes(&stored_routes).map_err(|error| error.to_string())?;
         let published_models = catalog_value.models.len() as u32;
         let providers = self
@@ -177,6 +223,7 @@ impl AppState {
         }
 
         *self.catalog.write().await = catalog_value;
+        *self.relay_catalog.write().await = relay_catalog_value;
         *self.routes.write().await = route_values;
         {
             let mut snapshot = self.snapshot.write().await;
@@ -195,13 +242,17 @@ impl AppState {
 
     async fn restart_proxy(&self) -> Result<(), String> {
         let preferred_port = self.proxy.read().await.port;
+        // Preserve the install bearer so Codex config.toml stays valid.
+        let secret = self.proxy.read().await.secret.as_ref().clone();
         self.proxy.read().await.stop().await;
-        let runtime = proxy::start(
+        let runtime = proxy::start_with_secret(
             Arc::clone(&self.catalog),
+            Arc::clone(&self.relay_catalog),
             Arc::clone(&self.routes),
             Arc::clone(&self.storage),
             Arc::clone(&self.vault),
             preferred_port,
+            secret,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -219,8 +270,134 @@ impl AppState {
         Ok(())
     }
 
+    async fn relay_status_inner(&self) -> Result<ApiRelayStatus, String> {
+        let relay = self.relay.read().await;
+        let running = relay.runtime.is_some();
+        let port = if let Some(runtime) = relay.runtime.as_ref() {
+            runtime.port
+        } else {
+            relay.port
+        };
+        let bind_lan = relay.bind_lan;
+        let last_error = relay.last_error.clone();
+        drop(relay);
+        let relay_model_count = self
+            .storage
+            .count_relay_enabled_routes()
+            .await
+            .map_err(|error| error.to_string())?;
+        let key_count = self
+            .storage
+            .list_relay_api_keys()
+            .await
+            .map(|keys| keys.len() as u32)
+            .map_err(|error| error.to_string())?;
+        let base_url = Some(format!("http://127.0.0.1:{port}/v1"));
+        let lan_base_url = if bind_lan {
+            primary_lan_ipv4().map(|ip| format!("http://{ip}:{port}/v1"))
+        } else {
+            None
+        };
+        Ok(ApiRelayStatus {
+            running,
+            base_url,
+            lan_base_url,
+            port,
+            bind_lan,
+            relay_model_count,
+            key_count,
+            last_error,
+        })
+    }
+
+    async fn start_relay_inner(&self) -> Result<ApiRelayStatus, String> {
+        let (preferred_port, bind_lan) = self
+            .storage
+            .get_relay_settings()
+            .await
+            .map_err(|error| error.to_string())?;
+        {
+            let mut relay = self.relay.write().await;
+            if let Some(runtime) = relay.runtime.take() {
+                runtime.stop().await;
+            }
+            relay.bind_lan = bind_lan;
+            relay.port = preferred_port;
+            relay.last_error = None;
+        }
+        match proxy::start_relay(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.relay_catalog),
+            Arc::clone(&self.routes),
+            Arc::clone(&self.storage),
+            Arc::clone(&self.vault),
+            preferred_port,
+            bind_lan,
+        )
+        .await
+        {
+            Ok(runtime) => {
+                let port = runtime.port;
+                let mut relay = self.relay.write().await;
+                relay.port = port;
+                relay.bind_lan = bind_lan;
+                relay.runtime = Some(runtime);
+                relay.last_error = None;
+            }
+            Err(error) => {
+                let mut relay = self.relay.write().await;
+                relay.last_error = Some(error.to_string());
+                return Err(error.to_string());
+            }
+        }
+        self.relay_status_inner().await
+    }
+
+    async fn stop_relay_inner(&self) -> Result<ApiRelayStatus, String> {
+        {
+            let mut relay = self.relay.write().await;
+            if let Some(runtime) = relay.runtime.take() {
+                runtime.stop().await;
+            }
+            relay.last_error = None;
+        }
+        self.relay_status_inner().await
+    }
+}
+
+fn primary_lan_ipv4() -> Option<String> {
+    use std::net::{IpAddr, UdpSocket};
+    // UDP connect does not send packets; it selects a source address for the route.
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
+fn stored_relay_key_to_summary(key: storage::StoredRelayApiKey) -> RelayApiKeySummary {
+    RelayApiKeySummary {
+        id: key.id,
+        label: key.label,
+        key_prefix: key.key_prefix,
+        enabled: key.enabled,
+        allowed_models: key.allowed_models,
+        created_at: key.created_at,
+        updated_at: key.updated_at,
+        last_used_at: key.last_used_at,
+    }
+}
+
+impl AppState {
     async fn shutdown(&self) {
         self.proxy.read().await.stop().await;
+        {
+            let mut relay = self.relay.write().await;
+            if let Some(runtime) = relay.runtime.take() {
+                runtime.stop().await;
+            }
+        }
         if let Err(error) = self.storage.release_all_leases().await {
             tracing::warn!(%error, "failed to release account leases during shutdown");
         }
@@ -2249,6 +2426,211 @@ async fn set_model_enabled(
     list_model_routes(state).await
 }
 
+#[tauri::command]
+async fn set_model_relay_enabled(
+    state: State<'_, AppState>,
+    route_id: String,
+    enabled: bool,
+) -> Result<Vec<ModelRouteSummary>, String> {
+    state
+        .storage
+        .set_route_relay_enabled(&route_id, enabled)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Ok(routes) = state.storage.list_routes(false).await {
+        if let Some(route) = routes.iter().find(|route| route.id == route_id) {
+            if let Ok(healed) = catalog::heal_stored_catalog_json(route) {
+                let _ = state
+                    .storage
+                    .update_route_catalog_json(&route_id, &healed)
+                    .await;
+            }
+        }
+    }
+    // Relay toggle only rebuilds runtime catalogs — no Codex Apply attention.
+    state.rebuild_runtime().await?;
+    list_model_routes(state).await
+}
+
+#[tauri::command]
+async fn get_api_relay_status(state: State<'_, AppState>) -> Result<ApiRelayStatus, String> {
+    state.relay_status_inner().await
+}
+
+#[tauri::command]
+async fn start_api_relay(state: State<'_, AppState>) -> Result<ApiRelayStatus, String> {
+    state.start_relay_inner().await
+}
+
+#[tauri::command]
+async fn stop_api_relay(state: State<'_, AppState>) -> Result<ApiRelayStatus, String> {
+    state.stop_relay_inner().await
+}
+
+#[tauri::command]
+async fn set_api_relay_settings(
+    state: State<'_, AppState>,
+    port: Option<u16>,
+    bind_lan: Option<bool>,
+) -> Result<ApiRelayStatus, String> {
+    let (next_port, next_lan) = state
+        .storage
+        .set_relay_settings(port, bind_lan)
+        .await
+        .map_err(|error| error.to_string())?;
+    {
+        let mut relay = state.relay.write().await;
+        relay.port = next_port;
+        relay.bind_lan = next_lan;
+    }
+    // If already running, restart so bind/port take effect.
+    let was_running = state.relay.read().await.runtime.is_some();
+    if was_running {
+        return state.start_relay_inner().await;
+    }
+    state.relay_status_inner().await
+}
+
+#[tauri::command]
+async fn list_relay_api_keys(
+    state: State<'_, AppState>,
+) -> Result<Vec<RelayApiKeySummary>, String> {
+    let keys = state
+        .storage
+        .list_relay_api_keys()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(keys.into_iter().map(stored_relay_key_to_summary).collect())
+}
+
+#[tauri::command]
+async fn create_relay_api_key(
+    state: State<'_, AppState>,
+    label: Option<String>,
+    allowed_models: Option<Vec<String>>,
+) -> Result<RelayApiKeyCreated, String> {
+    let secret = proxy::generate_relay_api_key_secret();
+    let id = Uuid::new_v4().to_string();
+    let label = label
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Client key".into());
+    let allowed = allowed_models.unwrap_or_default();
+    let stored = state
+        .storage
+        .insert_relay_api_key(
+            &id,
+            &label,
+            &proxy::relay_key_prefix(&secret),
+            &proxy::relay_key_hash(&secret),
+            &allowed,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(RelayApiKeyCreated {
+        key: stored_relay_key_to_summary(stored),
+        secret,
+    })
+}
+
+#[tauri::command]
+async fn update_relay_api_key(
+    state: State<'_, AppState>,
+    id: String,
+    label: Option<String>,
+    enabled: Option<bool>,
+    allowed_models: Option<Vec<String>>,
+) -> Result<RelayApiKeySummary, String> {
+    let stored = state
+        .storage
+        .update_relay_api_key(
+            &id,
+            label.as_deref(),
+            enabled,
+            allowed_models.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "API Key 不存在".to_string())?;
+    Ok(stored_relay_key_to_summary(stored))
+}
+
+#[tauri::command]
+async fn regenerate_relay_api_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<RelayApiKeyCreated, String> {
+    let secret = proxy::generate_relay_api_key_secret();
+    let stored = state
+        .storage
+        .regenerate_relay_api_key(
+            &id,
+            &proxy::relay_key_prefix(&secret),
+            &proxy::relay_key_hash(&secret),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "API Key 不存在".to_string())?;
+    // Drop stale bootstrap plaintext if any key was rotated.
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let _ = std::fs::remove_file(data_dir.join("relay_default_api_key"));
+    }
+    Ok(RelayApiKeyCreated {
+        key: stored_relay_key_to_summary(stored),
+        secret,
+    })
+}
+
+#[tauri::command]
+async fn delete_relay_api_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let deleted = state
+        .storage
+        .delete_relay_api_key(&id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if deleted {
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            let _ = std::fs::remove_file(data_dir.join("relay_default_api_key"));
+        }
+    }
+    Ok(deleted)
+}
+
+/// Reveal the one-time default key file written on first bootstrap (if still present
+/// and still matching a live key hash).
+#[tauri::command]
+async fn reveal_default_relay_api_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let path = data_dir.join("relay_default_api_key");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let hash = proxy::relay_key_hash(&trimmed);
+    let still_valid = state
+        .storage
+        .find_relay_api_key_by_hash(&hash)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !still_valid {
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
+    Ok(Some(trimmed))
+}
+
 /// Historical helper: enable/apply no longer fail-closed on native Compact V2.
 /// All routes use the proxy local portable compact shim (`spur1:` envelope).
 /// Kept for diagnostics / optional future soft warnings only.
@@ -3355,6 +3737,17 @@ pub fn run() {
             install_app_update,
             set_active_pool,
             set_model_enabled,
+            set_model_relay_enabled,
+            get_api_relay_status,
+            start_api_relay,
+            stop_api_relay,
+            set_api_relay_settings,
+            list_relay_api_keys,
+            create_relay_api_key,
+            update_relay_api_key,
+            regenerate_relay_api_key,
+            delete_relay_api_key,
+            reveal_default_relay_api_key,
             import_credentials_json,
             import_session_json,
             list_credentials,

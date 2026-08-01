@@ -14,6 +14,8 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct RouteTarget {
+    /// Stable SQLite route id (`provider_id/upstream…`).
+    pub route_id: String,
     pub provider_id: String,
     pub kind: String,
     pub upstream_model: String,
@@ -21,10 +23,16 @@ pub struct RouteTarget {
     pub protocol: String,
     /// User-selected reasoning template id (`openai_native`, `deepseek`, …).
     pub reasoning_profile_id: String,
+    /// Published into Codex App catalog.
+    pub codex_enabled: bool,
+    /// Exposed on the local API relay surface.
+    pub relay_enabled: bool,
 }
 
 pub type SharedCatalog = Arc<RwLock<ModelsResponse>>;
 pub type SharedRoutes = Arc<RwLock<HashMap<String, RouteTarget>>>;
+/// Catalog rows for the third-party API relay (`relay_enabled` only).
+pub type SharedRelayCatalog = Arc<RwLock<ModelsResponse>>;
 
 const REQUIRED_MODEL_FIELDS: &[&str] = &[
     "slug",
@@ -289,13 +297,22 @@ fn catalog_model_label(route: &StoredRoute, model: &CatalogModel) -> String {
     bare_model_label(raw).to_string()
 }
 
+/// Build Codex catalog, relay catalog, and unified proxy route map.
+///
+/// `routes` should already be the proxy-eligible set (`enabled || relay_enabled`),
+/// or the full table — non-active rows are skipped.
 pub fn build_from_routes(
     routes: &[StoredRoute],
-) -> Result<(ModelsResponse, HashMap<String, RouteTarget>)> {
-    let mut models = Vec::new();
+) -> Result<(ModelsResponse, ModelsResponse, HashMap<String, RouteTarget>)> {
+    let mut codex_models = Vec::new();
+    let mut relay_models = Vec::new();
     let mut targets = HashMap::new();
     let mut claimed_public_slugs = std::collections::HashSet::new();
-    for (enabled_index, route) in routes.iter().filter(|route| route.enabled).enumerate() {
+    let active: Vec<&StoredRoute> = routes
+        .iter()
+        .filter(|route| route.enabled || route.relay_enabled)
+        .collect();
+    for (enabled_index, route) in active.into_iter().enumerate() {
         let enabled_index = enabled_index as i32;
         let model = match serde_json::from_str::<RouteCatalogPayload>(&route.catalog_json) {
             Ok(payload) => payload.model,
@@ -362,12 +379,15 @@ pub fn build_from_routes(
                 route.base_url.clone()
             };
             let target = RouteTarget {
+                route_id: route.id.clone(),
                 provider_id: route.provider_id.clone(),
                 kind: route.kind.clone(),
                 upstream_model: route.upstream_model.clone(),
                 base_url,
                 protocol: route.protocol.clone(),
                 reasoning_profile_id: profile.as_str().to_string(),
+                codex_enabled: route.enabled,
+                relay_enabled: route.relay_enabled,
             };
             // Publish key + dual-keys so in-flight sessions on old slugs still route.
             targets.insert(published.clone(), target.clone());
@@ -383,9 +403,32 @@ pub fn build_from_routes(
             if previous_slug != published && !previous_slug.is_empty() {
                 targets.insert(previous_slug, target);
             }
-            models.push(model);
+            if route.enabled {
+                codex_models.push(model.clone());
+            }
+            if route.relay_enabled {
+                relay_models.push(model);
+            }
         }
     }
+    sort_and_reprioritize(&mut codex_models);
+    sort_and_reprioritize(&mut relay_models);
+    let catalog = ModelsResponse {
+        models: codex_models,
+    };
+    let relay_catalog = ModelsResponse {
+        models: relay_models,
+    };
+    if !catalog.models.is_empty() {
+        validate_catalog(&catalog)?;
+    }
+    if !relay_catalog.models.is_empty() {
+        validate_catalog(&relay_catalog)?;
+    }
+    Ok((catalog, relay_catalog, targets))
+}
+
+fn sort_and_reprioritize(models: &mut [CatalogModel]) {
     // Prefer human display order: non-GPT / third-party first, then name — helps GUI scanning.
     models.sort_by(|left, right| {
         let left_gpt = left.display_name.to_ascii_lowercase().contains("gpt");
@@ -395,15 +438,9 @@ pub fn build_from_routes(
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.slug.cmp(&right.slug))
     });
-    // Re-assign priorities after stable sort so ordering is deterministic.
     for (index, model) in models.iter_mut().enumerate() {
         model.priority = 1000 + index as i32;
     }
-    let catalog = ModelsResponse { models };
-    if !catalog.models.is_empty() {
-        validate_catalog(&catalog)?;
-    }
-    Ok((catalog, targets))
 }
 
 pub fn default_reasoning_levels() -> Vec<ReasoningEffortPreset> {
@@ -517,6 +554,7 @@ mod tests {
             upstream_model: upstream.into(),
             display_name: display.into(),
             enabled: true,
+            relay_enabled: false,
             catalog_json,
             protocol: "chat_completions".into(),
             base_url: "https://example.invalid/v1".into(),
@@ -561,7 +599,7 @@ mod tests {
                 "kimi",
             ),
         ];
-        let (catalog, targets) = build_from_routes(&routes).expect("build catalog");
+        let (catalog, _relay, targets) = build_from_routes(&routes).expect("build catalog");
         assert_eq!(catalog.models.len(), 2);
 
         // Kimi should sort before GPT for picker scanning.
@@ -689,7 +727,7 @@ mod tests {
                 "openai",
             ),
         ];
-        let (catalog, targets) = build_from_routes(&routes).expect("build catalog");
+        let (catalog, _relay, targets) = build_from_routes(&routes).expect("build catalog");
         assert_eq!(catalog.models.len(), 2);
 
         let official = catalog
@@ -775,6 +813,26 @@ mod tests {
         route.catalog_json = "{not-json".into();
         let error = build_from_routes(&[route]).unwrap_err();
         assert!(error.to_string().contains("catalog_json 无法解析"));
+    }
+
+    #[test]
+    fn build_from_routes_keeps_codex_and_relay_independent() {
+        let mut codex_only = stale_slash_route("p1", "OpenAI", "gpt-5.6-sol", "Sol", "openai");
+        codex_only.enabled = true;
+        codex_only.relay_enabled = false;
+        let mut relay_only = stale_slash_route("p2", "DeepSeek", "deepseek-v4-flash", "Flash", "deepseek");
+        relay_only.enabled = false;
+        relay_only.relay_enabled = true;
+        let mut both = stale_slash_route("p3", "Grok", "grok-4.5", "Grok", "xai");
+        both.enabled = true;
+        both.relay_enabled = true;
+        let (catalog, relay, targets) =
+            build_from_routes(&[codex_only, relay_only, both]).expect("build");
+        assert_eq!(catalog.models.len(), 2, "codex catalog = enabled only");
+        assert_eq!(relay.models.len(), 2, "relay catalog = relay_enabled only");
+        assert!(targets.values().any(|t| t.relay_enabled && !t.codex_enabled));
+        assert!(targets.values().any(|t| t.codex_enabled && !t.relay_enabled));
+        assert!(targets.values().any(|t| t.codex_enabled && t.relay_enabled));
     }
 
     #[test]

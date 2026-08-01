@@ -17,6 +17,9 @@ import type {
   KimiTargetStatus,
   DeleteCredentialResult,
   ModelRouteSummary,
+  ApiRelayStatus,
+  RelayApiKeySummary,
+  RelayApiKeyCreated,
   OpenAiQuotaSnapshot,
   ProviderSummary,
   UsageSnapshot,
@@ -383,6 +386,90 @@ export async function setActivePool(providerId: string, poolId: string): Promise
 export async function setModelEnabled(routeId: string, enabled: boolean): Promise<ModelRouteSummary[]> {
   if (!isTauriRuntime()) return [];
   return invoke<ModelRouteSummary[]>("set_model_enabled", { routeId, enabled });
+}
+
+export async function setModelRelayEnabled(
+  routeId: string,
+  enabled: boolean,
+): Promise<ModelRouteSummary[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<ModelRouteSummary[]>("set_model_relay_enabled", { routeId, enabled });
+}
+
+export async function getApiRelayStatus(): Promise<ApiRelayStatus> {
+  if (!isTauriRuntime()) {
+    return {
+      running: false,
+      baseUrl: "http://127.0.0.1:17862/v1",
+      lanBaseUrl: null,
+      port: 17862,
+      bindLan: false,
+      relayModelCount: 0,
+      keyCount: 0,
+      lastError: null,
+    };
+  }
+  return invoke<ApiRelayStatus>("get_api_relay_status");
+}
+
+export async function startApiRelay(): Promise<ApiRelayStatus> {
+  return invoke<ApiRelayStatus>("start_api_relay");
+}
+
+export async function stopApiRelay(): Promise<ApiRelayStatus> {
+  return invoke<ApiRelayStatus>("stop_api_relay");
+}
+
+export async function setApiRelaySettings(input: {
+  port?: number;
+  bindLan?: boolean;
+}): Promise<ApiRelayStatus> {
+  return invoke<ApiRelayStatus>("set_api_relay_settings", {
+    port: input.port ?? null,
+    bindLan: input.bindLan ?? null,
+  });
+}
+
+export async function listRelayApiKeys(): Promise<RelayApiKeySummary[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<RelayApiKeySummary[]>("list_relay_api_keys");
+}
+
+export async function createRelayApiKey(input?: {
+  label?: string;
+  allowedModels?: string[];
+}): Promise<RelayApiKeyCreated> {
+  return invoke<RelayApiKeyCreated>("create_relay_api_key", {
+    label: input?.label ?? null,
+    allowedModels: input?.allowedModels ?? null,
+  });
+}
+
+export async function updateRelayApiKey(input: {
+  id: string;
+  label?: string;
+  enabled?: boolean;
+  allowedModels?: string[];
+}): Promise<RelayApiKeySummary> {
+  return invoke<RelayApiKeySummary>("update_relay_api_key", {
+    id: input.id,
+    label: input.label ?? null,
+    enabled: input.enabled ?? null,
+    allowedModels: input.allowedModels ?? null,
+  });
+}
+
+export async function regenerateRelayApiKey(id: string): Promise<RelayApiKeyCreated> {
+  return invoke<RelayApiKeyCreated>("regenerate_relay_api_key", { id });
+}
+
+export async function deleteRelayApiKey(id: string): Promise<boolean> {
+  return invoke<boolean>("delete_relay_api_key", { id });
+}
+
+export async function revealDefaultRelayApiKey(): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<string | null>("reveal_default_relay_api_key");
 }
 
 
