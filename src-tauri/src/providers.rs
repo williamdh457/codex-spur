@@ -165,7 +165,11 @@ pub fn upstream_protocol_lane(kind: &str, protocol: &str, upstream_model: &str) 
     }
 
     // 2) Pure Responses (DeepSeek-official style for non-OpenAI Responses hosts)
-    // xAI: docs.x.ai — Responses preferred; Chat Completions is legacy.
+    //
+    // xAI / Grok is **always** ResponsesNative — including OAuth SuperGrok which
+    // hits `cli-chat-proxy.grok.com` (the host name says "chat" but Spur posts
+    // `/v1/responses`, never `/v1/chat/completions`). A stale provider.protocol
+    // of "Chat Completions" must not flip Grok onto the CCS Chat bridge.
     if kind == "xai" {
         return UpstreamProtocolLane::ResponsesNative;
     }
@@ -1377,6 +1381,15 @@ mod tests {
         assert_eq!(
             upstream_protocol_lane("xai", "Responses", "grok-4.5"),
             UpstreamProtocolLane::ResponsesNative
+        );
+        // OAuth CLI proxy / mislabeled protocol must never Chat-bridge Grok.
+        assert_eq!(
+            upstream_protocol_lane("xai", "Chat Completions", "grok-4.5"),
+            UpstreamProtocolLane::ResponsesNative
+        );
+        assert!(
+            !upstream_protocol_lane("xai", "Chat Completions", "grok-4.5")
+                .uses_chat_completions_bridge()
         );
         assert_eq!(
             upstream_protocol_lane("deepseek", "Responses", "deepseek-v4-flash"),
