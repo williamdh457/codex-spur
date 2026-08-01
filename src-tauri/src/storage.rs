@@ -3715,3 +3715,144 @@ mod delete_credential_tests {
         assert!(err.to_string().contains("供应商不存在"));
     }
 }
+
+#[cfg(test)]
+mod relay_storage_tests {
+    use super::Storage;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    async fn open_temp_storage() -> Storage {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-relay-{}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        Storage::open(&dir).await.expect("open storage")
+    }
+
+    #[tokio::test]
+    async fn relay_api_keys_crud_and_hash_lookup() {
+        let storage = open_temp_storage().await;
+        let secret = "sk-spur-test-secret-aaa";
+        let hash = crate::proxy::relay_key_hash(secret);
+        let created = storage
+            .insert_relay_api_key(
+                "key-1",
+                "Default",
+                "sk-spur-test…",
+                &hash,
+                &["route-a".into()],
+            )
+            .await
+            .expect("insert");
+        assert_eq!(created.label, "Default");
+        assert_eq!(created.allowed_models, vec!["route-a".to_string()]);
+
+        let found = storage
+            .find_relay_api_key_by_hash(&hash)
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(found.id, "key-1");
+
+        let updated = storage
+            .update_relay_api_key("key-1", Some("Team"), Some(false), Some(&[]))
+            .await
+            .expect("update")
+            .expect("row");
+        assert_eq!(updated.label, "Team");
+        assert!(!updated.enabled);
+        assert!(updated.allowed_models.is_empty());
+
+        // Disabled keys must not authenticate.
+        assert!(storage
+            .find_relay_api_key_by_hash(&hash)
+            .await
+            .expect("lookup disabled")
+            .is_none());
+
+        let new_hash = crate::proxy::relay_key_hash("sk-spur-rotated");
+        let regen = storage
+            .regenerate_relay_api_key("key-1", "sk-spur-rota…", &new_hash)
+            .await
+            .expect("regen")
+            .expect("row");
+        assert_eq!(regen.key_hash, new_hash);
+
+        // Re-enable after regenerate.
+        let _ = storage
+            .update_relay_api_key("key-1", None, Some(true), None)
+            .await
+            .expect("enable");
+        assert!(storage
+            .find_relay_api_key_by_hash(&new_hash)
+            .await
+            .expect("lookup new")
+            .is_some());
+
+        assert!(storage.delete_relay_api_key("key-1").await.expect("delete"));
+        assert!(storage
+            .list_relay_api_keys()
+            .await
+            .expect("list")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn relay_enabled_independent_of_codex_enabled() {
+        let storage = open_temp_storage().await;
+        sqlx::query(
+            "INSERT INTO providers (id, name, region, protocol, base_url, configured, selected_models, discovered_models, kind)
+             VALUES ('p1', 'P', 'global', 'Responses', 'https://example.test/v1', 1, 0, 1, 'deepseek')",
+        )
+        .execute(&storage.pool)
+        .await
+        .expect("provider");
+        sqlx::query(
+            "INSERT INTO model_routes (id, provider_id, upstream_model, display_name, enabled, relay_enabled, catalog_json)
+             VALUES ('p1/m1', 'p1', 'm1', 'M1', 0, 0, '{}')",
+        )
+        .execute(&storage.pool)
+        .await
+        .expect("route");
+
+        storage
+            .set_route_relay_enabled("p1/m1", true)
+            .await
+            .expect("relay on");
+        let proxy_routes = storage.list_proxy_routes().await.expect("proxy routes");
+        assert_eq!(proxy_routes.len(), 1);
+        assert!(!proxy_routes[0].enabled);
+        assert!(proxy_routes[0].relay_enabled);
+
+        let codex_only = storage.list_routes(true).await.expect("codex");
+        assert!(codex_only.is_empty());
+
+        assert_eq!(
+            storage.count_relay_enabled_routes().await.expect("count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_settings_roundtrip() {
+        let storage = open_temp_storage().await;
+        let (port, lan) = storage.get_relay_settings().await.expect("defaults");
+        assert_eq!(port, 17_862);
+        assert!(!lan);
+        let (port, lan) = storage
+            .set_relay_settings(Some(19_001), Some(true))
+            .await
+            .expect("set");
+        assert_eq!(port, 19_001);
+        assert!(lan);
+        let (port2, lan2) = storage.get_relay_settings().await.expect("reload");
+        assert_eq!(port2, 19_001);
+        assert!(lan2);
+    }
+}

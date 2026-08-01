@@ -112,6 +112,28 @@ Closing the main window keeps the menu-bar proxy alive. Quitting the app stops t
 - OpenCode Go imports the local `opencode-go` API credential from `$XDG_DATA_HOME/opencode/auth.json` (fallback `~/.local/share/opencode/auth.json`) or accepts a manually entered key, and uses `https://opencode.ai/zen/go/v1`
 - Fetched models stay **candidates** until you enable them on the Models page
 
+### API relay (Responses reverse-proxy)
+
+Expose configured models as a pure **OpenAI Responses** transit endpoint for third-party clients — independent of the Codex catalog publish:
+
+1. **Models** page: dual toggles per route — **Codex** (picker) vs **Relay** (API)
+2. **API relay** card: start/stop, copy Base URL + client API keys
+3. Multiple client keys with optional per-key model allowlists
+4. Default `http://127.0.0.1:17862/v1`; optional LAN bind
+
+```bash
+export SPUR_BASE=http://127.0.0.1:17862/v1
+export SPUR_KEY=sk-spur-...
+
+curl "$SPUR_BASE/models" -H "Authorization: Bearer $SPUR_KEY"
+curl "$SPUR_BASE/responses" \
+  -H "Authorization: Bearer $SPUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<slug>","input":"hello","stream":true}'
+```
+
+Responses only (`POST /v1/responses`). No Codex config rewrite. DeepSeek / OpenAI / Grok reuse the existing three-lane forwarder.
+
 ### Routing & scheduling
 
 Multi-account OpenAI instances support:

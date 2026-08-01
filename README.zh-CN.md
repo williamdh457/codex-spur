@@ -95,6 +95,28 @@ Spur 是 **local-first** 的桌面控制面：管你真正在用的模型，不�
 - OpenCode Go 可从 `$XDG_DATA_HOME/opencode/auth.json`（回退 `~/.local/share/opencode/auth.json`）自动导入本机 `opencode-go` API 凭据，也可手动填写 Key；默认端点为 `https://opencode.ai/zen/go/v1`
 - 拉取结果为候选；模型页启用后才进入 catalog  
 
+### API 反代（Responses 中转站）
+
+把已配置模型以 **OpenAI Responses** 格式外放给第三方客户端（与 Codex 发布互相独立）：
+
+1. **模型**页：每个模型两个开关——**Codex**（进官方选择器）与 **反代**（外放）
+2. 顶部 **API 反代** 卡片：启动服务、复制 Base URL / API Key
+3. 多把 Client Key，每把可设模型白名单
+4. 默认 `http://127.0.0.1:17862/v1`；可选局域网绑定
+
+```bash
+export SPUR_BASE=http://127.0.0.1:17862/v1
+export SPUR_KEY=sk-spur-...
+
+curl "$SPUR_BASE/models" -H "Authorization: Bearer $SPUR_KEY"
+curl "$SPUR_BASE/responses" \
+  -H "Authorization: Bearer $SPUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<slug>","input":"hello","stream":true}'
+```
+
+仅 Responses（`POST /v1/responses`）；不改 Codex 配置。DeepSeek / OpenAI / Grok 走现有转发核。
+
 ### 路由与调度
 
 多账号 OpenAI 支持 `Pool` / `Fixed`。Pool 顺序：`previous_response_id` 亲和 → session-hash 亲和 → Top-K 加权（sticky 并发等待默认 120s，与 Sub2API 一致）。不健康账号会 escape。设置 → 调度可调 sticky/fallback/评分/冷却等 Sub2API 风格 knobs。

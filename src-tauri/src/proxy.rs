@@ -5040,6 +5040,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn relay_listener_requires_client_api_key() {
+        use crate::domain::ModelsResponse;
+        use crate::vault::SecretVault;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-spur-relay-http-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let storage = Arc::new(
+            crate::storage::Storage::open(&dir)
+                .await
+                .expect("storage"),
+        );
+        let vault = Arc::new(SecretVault::load_or_create(&dir).expect("vault"));
+        let secret = "sk-spur-relay-http-test";
+        storage
+            .insert_relay_api_key(
+                "k1",
+                "Test",
+                "sk-spur-relay…",
+                &relay_key_hash(secret),
+                &[],
+            )
+            .await
+            .expect("key");
+
+        let catalog = Arc::new(RwLock::new(ModelsResponse { models: vec![] }));
+        let mut relay_model = crate::catalog::placeholder_model(
+            "spur-route-relay-test".into(),
+            "Relay Test".into(),
+        );
+        relay_model.slug = "spur-route-relay-test".into();
+        let relay_catalog = Arc::new(RwLock::new(ModelsResponse {
+            models: vec![relay_model],
+        }));
+        let routes: SharedRoutes = Arc::new(RwLock::new(HashMap::new()));
+
+        let runtime = start_relay(
+            Arc::clone(&catalog),
+            Arc::clone(&relay_catalog),
+            Arc::clone(&routes),
+            Arc::clone(&storage),
+            Arc::clone(&vault),
+            17_900,
+            false,
+        )
+        .await
+        .expect("start relay");
+        let port = runtime.port;
+        let client = reqwest::Client::new();
+
+        let unauthorized = client
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .send()
+            .await
+            .expect("req");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let bad = client
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .header(header::AUTHORIZATION, "Bearer wrong-key")
+            .send()
+            .await
+            .expect("req");
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+        let ok = client
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .send()
+            .await
+            .expect("req");
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body: serde_json::Value = ok.json().await.expect("json");
+        assert_eq!(body["models"][0]["slug"], "spur-route-relay-test");
+
+        let health = client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .send()
+            .await
+            .expect("health");
+        assert_eq!(health.status(), StatusCode::OK);
+
+        runtime.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn maps_response_inputs_to_chat_messages() {
         let messages = response_input_to_messages(Some(&json!([
