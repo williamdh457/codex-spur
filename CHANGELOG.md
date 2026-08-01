@@ -4,6 +4,20 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **ChatGPT Official / API Key 对齐 CC Switch Responses 工具标准**: `kind=openai`（Official OAuth / 多账号 JSON 订阅 / API Key，入口无关）统一 **Responses** 车道、**不 port** Codex-native tools、catalog `apply_patch_tool_type=freeform`、**`supports_parallel_tool_calls=true`**（官方 `models_cache` / Nice Switch GPT 行）。function_call / custom_tool_call 历史原样保留。其余供应商仍按 CCS：ProxyChat freeform；NativeResponses（xAI / custom Responses）剥 freeform。
+- **会话策略驱动 OpenAI 全量工具广告**: **不中途换模型** 时，ChatGPT Official-class catalog 额外广告 `web_search_tool_type=text_and_image`、`supports_search_tool`、`tool_mode=code_mode_only`（贴近 CC Switch Official/API Key）。**允许中途换** 时保持多厂安全广告（无 web_search / code_mode）。切换策略会 rebuild catalog；需 Review & Apply 写入 Desktop。
+- **OpenAI 中转站 = Official 档**: 自定义供应商若推理模板为 **`openai_native`（OpenAI Codex 原生）** 或 **`openai_compat`（OpenAI 兼容）**（如橙子便宜），catalog + 代理按 ChatGPT Official 处理：freeform / parallel / sticky 全量工具；代理 **不 port** Codex-native tools（与 `kind=openai` 相同）。其它模板的 custom Responses 仍走 CCS NativeResponses。
+
+### Features
+
+- **反代中转站（Codex Tools / Sub2API 式）**: 侧栏独立「反代」页；Client Key 分 **Response** / **Completion**。
+  - Response Key：`POST /v1/responses` 原样透传；`POST /v1/chat/completions` 转 Responses 上游，**回包再转 Chat**（含 stream）。
+  - Completion Key：仅 `/v1/chat/completions` 纯透传，仅 Completions 上游；拒 `/responses`。
+- **统一模型 id：`模型.供应商`**: Codex catalog slug 与反代 `/v1/models` 同一约定（如 `deepseek-chat.deepseek`、`gpt-5.6-sol.官方订阅`）；旧 `spur-route-*` / 裸 `gpt-5.6-*` dual-key 兼容。
+- **模型页**: Codex / 反代用途分 tab 勾选；反代服务与 Key 管理挪到侧栏「反代」。
+
 ## [0.1.13] - 2026-08-01
 
 ### Features

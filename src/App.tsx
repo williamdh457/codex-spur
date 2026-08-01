@@ -45,16 +45,6 @@ import {
   setDiagnosticsMaxEvents,
   setModelEnabled,
   setModelRelayEnabled,
-  getApiRelayStatus,
-  startApiRelay,
-  stopApiRelay,
-  setApiRelaySettings,
-  listRelayApiKeys,
-  createRelayApiKey,
-  updateRelayApiKey,
-  regenerateRelayApiKey,
-  deleteRelayApiKey,
-  revealDefaultRelayApiKey,
   setProviderReasoningProfile,
   setProviderProtocol,
   setProviderRouting,
@@ -70,7 +60,6 @@ import type {
   OpenAiOAuthFinishedEvent,
 } from "./api";
 import type {
-  ApiRelayStatus,
   AppSnapshot,
   ConversationPolicy,
   CredentialSummary,
@@ -84,14 +73,15 @@ import type {
   ProxyRequestEvent,
   QuotaWindow,
   ReasoningProfileOption,
-  RelayApiKeySummary,
   StatusTone,
 } from "./types";
+import { RelayPage } from "./RelayPage";
 import { UsagePage } from "./usage";
 
 const NAVIGATION: Array<{ id: NavigationSection; label: string; icon: string }> = [
   { id: "overview", label: "概览", icon: "◫" },
   { id: "models", label: "模型", icon: "◇" },
+  { id: "relay", label: "反代", icon: "⇄" },
   { id: "usage", label: "用量", icon: "▥" },
   { id: "diagnostics", label: "诊断", icon: "⌁" },
   { id: "settings", label: "设置", icon: "⚙" },
@@ -174,10 +164,10 @@ function Overview({
             <strong>会话策略</strong>
             <span>
               {allowSwitch
-                ? "同线程可换厂 · 可移植压缩"
+                ? "同线程可换厂 · 可移植压缩 · 多厂安全工具"
                 : policy.openaiCloudCompact
-                  ? "固定同厂 · 云端压缩"
-                  : "固定同厂 · 本地压缩"}
+                  ? "固定同厂 · 云端压缩 · OpenAI 全量工具"
+                  : "固定同厂 · 本地压缩 · OpenAI 全量工具"}
             </span>
           </div>
           <div className="policy-bar__switch" role="radiogroup" aria-label="中途换模型">
@@ -2552,26 +2542,33 @@ function ReasoningTable({ route }: { route: ModelRouteSummary }) {
   );
 }
 
-/** Models list title: `{供应商名}.{模型名}` (falls back to providerId if name empty). */
+/** Models list title: `模型.供应商` (same convention as catalog / relay ids). */
 function modelListLabel(route: ModelRouteSummary): string {
-  const provider = route.providerName.trim() || route.providerId;
-  return `${provider}.${route.displayName}`;
+  const model = (route.upstreamModel || route.displayName || route.id).trim();
+  const provider = (route.providerName || route.providerId).trim();
+  return `${model}.${provider}`;
 }
 
 function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> }) {
   const [routes, setRoutes] = useState<ModelRouteSummary[]>([]);
+  /** Which side is focused (highlight); both tables stay mounted. */
+  const [focus, setFocus] = useState<"codex" | "relay">("codex");
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [busyKind, setBusyKind] = useState<"codex" | "relay" | null>(null);
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
 
   const reload = useCallback(async () => setRoutes(await listModelRoutes()), []);
   useEffect(() => {
     let active = true;
-    void listModelRoutes().then((value) => { if (active) setRoutes(value); });
-    return () => { active = false; };
+    void listModelRoutes().then((value) => {
+      if (active) setRoutes(value);
+    });
+    return () => {
+      active = false;
+    };
   }, []);
+
   const filtered = routes.filter((route) =>
     `${modelListLabel(route)} ${route.upstreamModel} ${route.providerName} ${route.providerId}`
       .toLowerCase()
@@ -2579,17 +2576,13 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
   );
   const codexCount = routes.filter((route) => route.enabled).length;
   const relayCount = routes.filter((route) => route.relayEnabled).length;
-  const relayModelIds = useMemo(
-    () => routes.filter((route) => route.relayEnabled).map((route) => route.id),
-    [routes],
-  );
 
   const toggleCodex = async (route: ModelRouteSummary) => {
     if (busyId) return;
     const nextEnabled = !route.enabled;
     setBusyId(route.id);
-    setBusyKind("codex");
     setNotice(null);
+    setFocus("codex");
     setRoutes((current) =>
       current.map((item) => (item.id === route.id ? { ...item, enabled: nextEnabled } : item)),
     );
@@ -2614,7 +2607,6 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
       });
     } finally {
       setBusyId(null);
-      setBusyKind(null);
     }
   };
 
@@ -2622,8 +2614,8 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
     if (busyId) return;
     const nextEnabled = !route.relayEnabled;
     setBusyId(route.id);
-    setBusyKind("relay");
     setNotice(null);
+    setFocus("relay");
     setRoutes((current) =>
       current.map((item) =>
         item.id === route.id ? { ...item, relayEnabled: nextEnabled } : item,
@@ -2634,8 +2626,8 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
       setNotice({
         tone: "ok",
         text: nextEnabled
-          ? "已开启 API 反代。启动下方「API 反代」服务后，第三方可用 Base URL + API Key 调用 Responses。"
-          : "已关闭该模型的 API 反代。",
+          ? "已开启反代外放。启动服务与 API Key 请到侧栏「反代」页。"
+          : "已关闭该模型的反代外放。",
       });
     } catch (caught) {
       try {
@@ -2653,472 +2645,226 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
       });
     } finally {
       setBusyId(null);
-      setBusyKind(null);
     }
   };
 
   return (
     <div className="page-stack">
-      <ApiRelayPanel availableModelIds={relayModelIds} routes={routes} />
+      <section className="panel">
+        <div className="model-scope" role="group" aria-label="模型用途">
+          <button
+            type="button"
+            id="model-scope-codex"
+            aria-pressed={focus === "codex"}
+            className={`model-scope__btn${focus === "codex" ? " model-scope__btn--active" : ""}`}
+            onClick={() => {
+              setFocus("codex");
+              setNotice(null);
+            }}
+          >
+            <strong>Codex</strong>
+            <span>发布到官方选择器</span>
+            <span className="model-scope__count">已选 {codexCount}</span>
+          </button>
+          <button
+            type="button"
+            id="model-scope-relay"
+            aria-pressed={focus === "relay"}
+            className={`model-scope__btn${focus === "relay" ? " model-scope__btn--active" : ""}`}
+            onClick={() => {
+              setFocus("relay");
+              setExpanded(null);
+              setNotice(null);
+            }}
+          >
+            <strong>反代</strong>
+            <span>勾选外放模型</span>
+            <span className="model-scope__count">已选 {relayCount}</span>
+          </button>
+        </div>
+        <p className="caption model-scope__hint">
+          左侧表控制 Codex 发布，右侧表控制反代库存。两套开关互不共用。启动反代与 API Key 在侧栏「反代」。
+        </p>
+      </section>
+
       <section className="panel toolbar-panel">
-        <div className="search-field"><span aria-hidden="true">⌕</span><input aria-label="搜索模型" placeholder="搜索模型或供应商" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
+        <div className="search-field">
+          <span aria-hidden="true">⌕</span>
+          <input
+            aria-label="搜索模型"
+            placeholder="搜索模型或供应商（同时过滤两表）"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </div>
         <span className="toolbar-note">
           Codex {codexCount} · 反代 {relayCount} / 共 {routes.length}
         </span>
-        <button type="button" className="button button--secondary" onClick={() => void reload()}>刷新列表</button>
+        <button type="button" className="button button--secondary" onClick={() => void reload()}>
+          刷新列表
+        </button>
       </section>
+
       {notice ? (
         <div className={notice.tone === "ok" ? "inline-success" : "inline-warning"} role="status">
           {busyId ? "正在更新模型选择…" : notice.text}
         </div>
       ) : busyId ? (
-        <div className="inline-success" role="status">正在更新模型选择…</div>
+        <div className="inline-success" role="status">
+          正在更新模型选择…
+        </div>
       ) : null}
-      <section className="panel">
-        {filtered.length === 0 ? (
-          <EmptyState title="还没有模型" body="先在概览添加供应商并保存拉取模型，再回来选择要发布到 Codex 或反代出去的项。" action="等待添加供应商" />
-        ) : (
-          <div className="model-list">
-            <div className="model-list__legend" aria-hidden="true">
-              <span>Codex</span>
-              <span>反代</span>
-              <span>模型</span>
-            </div>
-            {filtered.map((route) => {
-              const busy = busyId === route.id;
-              const active = route.enabled || route.relayEnabled;
-              return (
-                <div className={`model-item ${active ? "model-item--enabled" : ""}`} key={route.id}>
-                  <div className="model-row model-row--dual">
-                    <div className="model-row__toggles">
-                      <button
-                        type="button"
-                        className={`switch${route.enabled ? " switch--on" : ""}`}
-                        role="switch"
-                        aria-checked={route.enabled}
-                        aria-label={`${route.enabled ? "取消 Codex 发布" : "发布到 Codex"} ${modelListLabel(route)}`}
-                        title="发布到 Codex"
-                        disabled={busyId !== null}
-                        onClick={() => void toggleCodex(route)}
-                      >
-                        <span className="switch__track" aria-hidden="true" />
-                      </button>
-                      <button
-                        type="button"
-                        className={`switch${route.relayEnabled ? " switch--on" : ""}`}
-                        role="switch"
-                        aria-checked={route.relayEnabled}
-                        aria-label={`${route.relayEnabled ? "关闭反代" : "开启反代"} ${modelListLabel(route)}`}
-                        title="API 反代"
-                        disabled={busyId !== null}
-                        onClick={() => void toggleRelay(route)}
-                      >
-                        <span className="switch__track" aria-hidden="true" />
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      className="model-row__select"
-                      disabled={busyId !== null}
-                      onClick={() => void toggleCodex(route)}
-                    >
-                      <span className="data-row__main">
-                        <strong>{modelListLabel(route)}</strong>
-                        <small>
-                          <code>{route.id}</code> · {route.protocol}
-                          {busy ? ` · 更新中（${busyKind === "relay" ? "反代" : "Codex"}）…` : ""}
-                        </small>
-                      </span>
-                    </button>
-                    <span className="badge badge--neutral">{route.providerName.trim() || route.providerId}</span>
-                    <button
-                      type="button"
-                      className="button button--ghost"
-                      aria-expanded={expanded === route.id}
-                      onClick={() => setExpanded(expanded === route.id ? null : route.id)}
-                    >
-                      推理映射
-                    </button>
-                  </div>
-                  {expanded === route.id && <ReasoningTable route={route} />}
+
+      {routes.length === 0 ? (
+        <section className="panel">
+          <EmptyState
+            title="还没有模型"
+            body="先在概览添加供应商并保存拉取模型，再回来分别勾选 Codex 发布与反代外放。"
+            action="等待添加供应商"
+          />
+        </section>
+      ) : (
+        <div className="model-tables">
+          {/* Codex table — independent list */}
+          <section
+            className={`panel model-table-panel${focus === "codex" ? " model-table-panel--focus" : ""}`}
+            aria-labelledby="model-scope-codex"
+          >
+            <header className="model-table-panel__header">
+              <h2>Codex</h2>
+              <p>勾选后点「Review & Apply」写入官方选择器。</p>
+            </header>
+            {filtered.length === 0 ? (
+              <p className="caption model-table-panel__empty">没有匹配的模型。</p>
+            ) : (
+              <div className="model-list" role="table" aria-label="Codex 模型表">
+                <div className="model-list__legend" aria-hidden="true">
+                  <span>发布</span>
+                  <span>模型</span>
                 </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function ApiRelayPanel({
-  availableModelIds,
-  routes,
-}: {
-  availableModelIds: string[];
-  routes: ModelRouteSummary[];
-}) {
-  const [status, setStatus] = useState<ApiRelayStatus | null>(null);
-  const [keys, setKeys] = useState<RelayApiKeySummary[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
-  const [newLabel, setNewLabel] = useState("");
-  const [editingKeyId, setEditingKeyId] = useState<string | null>(null);
-  const [portDraft, setPortDraft] = useState("17862");
-
-  const reload = useCallback(async () => {
-    const [nextStatus, nextKeys] = await Promise.all([getApiRelayStatus(), listRelayApiKeys()]);
-    setStatus(nextStatus);
-    setKeys(nextKeys);
-    setPortDraft(String(nextStatus.port));
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      try {
-        const [nextStatus, nextKeys, defaultSecret] = await Promise.all([
-          getApiRelayStatus(),
-          listRelayApiKeys(),
-          revealDefaultRelayApiKey(),
-        ]);
-        if (!active) return;
-        setStatus(nextStatus);
-        setKeys(nextKeys);
-        setPortDraft(String(nextStatus.port));
-        if (defaultSecret) setRevealedSecret(defaultSecret);
-      } catch (caught) {
-        if (active) {
-          setMessage(caught instanceof Error ? caught.message : String(caught));
-        }
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  const copyText = async (label: string, value: string) => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setMessage(`已复制 ${label}`);
-    } catch {
-      setMessage(`无法复制 ${label}，请手动选择。`);
-    }
-  };
-
-  const run = async (action: () => Promise<void>) => {
-    setBusy(true);
-    setMessage(null);
-    try {
-      await action();
-      await reload();
-    } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const routeLabel = (id: string) => {
-    const route = routes.find((item) => item.id === id);
-    return route ? modelListLabel(route) : id;
-  };
-
-  return (
-    <section className="panel">
-      <div className="panel__header">
-        <div>
-          <h2>API 反代</h2>
-          <p>
-            纯中转站：把下方勾选「反代」的模型以 OpenAI <strong>Responses</strong> 格式外放。
-            给第三方 Base URL + API Key 即可；不改 Codex 配置。DeepSeek / OpenAI / Grok 走现有转发核。
-          </p>
-        </div>
-        <StatusDot tone={status?.running ? "healthy" : "muted"} />
-      </div>
-
-      <dl className="diagnostic-grid">
-        <div>
-          <dt>状态</dt>
-          <dd>{status?.running ? "运行中" : "已停止"}</dd>
-        </div>
-        <div>
-          <dt>Local Base URL</dt>
-          <dd>
-            <code className="mono-copy">{status?.baseUrl ?? "—"}</code>
-            {status?.baseUrl ? (
-              <button
-                type="button"
-                className="button button--ghost"
-                disabled={busy}
-                onClick={() => void copyText("Base URL", status.baseUrl!)}
-              >
-                复制
-              </button>
-            ) : null}
-          </dd>
-        </div>
-        {status?.lanBaseUrl ? (
-          <div>
-            <dt>LAN Base URL</dt>
-            <dd>
-              <code className="mono-copy">{status.lanBaseUrl}</code>
-              <button
-                type="button"
-                className="button button--ghost"
-                disabled={busy}
-                onClick={() => void copyText("LAN Base URL", status.lanBaseUrl!)}
-              >
-                复制
-              </button>
-            </dd>
-          </div>
-        ) : null}
-        <div>
-          <dt>反代模型</dt>
-          <dd>{status?.relayModelCount ?? 0}</dd>
-        </div>
-        <div>
-          <dt>Client Keys</dt>
-          <dd>{status?.keyCount ?? 0}</dd>
-        </div>
-      </dl>
-
-      <div className="form-actions form-actions--wrap" style={{ marginTop: 12 }}>
-        {status?.running ? (
-          <button
-            type="button"
-            className="button button--secondary"
-            disabled={busy}
-            onClick={() => void run(async () => { await stopApiRelay(); setMessage("API 反代已停止"); })}
-          >
-            停止反代
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="button button--primary"
-            disabled={busy}
-            onClick={() => void run(async () => { await startApiRelay(); setMessage("API 反代已启动"); })}
-          >
-            启动反代
-          </button>
-        )}
-        <label className="inline-field">
-          端口
-          <input
-            className="input input--narrow"
-            inputMode="numeric"
-            value={portDraft}
-            disabled={busy}
-            onChange={(event) => setPortDraft(event.target.value)}
-            onBlur={() => {
-              const port = Number(portDraft);
-              if (!Number.isFinite(port) || port < 1 || port > 65535) return;
-              if (status && port === status.port) return;
-              void run(async () => {
-                await setApiRelaySettings({ port });
-                setMessage(`端口已设为 ${port}`);
-              });
-            }}
-          />
-        </label>
-        <label className="inline-field">
-          <input
-            type="checkbox"
-            checked={Boolean(status?.bindLan)}
-            disabled={busy}
-            onChange={(event) => {
-              const bindLan = event.target.checked;
-              void run(async () => {
-                await setApiRelaySettings({ bindLan });
-                setMessage(
-                  bindLan
-                    ? "已允许局域网访问（持 Key 的设备可调用，请谨慎）"
-                    : "已仅绑定本机 127.0.0.1",
-                );
-              });
-            }}
-          />
-          允许局域网
-        </label>
-      </div>
-      {status?.bindLan ? (
-        <div className="inline-warning" role="status" style={{ marginTop: 8 }}>
-          局域网模式下，同一网段内持有 API Key 的设备均可调用。仅在可信网络开启。
-        </div>
-      ) : null}
-
-      {revealedSecret ? (
-        <div className="inline-success" role="status" style={{ marginTop: 10 }}>
-          <div>Default API Key（请立即复制；重新生成后此值失效）</div>
-          <code className="mono-copy">{revealedSecret}</code>
-          <button
-            type="button"
-            className="button button--ghost"
-            onClick={() => void copyText("API Key", revealedSecret)}
-          >
-            复制 Key
-          </button>
-        </div>
-      ) : null}
-
-      <div className="panel__subheader" style={{ marginTop: 16 }}>
-        <h3>Client Keys</h3>
-        <p>多把 Key；每把可限制允许的模型（空 = 全部已开反代的模型）。</p>
-      </div>
-      <div className="form-actions form-actions--wrap">
-        <input
-          className="input"
-          placeholder="新 Key 名称（可选）"
-          value={newLabel}
-          disabled={busy}
-          onChange={(event) => setNewLabel(event.target.value)}
-        />
-        <button
-          type="button"
-          className="button button--secondary"
-          disabled={busy}
-          onClick={() =>
-            void run(async () => {
-              const created = await createRelayApiKey({
-                label: newLabel.trim() || undefined,
-              });
-              setRevealedSecret(created.secret);
-              setNewLabel("");
-              setMessage(`已创建 Key「${created.key.label}」`);
-            })
-          }
-        >
-          新建 Key
-        </button>
-      </div>
-
-      <div className="model-list" style={{ marginTop: 10 }}>
-        {keys.length === 0 ? (
-          <EmptyState title="还没有 Client Key" body="点击「新建 Key」生成，或使用首次安装的 Default。" action="等待创建" />
-        ) : (
-          keys.map((key) => (
-            <div className="model-item" key={key.id}>
-              <div className="model-row">
-                <button
-                  type="button"
-                  className={`switch${key.enabled ? " switch--on" : ""}`}
-                  role="switch"
-                  aria-checked={key.enabled}
-                  disabled={busy}
-                  onClick={() =>
-                    void run(async () => {
-                      await updateRelayApiKey({ id: key.id, enabled: !key.enabled });
-                    })
-                  }
-                >
-                  <span className="switch__track" aria-hidden="true" />
-                </button>
-                <span className="data-row__main">
-                  <strong>{key.label}</strong>
-                  <small>
-                    <code>{key.keyPrefix}</code>
-                    {key.allowedModels.length === 0
-                      ? " · 全部反代模型"
-                      : ` · 白名单 ${key.allowedModels.length} 个`}
-                    {key.lastUsedAt ? ` · 最近 ${key.lastUsedAt}` : ""}
-                  </small>
-                </span>
-                <button
-                  type="button"
-                  className="button button--ghost"
-                  disabled={busy}
-                  onClick={() => setEditingKeyId(editingKeyId === key.id ? null : key.id)}
-                >
-                  模型白名单
-                </button>
-                <button
-                  type="button"
-                  className="button button--ghost"
-                  disabled={busy}
-                  onClick={() =>
-                    void run(async () => {
-                      const created = await regenerateRelayApiKey(key.id);
-                      setRevealedSecret(created.secret);
-                      setMessage(`已重新生成「${key.label}」`);
-                    })
-                  }
-                >
-                  重新生成
-                </button>
-                <button
-                  type="button"
-                  className="button button--ghost"
-                  disabled={busy}
-                  onClick={() =>
-                    void run(async () => {
-                      await deleteRelayApiKey(key.id);
-                      setMessage(`已删除「${key.label}」`);
-                    })
-                  }
-                >
-                  删除
-                </button>
+                {filtered.map((route) => {
+                  const busy = busyId === route.id;
+                  const selected = route.enabled;
+                  return (
+                    <div
+                      className={`model-item ${selected ? "model-item--enabled" : ""}`}
+                      key={`codex-${route.id}`}
+                    >
+                      <div className="model-row">
+                        <button
+                          type="button"
+                          className={`switch${selected ? " switch--on" : ""}`}
+                          role="switch"
+                          aria-checked={selected}
+                          aria-label={`${selected ? "取消 Codex 发布" : "发布到 Codex"} ${modelListLabel(route)}`}
+                          title="发布到 Codex"
+                          disabled={busyId !== null}
+                          onClick={() => void toggleCodex(route)}
+                        >
+                          <span className="switch__track" aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          className="model-row__select"
+                          disabled={busyId !== null}
+                          onClick={() => void toggleCodex(route)}
+                        >
+                          <span className="data-row__main">
+                            <strong>{modelListLabel(route)}</strong>
+                            <small>
+                              <code>{route.id}</code> · {route.protocol}
+                              {busy ? " · 更新中…" : ""}
+                            </small>
+                          </span>
+                        </button>
+                        <span className="badge badge--neutral">
+                          {route.providerName.trim() || route.providerId}
+                        </span>
+                        <button
+                          type="button"
+                          className="button button--ghost"
+                          aria-expanded={expanded === route.id}
+                          onClick={() => setExpanded(expanded === route.id ? null : route.id)}
+                        >
+                          推理映射
+                        </button>
+                      </div>
+                      {expanded === route.id ? <ReasoningTable route={route} /> : null}
+                    </div>
+                  );
+                })}
               </div>
-              {editingKeyId === key.id ? (
-                <div className="relay-allowlist">
-                  <p className="caption">
-                    不勾选任何项 = 允许全部已开反代的模型。勾选后仅这些 slug 可用。
-                  </p>
-                  {availableModelIds.length === 0 ? (
-                    <p className="caption">请先在下方打开至少一个模型的「反代」开关。</p>
-                  ) : (
-                    <div className="relay-allowlist__grid">
-                      {availableModelIds.map((modelId) => {
-                        const checked = key.allowedModels.includes(modelId);
-                        return (
-                          <label key={modelId} className="relay-allowlist__item">
-                            <input
-                              type="checkbox"
-                              checked={checked}
-                              disabled={busy}
-                              onChange={() => {
-                                const next = checked
-                                  ? key.allowedModels.filter((item) => item !== modelId)
-                                  : [...key.allowedModels, modelId];
-                                void run(async () => {
-                                  await updateRelayApiKey({ id: key.id, allowedModels: next });
-                                });
-                              }}
-                            />
-                            <span>
-                              {routeLabel(modelId)}
-                              <small>
-                                <code>{modelId}</code>
-                              </small>
-                            </span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  )}
+            )}
+          </section>
+
+          {/* Relay table — independent list */}
+          <section
+            className={`panel model-table-panel${focus === "relay" ? " model-table-panel--focus" : ""}`}
+            aria-labelledby="model-scope-relay"
+          >
+            <header className="model-table-panel__header">
+              <h2>反代</h2>
+              <p>勾选进入反代库存。启停与 Key 在侧栏「反代」。</p>
+            </header>
+            {filtered.length === 0 ? (
+              <p className="caption model-table-panel__empty">没有匹配的模型。</p>
+            ) : (
+              <div className="model-list" role="table" aria-label="反代模型表">
+                <div className="model-list__legend" aria-hidden="true">
+                  <span>外放</span>
+                  <span>模型</span>
                 </div>
-              ) : null}
-            </div>
-          ))
-        )}
-      </div>
-
-      {message ? (
-        <div className="inline-success" role="status" style={{ marginTop: 10 }}>
-          {message}
+                {filtered.map((route) => {
+                  const busy = busyId === route.id;
+                  const selected = route.relayEnabled;
+                  return (
+                    <div
+                      className={`model-item ${selected ? "model-item--enabled" : ""}`}
+                      key={`relay-${route.id}`}
+                    >
+                      <div className="model-row">
+                        <button
+                          type="button"
+                          className={`switch${selected ? " switch--on" : ""}`}
+                          role="switch"
+                          aria-checked={selected}
+                          aria-label={`${selected ? "关闭反代" : "开启反代"} ${modelListLabel(route)}`}
+                          title="API 反代外放"
+                          disabled={busyId !== null}
+                          onClick={() => void toggleRelay(route)}
+                        >
+                          <span className="switch__track" aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          className="model-row__select"
+                          disabled={busyId !== null}
+                          onClick={() => void toggleRelay(route)}
+                        >
+                          <span className="data-row__main">
+                            <strong>{modelListLabel(route)}</strong>
+                            <small>
+                              <code>{route.id}</code> · {route.protocol}
+                              {busy ? " · 更新中…" : ""}
+                            </small>
+                          </span>
+                        </button>
+                        <span className="badge badge--neutral">
+                          {route.providerName.trim() || route.providerId}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <p className="caption model-table-panel__footer">
+              模型 id 为 模型.供应商。服务与 Client Key 请到侧栏「反代」。
+            </p>
+          </section>
         </div>
-      ) : null}
-
-      <p className="caption" style={{ marginTop: 12 }}>
-        接入示例：<code>POST {"{base}"}/responses</code>，Header{" "}
-        <code>Authorization: Bearer sk-spur-…</code>，body{" "}
-        <code>{`{"model":"<slug>","input":"hi","stream":true}`}</code>。仅 Responses，无 Chat Completions。
-      </p>
-    </section>
+      )}
+    </div>
   );
 }
 
@@ -4563,12 +4309,18 @@ export default function App() {
         if (saved.openaiCloudCompact) {
           pushToast(
             "warning",
-            "已开云端压缩：请 Review & Apply 写入 name=OpenAI；中途换厂请新开线程。",
+            "已开云端压缩 + OpenAI 全量工具广告：请 Review & Apply 写入 name=OpenAI；中途换厂请新开线程。",
           );
         } else if (saved.midThread === "allowSwitch") {
-          pushToast("success", "已允许中途换模型（可移植压缩）。改完后若曾开云端压缩请再 Apply。");
+          pushToast(
+            "success",
+            "已允许中途换模型（可移植压缩 · 多厂安全工具广告）。请 Review & Apply 使 catalog 生效。",
+          );
         } else {
-          pushToast("success", "已切换为不中途换模型。可选开云端压缩后 Apply。");
+          pushToast(
+            "success",
+            "已切换为不中途换：OpenAI 将广告 web_search / tool_mode（贴近官方）。请 Review & Apply。",
+          );
         }
       } catch (error) {
         pushToast("error", error instanceof Error ? error.message : String(error));
@@ -4733,6 +4485,7 @@ export default function App() {
             />
           )}
           {section === "models" && <ModelsPage refreshSnapshot={refresh} />}
+          {section === "relay" && <RelayPage />}
           {section === "usage" && <UsagePage />}
           {section === "diagnostics" && <DiagnosticsPage snapshot={snapshot} />}
           {section === "settings" && <SettingsPage providers={snapshot.providers} />}

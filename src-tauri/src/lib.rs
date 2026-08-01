@@ -87,8 +87,13 @@ impl AppState {
             }
         }
         let stored_routes = storage.list_proxy_routes().await?;
+        let conversation_policy = storage
+            .get_conversation_policy()
+            .await
+            .unwrap_or_default()
+            .sanitized();
         let (catalog_value, relay_catalog_value, route_values) =
-            catalog::build_from_routes(&stored_routes)?;
+            catalog::build_from_routes_with_policy(&stored_routes, &conversation_policy)?;
         let catalog = Arc::new(RwLock::new(catalog_value));
         let relay_catalog = Arc::new(RwLock::new(relay_catalog_value));
         let routes = Arc::new(RwLock::new(route_values));
@@ -119,7 +124,7 @@ impl AppState {
                     &proxy::relay_key_prefix(&secret),
                     &proxy::relay_key_hash(&secret),
                     "responses",
-                    "flat",
+                    "dotted",
                     &[],
                     &[],
                 )
@@ -200,8 +205,15 @@ impl AppState {
             .list_proxy_routes()
             .await
             .map_err(|error| error.to_string())?;
+        let conversation_policy = self
+            .storage
+            .get_conversation_policy()
+            .await
+            .map(|p| p.sanitized())
+            .unwrap_or_default();
         let (catalog_value, relay_catalog_value, route_values) =
-            catalog::build_from_routes(&stored_routes).map_err(|error| error.to_string())?;
+            catalog::build_from_routes_with_policy(&stored_routes, &conversation_policy)
+                .map_err(|error| error.to_string())?;
         let published_models = catalog_value.models.len() as u32;
         let providers = self
             .storage
@@ -670,6 +682,11 @@ async fn set_conversation_policy(
         .set_conversation_policy(&policy)
         .await
         .map_err(|error| error.to_string())?;
+    // Rebuild in-memory catalog so tool ads (web_search / tool_mode on OpenAI)
+    // match sticky vs allow-switch before the next Review & Apply.
+    if let Err(err) = state.rebuild_runtime().await {
+        tracing::warn!(%err, "rebuild_runtime after set_conversation_policy failed");
+    }
     {
         let mut snapshot = state.snapshot.write().await;
         snapshot.conversation_policy = saved.clone();
@@ -2548,7 +2565,8 @@ async fn create_relay_api_key(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Client key".into());
     let wire = wire_type.unwrap_or_else(|| "responses".into());
-    let style = name_style.unwrap_or_else(|| "flat".into());
+    // Product default: always 加点 (模型.供应商). Flat is legacy-only.
+    let style = name_style.unwrap_or_else(|| "dotted".into());
     let providers = allowed_providers.unwrap_or_default();
     let models = allowed_models.unwrap_or_default();
     let stored = state

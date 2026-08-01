@@ -159,10 +159,13 @@ pub fn deepseek_route_uses_chat_completions(_protocol: &str, upstream_model: &st
 /// Codex Desktop always hits Spur with **Responses**. The lane only picks the
 /// upstream dialect + which reference we follow:
 ///
-/// 1. [`OpenAiOfficial`] — OpenAI / ChatGPT Codex backend (OpenAI product path).
+/// 1. [`OpenAiOfficial`] — ChatGPT / OpenAI product **Responses** path for
+///    `kind=openai` only (Official OAuth / multi-account JSON / API Key — same
+///    CC Switch ChatGPT Official/API Key standard; entry method does not split).
 /// 2. [`ResponsesNative`] — pure Responses hosts. Protocol is `/responses`
-///    passthrough. **DeepSeek Flash** keeps freeform apply_patch (official Codex
-///    script). **xAI/Grok** and similar CCS-style natives strip freeform (shell).
+///    passthrough. **DeepSeek V4 Flash/Pro** keeps freeform (official DS Codex
+///    script). **xAI/Grok** and **custom Responses** strip freeform (CCS
+///    NativeResponses shell path).
 /// 3. [`ChatCompletionsBridge`] — CC Switch `openai_chat` / **ProxyChat**: rewrite
 ///    Responses↔Chat Completions for Kimi / MiniMax / OpenCode Go / most custom
 ///    OpenAI-compatible gateways; catalog **keeps** freeform `apply_patch`.
@@ -884,15 +887,38 @@ pub fn advertise_apply_patch_tool() -> bool {
     )
 }
 
-/// Freeform `apply_patch` catalog ad policy (Desktop injects the client tool).
+/// True when the instance should get **ChatGPT Official / API Key** catalog + tool
+/// treatment (freeform apply_patch, parallel FC, sticky full-fidelity ads).
 ///
-/// - **OpenAI Official** (`kind=openai`, any entry: OAuth / API Key / JSON):
-///   always freeform — CCS ChatGPT Official parity.
-/// - **Chat Completions bridge** (Kimi / MiniMax / …): freeform (CCS ProxyChat).
-/// - **DeepSeek V4 Flash/Pro** (Responses native): freeform — **DeepSeek official
-///   Codex script** (`apply_patch_tool_type: freeform`), not CCS NativeResponses strip.
-/// - **Other Responses-native** (e.g. xAI/Grok): strip freeform (CCS NativeResponses
-///   / shell_command edits) — unchanged outside OpenAI+DeepSeek scope.
+/// Includes:
+/// - `kind=openai` (Official OAuth / JSON subscription / API Key — any entry);
+/// - **custom (or other) instances** whose user-selected reasoning template is
+///   `openai_native` (OpenAI Codex 原生) or `openai_compat` (OpenAI 兼容) —
+///   these are OpenAI mid-stations (e.g. 橙子便宜), not CCS NativeResponses.
+pub fn treats_as_chatgpt_official(kind: &str, reasoning_profile_id: Option<&str>) -> bool {
+    if kind.eq_ignore_ascii_case("openai") {
+        return true;
+    }
+    matches!(
+        crate::reasoning_map::ReasoningProfileId::parse(reasoning_profile_id.unwrap_or("")),
+        Some(
+            crate::reasoning_map::ReasoningProfileId::OpenaiNative
+                | crate::reasoning_map::ReasoningProfileId::OpenaiCompat
+        )
+    )
+}
+
+/// Freeform `apply_patch` catalog ad policy (Desktop injects the **client** tool).
+///
+/// Aligns with **CC Switch catalog profiles** + official OpenAI `models_cache`.
+///
+/// | Profile | freeform |
+/// |---|---|
+/// | **ChatGPT Official+API Key** (`kind=openai`) | yes |
+/// | **OpenAI mid-station** (reasoning `openai_native` / `openai_compat`) | yes |
+/// | **ProxyChat** (Kimi / MiniMax / custom Chat without OpenAI profile) | yes |
+/// | **DeepSeek V4 Responses** | yes |
+/// | **NativeResponses** (xAI; custom Responses **without** OpenAI profile) | no |
 ///
 /// Kill switch [`advertise_apply_patch_tool`] forces false for every profile.
 pub fn catalog_advertises_freeform_apply_patch(
@@ -900,21 +926,31 @@ pub fn catalog_advertises_freeform_apply_patch(
     protocol: &str,
     upstream_model: &str,
 ) -> bool {
+    catalog_advertises_freeform_apply_patch_with_profile(kind, protocol, upstream_model, None)
+}
+
+/// Same as [`catalog_advertises_freeform_apply_patch`], with reasoning template.
+pub fn catalog_advertises_freeform_apply_patch_with_profile(
+    kind: &str,
+    protocol: &str,
+    upstream_model: &str,
+    reasoning_profile_id: Option<&str>,
+) -> bool {
     if !advertise_apply_patch_tool() {
         return false;
     }
-    let kind_l = kind.to_ascii_lowercase();
-    // ChatGPT Official family: never strip freeform regardless of entry method.
-    if kind_l == "openai" {
+    // ChatGPT Official / API Key / OpenAI-template mid-stations.
+    if treats_as_chatgpt_official(kind, reasoning_profile_id) {
         return true;
     }
+    let kind_l = kind.to_ascii_lowercase();
     // DeepSeek official Codex Responses path requires freeform apply_patch.
-    if kind_l == "deepseek" && deepseek_model_supports_native_responses(upstream_model) {
+    if kind_l == "deepseek" {
         return true;
     }
     match upstream_protocol_lane(kind, protocol, upstream_model) {
         UpstreamProtocolLane::OpenAiOfficial | UpstreamProtocolLane::ChatCompletionsBridge => true,
-        // Remaining Responses-native (xAI, custom Responses, …): no freeform ad.
+        // CCS NativeResponses without OpenAI template: shell edits.
         UpstreamProtocolLane::ResponsesNative => false,
     }
 }
@@ -924,9 +960,8 @@ pub fn catalog_advertises_freeform_apply_patch_for_kind(kind: &str) -> bool {
     let protocol = kind_meta(kind)
         .map(|(_, _, protocol, _)| protocol)
         .unwrap_or("Chat Completions");
-    // DeepSeek default protocol is Responses; lane still depends on model id —
-    // without a model id, prefer native (Flash) path so we do not re-introduce
-    // freeform on Grok/DeepSeek-style rows during partial heals.
+    // DeepSeek default protocol is Responses; without a model id prefer Flash
+    // so freeform stays on (official DS script). xAI still strips.
     let upstream = match kind.to_ascii_lowercase().as_str() {
         "deepseek" => "deepseek-v4-flash",
         "xai" => "grok-4.5",
@@ -939,10 +974,12 @@ pub fn catalog_advertises_freeform_apply_patch_for_kind(kind: &str) -> bool {
 /// match **CC Switch catalog profiles** + Codex Desktop constraints.
 ///
 /// - `base_instructions` from openai/codex models.json (Sol / Terra / Luna)
-/// - `apply_patch_tool_type`: freeform only for OpenAI + Chat-bridge kinds
-///   (CCS ProxyChat); **omitted** for Responses-native kinds (CCS NativeResponses)
-/// - `shell_type` always `shell_command` (edit path when freeform is stripped)
-/// - `experimental_supported_tools` stays `[]`; web_search stays off until separate A/B
+/// - `apply_patch_tool_type`: CC Switch split — freeform for OpenAI Official +
+///   ProxyChat + DeepSeek; **omitted** for NativeResponses (xAI / custom Responses)
+/// - ChatGPT Official also: `supports_parallel_tool_calls = true` (official
+///   `models_cache` / Nice Switch GPT rows). Do **not** force `tool_mode=code_mode_only`.
+/// - `shell_type` always `shell_command`
+/// - `experimental_supported_tools` stays `[]`; web_search stays off (catalog validator)
 ///
 /// Kill switch: `SPUR_DISABLE_APPLY_PATCH=1` forces no freeform ad on any row.
 ///
@@ -957,17 +994,49 @@ pub fn normalize_catalog_model_for_codex_with_kind(
     priority: i32,
     kind: Option<&str>,
 ) {
-    normalize_catalog_model_for_codex_full(model, priority, kind, None, None);
+    normalize_catalog_model_for_codex_full_with_profile(
+        model, priority, kind, None, None, None, false,
+    );
 }
 
 /// Full heal with protocol + upstream model so DeepSeek Flash vs chat and custom
 /// Responses vs Chat resolve the same freeform policy as the live proxy lane.
+///
+/// `reasoning_profile_id`: user template (`openai_native` / `openai_compat` makes
+/// custom mid-stations eat ChatGPT Official catalog ads).
+///
+/// `openai_full_fidelity`: when true (`ConversationPolicy` 不中途换模型), ChatGPT
+/// Official-class rows get CC Switch Official tools — freeform apply_patch,
+/// parallel FC, `web_search=text_and_image`, `tool_mode=code_mode_only`. When false
+/// (允许中途换), multi-vendor-safe ads only (no web_search / code_mode).
 pub fn normalize_catalog_model_for_codex_full(
     model: &mut CatalogModel,
     priority: i32,
     kind: Option<&str>,
     protocol: Option<&str>,
     upstream_model: Option<&str>,
+    openai_full_fidelity: bool,
+) {
+    normalize_catalog_model_for_codex_full_with_profile(
+        model,
+        priority,
+        kind,
+        protocol,
+        upstream_model,
+        None,
+        openai_full_fidelity,
+    );
+}
+
+/// Full heal with explicit reasoning profile (see [`normalize_catalog_model_for_codex_full`]).
+pub fn normalize_catalog_model_for_codex_full_with_profile(
+    model: &mut CatalogModel,
+    priority: i32,
+    kind: Option<&str>,
+    protocol: Option<&str>,
+    upstream_model: Option<&str>,
+    reasoning_profile_id: Option<&str>,
+    openai_full_fidelity: bool,
 ) {
     model.shell_type = "shell_command".into();
     model.priority = priority;
@@ -1009,18 +1078,16 @@ pub fn normalize_catalog_model_for_codex_full(
     model.supports_reasoning_summaries = true;
 
     let kind_lower = kind.unwrap_or("").to_ascii_lowercase();
-    let looks_openai = kind_lower == "openai"
+    let chatgpt_official = treats_as_chatgpt_official(&kind_lower, reasoning_profile_id);
+    let looks_openai = chatgpt_official
         || model.display_name.to_ascii_lowercase().contains("gpt")
         || model.slug.contains("gpt")
         || is_desktop_native_model_slug(&model.slug);
 
-    // Desktop catalog tool ads — CC Switch profile split:
-    // - OpenAI + Chat Completions bridge (ProxyChat): freeform apply_patch.
-    // - Responses native (Grok / DeepSeek Flash / custom Responses): strip
-    //   freeform; edits go through shell_command (CCS NativeResponses).
-    // - experimental_supported_tools must stay [] (non-empty emptied the picker).
-    // - web_search stays off until a separate A/B.
-    // - Do NOT force tool_mode=code_mode_only.
+    // Desktop catalog tool ads (CC Switch + official models_cache):
+    // - freeform: ChatGPT Official / OpenAI-template mid-stations / ProxyChat / DeepSeek
+    // - parallel + sticky full-fidelity: ChatGPT Official-class only
+    // - 允许中途换: multi-vendor-safe (no web_search / code_mode)
     // Kill switch: SPUR_DISABLE_APPLY_PATCH=1 forces no freeform on every profile.
     let protocol_s = protocol.unwrap_or_else(|| {
         kind_meta(&kind_lower)
@@ -1028,16 +1095,21 @@ pub fn normalize_catalog_model_for_codex_full(
             .unwrap_or("Chat Completions")
     });
     let upstream_s = upstream_model.unwrap_or("");
-    if catalog_advertises_freeform_apply_patch(&kind_lower, protocol_s, upstream_s) {
+    if catalog_advertises_freeform_apply_patch_with_profile(
+        &kind_lower,
+        protocol_s,
+        upstream_s,
+        reasoning_profile_id,
+    ) {
         model.apply_patch_tool_type = Some("freeform".into());
     } else {
         model.apply_patch_tool_type = None;
     }
-    // Always clear forced code_mode so heal rewrites legacy Spur rows that still
-    // carry code_mode_only from earlier catalog publishes.
+    // Default multi-vendor-safe; ChatGPT Official-class sticky re-enables below.
     model.tool_mode = None;
     model.web_search_tool_type = None;
-    model.supports_parallel_tool_calls = false;
+    model.supports_parallel_tool_calls = chatgpt_official;
+    model.supports_search_tool = false;
     model.experimental_supported_tools = Vec::new();
     model.include_skills_usage_instructions = false;
     model.supports_reasoning_summary_parameter = false;
@@ -1054,7 +1126,23 @@ pub fn normalize_catalog_model_for_codex_full(
     model.auto_review_model_override = None;
     model.multi_agent_version = None;
 
-    if looks_openai {
+    if chatgpt_official {
+        // ChatGPT Official / API Key / openai_native|compat mid-station catalog shape.
+        if model.context_window.unwrap_or(0) < 200_000 {
+            model.context_window = Some(272_000);
+            model.max_context_window = Some(272_000);
+            model.auto_compact_token_limit = Some(244_800);
+        }
+        model.input_modalities = vec!["text".into(), "image".into()];
+        model.supports_parallel_tool_calls = true;
+        // 不中途换：全量 Official 工具广告（web_search + code_mode）。
+        if openai_full_fidelity {
+            model.web_search_tool_type = Some("text_and_image".into());
+            model.supports_search_tool = true;
+            model.tool_mode = Some("code_mode_only".into());
+        }
+    } else if looks_openai {
+        // Looks like GPT but not Official-class profile: window/image only.
         if model.context_window.unwrap_or(0) < 200_000 {
             model.context_window = Some(272_000);
             model.max_context_window = Some(272_000);
@@ -1141,27 +1229,124 @@ pub fn is_desktop_native_model_slug(slug: &str) -> bool {
         )
 }
 
-/// Prefer Desktop-native public slug when unique; otherwise fall back to opaque.
+/// Model segment for dotted ids (`gpt-5.6-sol`, `deepseek-chat`). Keeps dots.
+pub fn model_part_for_slug(upstream_model: &str) -> String {
+    if let Some(native) = desktop_native_model_slug(upstream_model) {
+        return native.to_string();
+    }
+    let normalized = upstream_model.trim();
+    let tail = normalized
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(normalized)
+        .trim();
+    if tail.is_empty() {
+        return "model".into();
+    }
+    // Keep `.` so gpt-4.1 stays intact; only rewrite other punctuation.
+    let mut out = String::with_capacity(tail.len());
+    for ch in tail.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-').trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "model".into()
+    } else {
+        trimmed
+    }
+}
+
+/// Provider segment for dotted ids (instance label, then kind, then id).
 ///
-/// Multi-instance OpenAI providers may both expose `gpt-5.6-terra` — only the first
-/// enabled route may claim the public slug; later ones stay opaque so catalog ids
-/// remain unique while the proxy still dual-keys both forms.
+/// ASCII labels use `slugify`. CJK / unicode labels keep letters (e.g. `官方订阅`)
+/// so multi-instance Chinese names stay distinguishable as `模型.官方订阅`.
+pub fn provider_part_for_slug(provider_label: &str, kind: &str, provider_id: &str) -> String {
+    let label = provider_label.trim();
+    if !label.is_empty() {
+        let ascii = slugify(label);
+        if !ascii.is_empty() {
+            return ascii;
+        }
+        let mut out = String::with_capacity(label.len());
+        for ch in label.chars() {
+            if ch.is_alphanumeric() {
+                out.push(ch);
+            } else if !out.is_empty() && !out.ends_with('-') {
+                out.push('-');
+            }
+        }
+        let trimmed = out.trim_matches('-').to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let from_kind = slugify(kind.trim());
+    if !from_kind.is_empty() {
+        return from_kind;
+    }
+    let from_id = slugify(provider_id.trim());
+    if from_id.is_empty() {
+        "provider".into()
+    } else {
+        from_id
+    }
+}
+
+/// Canonical public id: `模型.供应商` (model first, provider second).
+///
+/// Example: `deepseek-chat.deepseek`, `gpt-5.6-sol.openai-work`.
+pub fn model_provider_dotted_slug(
+    upstream_model: &str,
+    provider_label: &str,
+    kind: &str,
+    provider_id: &str,
+) -> String {
+    format!(
+        "{}.{}",
+        model_part_for_slug(upstream_model),
+        provider_part_for_slug(provider_label, kind, provider_id)
+    )
+}
+
+/// Publish slug for Codex + relay catalogs: always `模型.供应商`, unique under `claimed`.
+///
+/// Dual-keying of legacy/opaque/desktop-native forms happens in `catalog::build_from_routes`.
 pub fn catalog_publish_slug(
     provider_id: &str,
+    provider_label: &str,
+    kind: &str,
     upstream_model: &str,
     claimed_public_slugs: &mut std::collections::HashSet<String>,
 ) -> String {
-    if let Some(public) = desktop_native_model_slug(upstream_model) {
-        if claimed_public_slugs.insert(public.to_string()) {
-            return public.to_string();
-        }
+    let base = model_provider_dotted_slug(upstream_model, provider_label, kind, provider_id);
+    if claimed_public_slugs.insert(base.clone()) {
+        return base;
     }
-    opaque_route_slug(provider_id, upstream_model)
+    // Disambiguate multi-instance same label: append short stable id tail.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(provider_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(upstream_model.as_bytes());
+    let digest = hasher.finalize();
+    let short = hex::encode(&digest[..3]);
+    let alt = format!("{base}-{short}");
+    claimed_public_slugs.insert(alt.clone());
+    alt
 }
 
 /// Legacy DB / catalog slug used before opaque routes.
 pub fn legacy_route_slug(provider_id: &str, upstream_model: &str) -> String {
     format!("{provider_id}/{}", slugify(upstream_model))
+}
+
+/// Pre-dotted opaque form (still dual-keyed for in-flight sessions).
+pub fn legacy_opaque_route_slug(provider_id: &str, upstream_model: &str) -> String {
+    opaque_route_slug(provider_id, upstream_model)
 }
 
 pub fn catalog_model(
@@ -1211,11 +1396,8 @@ pub fn catalog_model_with_profile(
         (Some(128_000), Some(128_000))
     };
     let auto_compact = context_window.map(|window| (window as f64 * 0.9) as i64);
-    // Prefer Desktop-native public slug for terra/sol/luna so the power picker is non-empty.
-    // apply_patch freeform is set in normalize per CCS catalog profile.
-    let slug = desktop_native_model_slug(&model.id)
-        .map(str::to_string)
-        .unwrap_or_else(|| opaque_route_slug(provider_id, &model.id));
+    // Canonical id: 模型.供应商 (Codex picker + API relay share this).
+    let slug = model_provider_dotted_slug(&model.id, provider_label, kind, provider_id);
     // Prefer the instance's stored protocol (custom Responses vs Chat); fall back to kind default.
     let protocol = protocol_override
         .map(str::trim)
@@ -1251,10 +1433,11 @@ pub fn catalog_model_with_profile(
         },
         support_verbosity: false,
         default_verbosity: None,
-        apply_patch_tool_type: if catalog_advertises_freeform_apply_patch(
+        apply_patch_tool_type: if catalog_advertises_freeform_apply_patch_with_profile(
             kind,
             protocol,
             &model.id,
+            Some(profile.as_str()),
         ) {
             Some("freeform".into())
         } else {
@@ -1270,9 +1453,9 @@ pub fn catalog_model_with_profile(
             },
             limit: 10_000,
         },
-        // Official DS models.json sets parallel true; other third-parties stay false
-        // until Desktop A/B (picker / gateway 400 risk).
-        supports_parallel_tool_calls: kind == "deepseek",
+        // ChatGPT Official-class + DeepSeek: parallel tool calls.
+        supports_parallel_tool_calls: treats_as_chatgpt_official(kind, Some(profile.as_str()))
+            || kind == "deepseek",
         supports_image_detail_original: false,
         context_window,
         max_context_window,
@@ -1293,14 +1476,17 @@ pub fn catalog_model_with_profile(
         multi_agent_version: None,
     };
     // Always pass kind so reasoning/profile heal is correct for Kimi/DeepSeek/….
-    // Sets base_instructions + CCS freeform policy (OpenAI/Chat keep freeform;
-    // Responses-native strips apply_patch_tool_type).
-    normalize_catalog_model_for_codex_full(
+    // Sets base_instructions + CC Switch freeform / parallel policy.
+    // Discovery-time rows use multi-vendor-safe ads; Apply/rebuild passes
+    // conversation policy for OpenAI full-fidelity when sticky.
+    normalize_catalog_model_for_codex_full_with_profile(
         &mut catalog,
         1000,
         Some(kind),
         Some(protocol),
         Some(&model.id),
+        Some(profile.as_str()),
+        false,
     );
     // Re-apply with upstream id so Sol/Terra/Luna display names + upstream map correctly
     // even when the published slug is already a native Desktop slug.
@@ -1763,11 +1949,8 @@ mod tests {
             .get("slug")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        assert!(
-            slug.starts_with("spur-route-"),
-            "expected opaque slug, got {slug}"
-        );
-        assert!(!slug.contains('/'), "opaque slug must not contain '/'");
+        assert_eq!(slug, "k3.kimi-tian", "expected model.provider slug, got {slug}");
+        assert!(!slug.contains('/'), "slug must not contain '/'");
         // ChatGPT's GUI expects the complete ModelInfo shape even for empty values.
         assert_eq!(
             json.get("additional_speed_tiers"),
@@ -1830,25 +2013,31 @@ mod tests {
     }
 
     #[test]
-    fn catalog_publish_slug_prefers_desktop_native_once() {
+    fn catalog_publish_slug_is_model_dot_provider() {
         let mut claimed = std::collections::HashSet::new();
-        let first = catalog_publish_slug("p1", "gpt-5.6-terra", &mut claimed);
-        let second = catalog_publish_slug("p2", "gpt-5.6-terra", &mut claimed);
-        let kimi = catalog_publish_slug("p3", "k3", &mut claimed);
-        assert_eq!(first, "gpt-5.6-terra");
-        assert!(
-            second.starts_with("spur-route-"),
-            "second claim stays opaque: {second}"
-        );
-        assert!(kimi.starts_with("spur-route-"));
+        let first = catalog_publish_slug("p1", "OpenAI Work", "openai", "gpt-5.6-terra", &mut claimed);
+        let second = catalog_publish_slug("p2", "OpenAI Home", "openai", "gpt-5.6-terra", &mut claimed);
+        let kimi = catalog_publish_slug("p3", "Kimi", "kimi", "k3", &mut claimed);
+        assert_eq!(first, "gpt-5.6-terra.openai-work");
+        assert_eq!(second, "gpt-5.6-terra.openai-home");
+        assert_eq!(kimi, "k3.kimi");
+        // Same label + model → disambiguated
+        let clash = catalog_publish_slug("p4", "OpenAI Work", "openai", "gpt-5.6-terra", &mut claimed);
+        assert!(clash.starts_with("gpt-5.6-terra.openai-work-"));
         assert_eq!(
             desktop_native_model_slug("openai/gpt-5.6-sol"),
             Some("gpt-5.6-sol")
         );
+        assert_eq!(
+            model_provider_dotted_slug("deepseek-chat", "DeepSeek", "deepseek", "ds-1"),
+            "deepseek-chat.deepseek"
+        );
     }
 
     #[test]
-    fn openai_catalog_rows_advertise_freeform_apply_patch_not_web_search() {
+    fn openai_catalog_rows_match_ccs_chatgpt_official_responses_tools() {
+        // kind=openai covers Official OAuth/JSON subscription AND API Key entries.
+        // Discovery / allow-switch: multi-vendor-safe ads (no web_search / code_mode).
         let model = catalog_model(
             "openai-instance",
             "openai",
@@ -1860,25 +2049,93 @@ mod tests {
                 created_at: None,
             },
         );
-        assert_eq!(model.slug, "gpt-5.6-terra");
+        assert_eq!(model.slug, "gpt-5.6-terra.openai-2");
         assert_eq!(model.display_name, "OpenAI 2 · GPT-5.6-Terra");
         assert!(model.experimental_supported_tools.is_empty());
         assert_eq!(
             model.apply_patch_tool_type.as_deref(),
             Some("freeform"),
-            "OpenAI official keeps freeform apply_patch"
+            "ChatGPT Official/API Key freeform apply_patch (models_cache + CCS)"
         );
         assert!(
             model.tool_mode.is_none(),
-            "do not force code_mode_only"
+            "allow-switch / discovery: no code_mode_only"
         );
-        assert!(model.web_search_tool_type.is_none());
-        assert!(!model.supports_parallel_tool_calls);
+        assert!(
+            model.web_search_tool_type.is_none(),
+            "allow-switch / discovery: no web_search"
+        );
+        assert!(
+            model.supports_parallel_tool_calls,
+            "ChatGPT Official/API Key must advertise parallel function calling"
+        );
+        assert_eq!(
+            upstream_protocol_lane("openai", "Responses", "gpt-5.6-terra"),
+            UpstreamProtocolLane::OpenAiOfficial
+        );
+        // Protocol string variants must not leave the Official Responses lane.
+        assert_eq!(
+            upstream_protocol_lane("openai", "Chat Completions", "gpt-5.6-sol"),
+            UpstreamProtocolLane::OpenAiOfficial,
+            "kind=openai always Official lane regardless of stored protocol label"
+        );
     }
 
     #[test]
-    fn freeform_apply_patch_policy_openai_deepseek_xai() {
-        // ChatGPT Official (any entry is kind=openai) → freeform.
+    fn openai_sticky_no_switch_unlocks_full_fidelity_tool_ads() {
+        // 不中途换模型 → ChatGPT Official catalog tools (web_search + code_mode).
+        let mut model = catalog_model(
+            "openai-sticky",
+            "openai",
+            "再来",
+            &DiscoveredProviderModel {
+                id: "gpt-5.6-sol".into(),
+                display_name: "GPT-5.6-Sol".into(),
+                owned_by: None,
+                created_at: None,
+            },
+        );
+        normalize_catalog_model_for_codex_full(
+            &mut model,
+            1000,
+            Some("openai"),
+            Some("Responses"),
+            Some("gpt-5.6-sol"),
+            true,
+        );
+        assert_eq!(model.apply_patch_tool_type.as_deref(), Some("freeform"));
+        assert!(model.supports_parallel_tool_calls);
+        assert_eq!(
+            model.web_search_tool_type.as_deref(),
+            Some("text_and_image"),
+            "sticky OpenAI must advertise official web_search"
+        );
+        assert!(model.supports_search_tool);
+        assert_eq!(
+            model.tool_mode.as_deref(),
+            Some("code_mode_only"),
+            "sticky OpenAI matches Nice/CCS Official tool_mode"
+        );
+
+        // Allow-switch clears full-fidelity ads again.
+        normalize_catalog_model_for_codex_full(
+            &mut model,
+            1000,
+            Some("openai"),
+            Some("Responses"),
+            Some("gpt-5.6-sol"),
+            false,
+        );
+        assert!(model.web_search_tool_type.is_none());
+        assert!(!model.supports_search_tool);
+        assert!(model.tool_mode.is_none());
+        assert!(model.supports_parallel_tool_calls);
+        assert_eq!(model.apply_patch_tool_type.as_deref(), Some("freeform"));
+    }
+
+    #[test]
+    fn freeform_apply_patch_policy_ccs_profiles() {
+        // ChatGPT Official / API Key (kind=openai) → freeform + parallel.
         let openai = catalog_model(
             "o",
             "openai",
@@ -1891,6 +2148,7 @@ mod tests {
             },
         );
         assert_eq!(openai.apply_patch_tool_type.as_deref(), Some("freeform"));
+        assert!(openai.supports_parallel_tool_calls);
         assert_eq!(
             upstream_protocol_lane("openai", "Responses", "gpt-5.6-terra"),
             UpstreamProtocolLane::OpenAiOfficial
@@ -1914,7 +2172,7 @@ mod tests {
             UpstreamProtocolLane::ResponsesNative
         );
 
-        // xAI still strips freeform (CCS NativeResponses / shell edits).
+        // xAI → CCS NativeResponses strip freeform.
         let grok = catalog_model(
             "g",
             "xai",
@@ -1944,6 +2202,52 @@ mod tests {
             },
         );
         assert_eq!(kimi.apply_patch_tool_type.as_deref(), Some("freeform"));
+
+        // custom + Responses + openai_native → OpenAI mid-station = ChatGPT Official ads.
+        assert!(catalog_advertises_freeform_apply_patch_with_profile(
+            "custom",
+            "Responses",
+            "gpt-5.6-sol",
+            Some("openai_native"),
+        ));
+        let cheap = catalog_model_with_profile(
+            "cheap",
+            "custom",
+            "橙子便宜",
+            &DiscoveredProviderModel {
+                id: "gpt-5.6-sol".into(),
+                display_name: "GPT-5.6-Sol".into(),
+                owned_by: None,
+                created_at: None,
+            },
+            crate::reasoning_map::ReasoningProfileId::OpenaiNative,
+            Some("Responses"),
+        );
+        assert_eq!(
+            cheap.apply_patch_tool_type.as_deref(),
+            Some("freeform"),
+            "OpenAI mid-station (openai_native) eats Official freeform"
+        );
+        assert!(cheap.supports_parallel_tool_calls);
+        assert_eq!(
+            upstream_protocol_lane("custom", "Responses", "gpt-5.6-sol"),
+            UpstreamProtocolLane::ResponsesNative
+        );
+
+        // custom + Responses + non-OpenAI template → still CCS NativeResponses strip.
+        assert!(!catalog_advertises_freeform_apply_patch_with_profile(
+            "custom",
+            "Responses",
+            "claude-opus-5",
+            Some("xai"),
+        ));
+
+        // custom Chat Completions still freeform (ProxyChat).
+        assert!(catalog_advertises_freeform_apply_patch(
+            "custom",
+            "Chat Completions",
+            "claude-opus-5"
+        ));
     }
 
     #[test]

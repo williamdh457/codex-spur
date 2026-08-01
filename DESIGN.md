@@ -132,11 +132,16 @@ Primary destinations:
 
 1. Overview
 2. Models
-3. Usage
-4. Diagnostics
-5. Settings
+3. 反代 (API reverse-proxy mid-station)
+4. Usage
+5. Diagnostics
+6. Settings
 
 Provider configuration is intentionally consolidated into the Overview: a multi-instance provider list, an Add Provider wizard, and a single-instance edit sheet. Do not promote account-pool management as a primary sidebar destination or as a peer top-level config tab.
+
+**Models page:** two large equal buttons (Codex left, 反代 right) and **two independent tables** side by side — never one shared list that mixes Codex publish and relay export switches in the same rows.
+
+**反代 page:** reverse-proxy mid-station only (start/stop, Base URL, client keys). Model enablement for relay stays on the Models page relay table.
 
 Navigation rows are 32px high with 8px horizontal padding. Use specific labels; avoid vague categories such as “Manage.”
 
@@ -338,25 +343,32 @@ API keys are write-only. After save, show only “Key stored” and a replacemen
 
 ### Models
 
-Use a selectable table with sticky header:
+Top of the page is a two-button scope switcher (equal width, large hit targets):
 
-- enabled checkbox;
+```text
+[ Codex · 发布到官方选择器 ]  [ 反代 · 外放 Responses ]
+```
+
+- **Codex** — one large model table with a single enable switch per row (publish into Codex picker). Reasoning mapping remains on this tab.
+- **反代** — the same table shape, but the switch controls `relayEnabled`. API relay service controls (start/stop, keys, allowlist) appear only on this tab, below the table.
+
+Do not show dual Codex+反代 switches in the same row. Selection state is independent per scope; switching tabs must not clear the other scope’s choices.
+
+Table columns (active scope):
+
+- enable switch for the current scope;
 - picker display name;
 - upstream model id;
 - provider;
 - protocol;
-- context;
-- tools/image status;
-- reasoning summary;
-- validation state.
+- context / tools when space allows;
+- reasoning summary (Codex tab only).
 
 Toolbar:
 
-- provider filter;
 - search;
-- selected count;
-- Fetch models;
-- Review mappings.
+- selected count for the active scope;
+- refresh list.
 
 Default display name format:
 

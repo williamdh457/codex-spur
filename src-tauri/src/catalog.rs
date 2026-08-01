@@ -168,7 +168,8 @@ pub fn validate_catalog(catalog: &ModelsResponse) -> Result<()> {
 
         // experimental_supported_tools must stay [] — non-empty ads have emptied Desktop's
         // model list. apply_patch freeform is allowed (official models_cache + Nice Switch
-        // GPT custom rows). web_search stays off until a dedicated A/B.
+        // GPT custom rows). web_search / tool_mode allowed only as official values
+        // (sticky 不中途换 OpenAI full-fidelity catalog).
         if !model.experimental_supported_tools.is_empty() {
             bail!(
                 "catalog 第 {} 个模型不得广告 experimental_supported_tools（须为空数组，对齐 CC Switch）",
@@ -182,11 +183,19 @@ pub fn validate_catalog(catalog: &ModelsResponse) -> Result<()> {
                 index + 1
             ),
         }
-        if model.web_search_tool_type.is_some() {
-            bail!(
-                "catalog 第 {} 个模型不得设置 web_search tool type（未做 Desktop A/B）",
+        match model.web_search_tool_type.as_deref() {
+            None | Some("text_and_image") => {}
+            Some(other) => bail!(
+                "catalog 第 {} 个模型 web_search_tool_type 仅允许 text_and_image 或省略，收到 {other}",
                 index + 1
-            );
+            ),
+        }
+        match model.tool_mode.as_deref() {
+            None | Some("code_mode_only") => {}
+            Some(other) => bail!(
+                "catalog 第 {} 个模型 tool_mode 仅允许 code_mode_only 或省略，收到 {other}",
+                index + 1
+            ),
         }
     }
 
@@ -215,24 +224,30 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
             anyhow::anyhow!("模型路由 {} 的 catalog_json 无法解析：{}", route.id, error)
         })?,
     };
-    crate::providers::normalize_catalog_model_for_codex_full(
+    // SQLite heal stays multi-vendor-safe for sticky ads; OpenAI-template mid-stations
+    // still get freeform/parallel. Full sticky ads applied at build_from_routes.
+    let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
+        .unwrap_or_else(|| crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind));
+    crate::providers::normalize_catalog_model_for_codex_full_with_profile(
         &mut model,
         1000,
         Some(route.kind.as_str()),
         Some(route.protocol.as_str()),
         Some(route.upstream_model.as_str()),
+        Some(profile.as_str()),
+        false,
     );
-    let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
-        .unwrap_or_else(|| crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind));
     crate::providers::apply_reasoning_levels_for_profile(
         &mut model,
         profile,
         Some(route.upstream_model.as_str()),
     );
-    // Prefer Desktop-native public slug when unique; heal path claims freely (single row).
+    // Heal to 模型.供应商 (single-row claim set is fine here).
     let mut claimed = std::collections::HashSet::new();
     model.slug = crate::providers::catalog_publish_slug(
         &route.provider_id,
+        &route.provider_name,
+        &route.kind,
         &route.upstream_model,
         &mut claimed,
     );
@@ -301,9 +316,25 @@ fn catalog_model_label(route: &StoredRoute, model: &CatalogModel) -> String {
 ///
 /// `routes` should already be the proxy-eligible set (`enabled || relay_enabled`),
 /// or the full table — non-active rows are skipped.
+///
+/// Uses the default (multi-vendor-safe) conversation policy. Prefer
+/// [`build_from_routes_with_policy`] at Apply/runtime so 不中途换 can unlock
+/// ChatGPT Official full tool ads.
 pub fn build_from_routes(
     routes: &[StoredRoute],
 ) -> Result<(ModelsResponse, ModelsResponse, HashMap<String, RouteTarget>)> {
+    build_from_routes_with_policy(routes, &crate::domain::ConversationPolicy::default())
+}
+
+/// Same as [`build_from_routes`], applying `conversation_policy` to OpenAI
+/// catalog tool ads (web_search / tool_mode when sticky no-switch).
+pub fn build_from_routes_with_policy(
+    routes: &[StoredRoute],
+    conversation_policy: &crate::domain::ConversationPolicy,
+) -> Result<(ModelsResponse, ModelsResponse, HashMap<String, RouteTarget>)> {
+    let openai_full_fidelity = conversation_policy
+        .sanitized()
+        .uses_openai_full_fidelity_catalog();
     let mut codex_models = Vec::new();
     let mut relay_models = Vec::new();
     let mut targets = HashMap::new();
@@ -330,28 +361,31 @@ pub fn build_from_routes(
             let mut model = model;
             // Heal stale SQLite rows (camelCase era, technical effort copy, weak meta)
             // so ChatGPT always receives a Nice/CC Switch–compatible catalog shape.
-            crate::providers::normalize_catalog_model_for_codex_full(
+            let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
+                .unwrap_or_else(|| {
+                    crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind)
+                });
+            crate::providers::normalize_catalog_model_for_codex_full_with_profile(
                 &mut model,
                 1000 + enabled_index,
                 Some(route.kind.as_str()),
                 Some(route.protocol.as_str()),
                 Some(route.upstream_model.as_str()),
+                Some(profile.as_str()),
+                openai_full_fidelity,
             );
-            let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
-                .unwrap_or_else(|| {
-                    crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind)
-                });
             crate::providers::apply_reasoning_levels_for_profile(
                 &mut model,
                 profile,
                 Some(route.upstream_model.as_str()),
             );
-            // Desktop power picker only lists gpt-5.6-terra/sol (CC Switch style). Prefer
-            // those public slugs when unique; otherwise keep opaque spur-route-*.
+            // Canonical public id: 模型.供应商 (Codex + relay). Dual-key legacy forms.
             let opaque =
                 crate::providers::opaque_route_slug(&route.provider_id, &route.upstream_model);
             let published = crate::providers::catalog_publish_slug(
                 &route.provider_id,
+                &route.provider_name,
+                &route.kind,
                 &route.upstream_model,
                 &mut claimed_public_slugs,
             );
@@ -359,9 +393,7 @@ pub fn build_from_routes(
                 crate::providers::legacy_route_slug(&route.provider_id, &route.upstream_model);
             let previous_slug = model.slug.clone();
             model.slug = published.clone();
-            // Always publish "供应商 · 模型" — including OpenAI official subscription
-            // and account-pool instances that previously lost their prefix for native
-            // terra/sol/luna public slugs.
+            // Human label stays "供应商 · 模型"; machine id is model.provider.
             let label = format_catalog_display_name(
                 &route.provider_name,
                 &catalog_model_label(route, &model),
@@ -396,6 +428,16 @@ pub fn build_from_routes(
             }
             if legacy != published {
                 targets.insert(legacy, target.clone());
+            }
+            // Desktop-native bare slug (gpt-5.6-sol) for older threads.
+            if let Some(native) =
+                crate::providers::desktop_native_model_slug(&route.upstream_model)
+            {
+                if native != published {
+                    targets
+                        .entry(native.to_string())
+                        .or_insert_with(|| target.clone());
+                }
             }
             if route.id != published {
                 targets.insert(route.id.clone(), target.clone());
@@ -642,28 +684,26 @@ mod tests {
             );
         }
 
-        // OpenAI luna: public slug for power picker + instance-prefixed display name.
+        // OpenAI luna: 模型.供应商 slug + human display 供应商 · 模型.
         let luna = catalog
             .models
             .iter()
-            .find(|m| m.slug == "gpt-5.6-luna" || m.display_name.contains("Luna"))
+            .find(|m| m.slug.contains("luna") || m.display_name.contains("Luna"))
             .expect("luna model");
-        assert_eq!(luna.slug, "gpt-5.6-luna");
+        assert_eq!(luna.slug, "gpt-5.6-luna.openai-2");
         assert_eq!(luna.display_name, "OpenAI 2 · GPT-5.6-Luna");
         assert_eq!(luna.description.as_deref(), Some("OpenAI 2 · GPT-5.6-Luna"));
+        // Dual-key still accepts bare desktop-native id.
+        assert!(targets.contains_key("gpt-5.6-luna"));
 
-        // Kimi stays opaque (not a Desktop power-picker preset) and keeps its prefix.
+        // Kimi also 模型.供应商; display keeps prefix.
         let kimi = catalog
             .models
             .iter()
             .find(|m| m.display_name.contains("Kimi"))
             .expect("kimi model");
         assert_eq!(kimi.display_name, "Kimi tian · K3");
-        assert!(
-            kimi.slug.starts_with("spur-route-"),
-            "kimi slug must stay opaque, got {}",
-            kimi.slug
-        );
+        assert_eq!(kimi.slug, "k3.kimi-tian");
 
         // Dual-key: legacy uuid/upstream still routes to same upstream.
         let legacy_kimi = legacy_route_slug("d643a92a-76ae-458a-a567-81c0ea171ea5", "k3");
@@ -704,13 +744,13 @@ mod tests {
         assert!(raw.contains("\"effort\": \"max\""));
         assert!(raw.contains("Kimi tian · K3"));
         assert!(raw.contains("OpenAI 2 · GPT-5.6-Luna"));
-        assert!(raw.contains("\"gpt-5.6-luna\""));
+        assert!(raw.contains("\"gpt-5.6-luna.openai-2\""));
     }
 
     #[test]
     fn build_from_routes_keeps_provider_prefix_for_native_openai_and_pool() {
-        // Official subscription instance + account-pool instance both share gpt-5.6-sol;
-        // first claims public slug, second stays opaque — both must keep instance prefix.
+        // Two OpenAI instances share gpt-5.6-sol — both get 模型.供应商 with distinct
+        // provider segments; dual-key still accepts bare gpt-5.6-sol for old threads.
         let routes = vec![
             stale_slash_route(
                 "official-instance",
@@ -743,13 +783,10 @@ mod tests {
 
         assert_eq!(official.display_name, "官方订阅 · GPT-5.6-Sol");
         assert_eq!(pool.display_name, "账号池 · GPT-5.6-Sol");
-        assert_eq!(official.slug, "gpt-5.6-sol");
-        assert!(
-            pool.slug.starts_with("spur-route-"),
-            "second sol claim stays opaque, got {}",
-            pool.slug
-        );
-        assert!(targets.contains_key("gpt-5.6-sol"));
+        assert_eq!(official.slug, "gpt-5.6-sol.官方订阅");
+        assert_eq!(pool.slug, "gpt-5.6-sol.账号池");
+        assert!(targets.contains_key("gpt-5.6-sol")); // dual-key bare native
+        assert!(targets.contains_key(&official.slug));
         assert!(targets.contains_key(&pool.slug));
     }
 
@@ -850,7 +887,11 @@ mod tests {
         assert!(!healed.contains("\"displayName\""));
         assert!(healed.contains("\"experimental_supported_tools\""));
         assert!(!healed.contains("\"experimentalSupportedTools\""));
-        assert!(healed.contains("spur-route-"));
+        assert!(
+            healed.contains("k3.kimi-tian") || healed.contains("\"slug\""),
+            "healed slug should be model.provider, got snippet in heal output"
+        );
+        assert!(healed.contains("k3.kimi-tian"));
         // Heal keeps freeform apply_patch + empty experimental tools; still no web_search.
         let payload: RouteCatalogPayload = serde_json::from_str(&healed).expect("payload");
         assert!(payload.model.experimental_supported_tools.is_empty());

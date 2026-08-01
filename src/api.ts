@@ -445,10 +445,16 @@ export async function listRelayApiKeys(): Promise<RelayApiKeySummary[]> {
 
 export async function createRelayApiKey(input?: {
   label?: string;
+  wireType?: "responses" | "completions";
+  nameStyle?: "dotted" | "flat";
+  allowedProviders?: string[];
   allowedModels?: string[];
 }): Promise<RelayApiKeyCreated> {
   return invoke<RelayApiKeyCreated>("create_relay_api_key", {
     label: input?.label ?? null,
+    wireType: input?.wireType ?? null,
+    nameStyle: input?.nameStyle ?? "dotted",
+    allowedProviders: input?.allowedProviders ?? null,
     allowedModels: input?.allowedModels ?? null,
   });
 }
@@ -457,12 +463,18 @@ export async function updateRelayApiKey(input: {
   id: string;
   label?: string;
   enabled?: boolean;
+  wireType?: "responses" | "completions";
+  nameStyle?: "dotted" | "flat";
+  allowedProviders?: string[];
   allowedModels?: string[];
 }): Promise<RelayApiKeySummary> {
   return invoke<RelayApiKeySummary>("update_relay_api_key", {
     id: input.id,
     label: input.label ?? null,
     enabled: input.enabled ?? null,
+    wireType: input.wireType ?? null,
+    nameStyle: input.nameStyle ?? null,
+    allowedProviders: input.allowedProviders ?? null,
     allowedModels: input.allowedModels ?? null,
   });
 }

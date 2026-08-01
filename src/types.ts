@@ -1,6 +1,7 @@
 export type NavigationSection =
   | "overview"
   | "models"
+  | "relay"
   | "usage"
   | "diagnostics"
   | "settings";
@@ -94,12 +95,26 @@ export type ApiRelayStatus = {
   lastError: string | null;
 };
 
+/** Client API key wire protocol for the reverse-proxy mid-station. */
+export type RelayWireType = "responses" | "completions";
+
+/**
+ * Naming style. Product is always dotted (`模型.供应商`); `flat` is legacy only.
+ */
+export type RelayNameStyle = "dotted" | "flat";
+
 export type RelayApiKeySummary = {
   id: string;
   label: string;
   keyPrefix: string;
   enabled: boolean;
-  /** Empty = all relay-enabled models. */
+  /** Response = dual entry; Completion = chat only. */
+  wireType: RelayWireType;
+  /** Always `dotted` for new keys (模型.供应商). */
+  nameStyle: RelayNameStyle;
+  /** Legacy flat provider allow-list. */
+  allowedProviders: string[];
+  /** Allowed public ids (`模型.供应商`). Empty = all relay-enabled models. */
   allowedModels: string[];
   createdAt: string;
   updatedAt: string;

@@ -128,11 +128,11 @@ pub struct RelayApiKeySummary {
     pub enabled: bool,
     /// `responses` | `completions`
     pub wire_type: String,
-    /// `dotted` | `flat` (加点 / 不加点)
+    /// Always `dotted` (模型.供应商) for product UI; `flat` kept for legacy keys only.
     pub name_style: String,
-    /// Flat mode: provider instance ids.
+    /// Legacy flat allow-list of provider instance ids (unused when dotted).
     pub allowed_providers: Vec<String>,
-    /// Dotted mode or legacy: public model / route ids. Empty = all allowed by style.
+    /// Allowed public model ids (`模型.供应商`). Empty = all relay-enabled models.
     pub allowed_models: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -402,6 +402,16 @@ impl ConversationPolicy {
             && self.openai_cloud_compact
     }
 
+    /// True when the user opts into **fixed same-factory threads** (不中途换模型).
+    ///
+    /// In this mode Spur may advertise ChatGPT Official–fidelity catalog tools
+    /// (`web_search`, `tool_mode=code_mode_only`, parallel FC) on `kind=openai`
+    /// rows, matching CC Switch Official / API Key experience. Cross-provider
+    /// mid-thread is unsupported; AllowSwitch keeps multi-vendor-safe ads.
+    pub fn uses_openai_full_fidelity_catalog(self) -> bool {
+        matches!(self.mid_thread, MidThreadModelPolicy::StickyNoSwitch)
+    }
+
     /// Normalize illegal combinations.
     /// Allow-switch always disables cloud compact. Cloud compact only sticks
     /// when the user is already in sticky mode.
@@ -444,6 +454,24 @@ mod conversation_policy_tests {
         }
         .sanitized();
         assert!(p.uses_openai_cloud_compact());
+    }
+
+    #[test]
+    fn full_fidelity_catalog_follows_sticky_not_cloud_flag() {
+        let sticky_local = ConversationPolicy {
+            mid_thread: MidThreadModelPolicy::StickyNoSwitch,
+            openai_cloud_compact: false,
+        }
+        .sanitized();
+        assert!(sticky_local.uses_openai_full_fidelity_catalog());
+        assert!(!sticky_local.uses_openai_cloud_compact());
+
+        let allow = ConversationPolicy {
+            mid_thread: MidThreadModelPolicy::AllowSwitch,
+            openai_cloud_compact: false,
+        }
+        .sanitized();
+        assert!(!allow.uses_openai_full_fidelity_catalog());
     }
 }
 

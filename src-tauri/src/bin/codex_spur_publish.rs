@@ -25,10 +25,29 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("没有已启用的模型路由。请先在 Codex Spur 里勾选模型。");
     }
 
-    let (catalog, _relay, _targets) = catalog::build_from_routes(&routes)?;
+    let policy = storage
+        .get_conversation_policy()
+        .await
+        .unwrap_or_default()
+        .sanitized();
+    println!(
+        "conversation_policy mid_thread={} openai_full_fidelity={} cloud_compact={}",
+        policy.mid_thread.as_str(),
+        policy.uses_openai_full_fidelity_catalog(),
+        policy.uses_openai_cloud_compact()
+    );
+    let (catalog, _relay, _targets) = catalog::build_from_routes_with_policy(&routes, &policy)?;
     println!("enabled_models={}", catalog.models.len());
     for model in &catalog.models {
-        println!("  - {} | {}", model.slug, model.display_name);
+        println!(
+            "  - {} | {} | ap={:?} web={:?} tool_mode={:?} parallel={}",
+            model.slug,
+            model.display_name,
+            model.apply_patch_tool_type,
+            model.web_search_tool_type,
+            model.tool_mode,
+            model.supports_parallel_tool_calls
+        );
     }
 
     // Prefer the persisted Spur proxy bearer so restarts keep Codex config valid.

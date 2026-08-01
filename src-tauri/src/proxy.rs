@@ -252,7 +252,9 @@ fn route_upstream_is_responses(target: &RouteTarget) -> bool {
     !route_uses_chat_completions(target)
 }
 
-/// Resolve a client-facing model id to a route (supports `provider.model` dotted form).
+/// Resolve a client-facing model id to a route.
+///
+/// Canonical form is `模型.供应商` (rsplit once so model may contain dots, e.g. `gpt-4.1.openai`).
 fn resolve_relay_route(
     routes: &std::collections::HashMap<String, RouteTarget>,
     client_model: &str,
@@ -263,57 +265,75 @@ fn resolve_relay_route(
             return Some(target.clone());
         }
     }
-    // Dotted: providerSlug.upstreamModel or providerName.upstreamModel
-    if let Some((left, right)) = client_model.split_once('.') {
-        let left_l = left.to_ascii_lowercase();
-        let right_l = right.to_ascii_lowercase();
-        for target in routes.values() {
-            if !target.relay_enabled {
-                continue;
-            }
-            if !model_allowed_by_key(key, client_model, target) {
-                continue;
-            }
-            let kind_ok = target.kind.eq_ignore_ascii_case(left);
-            let name_ok = target
-                .provider_id
-                .to_ascii_lowercase()
-                .starts_with(&left_l)
-                || left_l.len() >= 4
-                    && target
-                        .provider_id
-                        .to_ascii_lowercase()
-                        .contains(&left_l);
-            let model_ok = target.upstream_model.eq_ignore_ascii_case(right)
-                || target.upstream_model.to_ascii_lowercase().ends_with(&right_l)
-                || target.route_id.eq_ignore_ascii_case(client_model);
-            if (kind_ok || name_ok) && model_ok {
-                return Some(target.clone());
-            }
-        }
-        // Fallback: match only upstream model when unique under key allow-list.
+    // 模型.供应商 — split from the right so model ids like gpt-4.1 keep their dots.
+    if let Some((model_part, provider_part)) = client_model.rsplit_once('.') {
+        let model_l = model_part.to_ascii_lowercase();
+        let provider_l = provider_part.to_ascii_lowercase();
         let mut matches: Vec<&RouteTarget> = routes
             .values()
-            .filter(|t| {
-                t.relay_enabled
-                    && t.upstream_model.eq_ignore_ascii_case(right)
-                    && model_allowed_by_key(key, client_model, t)
+            .filter(|target| {
+                if !target.relay_enabled || !model_allowed_by_key(key, client_model, target) {
+                    return false;
+                }
+                let upstream_l = target.upstream_model.to_ascii_lowercase();
+                let model_ok = upstream_l == model_l
+                    || upstream_l.ends_with(&model_l)
+                    || crate::providers::model_part_for_slug(&target.upstream_model) == model_l
+                    || target.route_id.eq_ignore_ascii_case(client_model);
+                if !model_ok {
+                    return false;
+                }
+                let kind_ok = target.kind.eq_ignore_ascii_case(provider_part);
+                let id_l = target.provider_id.to_ascii_lowercase();
+                let id_ok = id_l == provider_l
+                    || id_l.starts_with(&provider_l)
+                    || (provider_l.len() >= 3 && id_l.contains(&provider_l));
+                let slug_provider =
+                    crate::providers::provider_part_for_slug("", &target.kind, &target.provider_id);
+                let slug_ok = slug_provider == provider_l
+                    || provider_l.starts_with(&slug_provider)
+                    || slug_provider.starts_with(&provider_l);
+                kind_ok || id_ok || slug_ok
             })
             .collect();
+        // Deduplicate by route_id (map may dual-key same target).
+        matches.sort_by_key(|t| t.route_id.as_str());
+        matches.dedup_by_key(|t| t.route_id.as_str());
         if matches.len() == 1 {
             return Some(matches.remove(0).clone());
         }
+        if matches.is_empty() {
+            // Fallback: unique model under allow-list (ignore provider segment).
+            let mut by_model: Vec<&RouteTarget> = routes
+                .values()
+                .filter(|t| {
+                    t.relay_enabled
+                        && model_allowed_by_key(key, client_model, t)
+                        && (t.upstream_model.eq_ignore_ascii_case(model_part)
+                            || crate::providers::model_part_for_slug(&t.upstream_model) == model_l)
+                })
+                .collect();
+            by_model.sort_by_key(|t| t.route_id.as_str());
+            by_model.dedup_by_key(|t| t.route_id.as_str());
+            if by_model.len() == 1 {
+                return Some(by_model.remove(0).clone());
+            }
+        }
     }
-    // Flat: match upstream_model uniquely.
+    // Bare model id: only when uniquely allowed.
     let mut matches: Vec<&RouteTarget> = routes
         .values()
         .filter(|t| {
             t.relay_enabled
                 && (t.upstream_model.eq_ignore_ascii_case(client_model)
-                    || t.route_id.eq_ignore_ascii_case(client_model))
+                    || t.route_id.eq_ignore_ascii_case(client_model)
+                    || crate::providers::model_part_for_slug(&t.upstream_model)
+                        == client_model.to_ascii_lowercase())
                 && model_allowed_by_key(key, client_model, t)
         })
         .collect();
+    matches.sort_by_key(|t| t.route_id.as_str());
+    matches.dedup_by_key(|t| t.route_id.as_str());
     if matches.len() == 1 {
         return Some(matches.remove(0).clone());
     }
@@ -502,7 +522,11 @@ async fn responses(
         forward_chat_compatible(&state, &target, parsed, &affinity).await
     } else {
         map_reasoning(&target, &mut parsed);
-        sanitize_responses_request_for_upstream(&target.kind, &mut parsed);
+        sanitize_responses_request_for_upstream_with_profile(
+            &target.kind,
+            &target.reasoning_profile_id,
+            &mut parsed,
+        );
         if media_sanitizer::should_strip_images(&target.kind, &target.upstream_model) {
             media_sanitizer::replace_images_with_marker(&mut parsed);
         }
@@ -894,24 +918,298 @@ async fn relay_chat_completions(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let responses_req = chat_request_to_responses_request(&parsed, &target.upstream_model);
+    let mut responses_req = chat_request_to_responses_request(&parsed, &target.upstream_model);
     if wants_stream {
-        // Stream path: convert Responses SSE → Chat Completions SSE (reuse bridge).
-        return forward_chat_compatible(
-            &state,
-            &target,
-            // Trick: feed original chat body through existing chat bridge would hit chat upstream.
-            // Instead convert then forward responses, then... for stream we need special handling.
-            // Minimal: run chat path only when upstream is chat; for responses-up use non-stream convert for now?
-            parsed,
-            &affinity,
-        )
-        .await;
+        if let Some(obj) = responses_req.as_object_mut() {
+            obj.insert("stream".into(), Value::Bool(true));
+        }
+        return relay_chat_via_responses_stream(&state, &target, responses_req, &affinity).await;
     }
     // Non-stream: responses raw → convert JSON to chat completion shape.
     let responses_resp =
         relay_forward_responses_raw(&state, &target, responses_req, &affinity).await;
     relay_responses_http_to_chat_json(responses_resp).await
+}
+
+/// Response-key stream: Responses SSE upstream → Chat Completions SSE to client.
+async fn relay_chat_via_responses_stream(
+    state: &ProxyState,
+    target: &RouteTarget,
+    request_body: Value,
+    affinity: &AffinityInputs,
+) -> Response {
+    let endpoint = endpoint(&target.base_url, &target.kind, "responses");
+    let mut request = state.client.post(&endpoint).json(&request_body);
+    let auth = match upstream_auth(state, target, affinity, &[]).await {
+        Ok(Some(auth)) => {
+            request = apply_upstream_headers(request, &auth, target);
+            Some(auth)
+        }
+        Ok(None) => return no_healthy_upstream_response(state, &target.provider_id).await,
+        Err(response) => return response,
+    };
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(auth) = auth {
+                let _ = state.storage.release_lease(&auth.lease_id).await;
+            }
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_transport_error",
+                &format!("Upstream request failed: {error}"),
+            );
+        }
+    };
+    if let Some(auth) = auth {
+        let _ = state.storage.release_lease(&auth.lease_id).await;
+    }
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let is_sse = content_type.to_ascii_lowercase().contains("text/event-stream");
+    if !status.is_success() {
+        let bytes = response.bytes().await.unwrap_or_default();
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "proxy_response_error",
+                    "Failed to build error response",
+                )
+            });
+    }
+    if !is_sse {
+        // Upstream ignored stream; convert buffered JSON.
+        return relay_responses_http_to_chat_json(
+            passthrough_raw(
+                response,
+                &state.metrics,
+                &state.storage,
+                &target.provider_id,
+                &target.upstream_model,
+            )
+            .await,
+        )
+        .await;
+    }
+    state.metrics.output_tokens.fetch_add(1, Ordering::Relaxed);
+    let _ = state
+        .storage
+        .record_usage(
+            &target.provider_id,
+            &target.upstream_model,
+            &UsageDelta {
+                request_count: 0,
+                input_tokens: 0,
+                output_tokens: 1,
+                cache_observations: 0,
+                cache_hits: 0,
+                failed_requests: 0,
+            },
+        )
+        .await;
+    use futures_util::StreamExt;
+    let model_id = target.upstream_model.clone();
+    let mut converter = ResponsesSseToChatConverter::new(model_id);
+    let mapped = response.bytes_stream().map(move |chunk| {
+        chunk
+            .map(|bytes| converter.push(&bytes))
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(mapped))
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_response_error",
+                "Failed to build streaming chat response",
+            )
+        })
+}
+
+/// Incremental Responses SSE → Chat Completions SSE (`data: {chat.completion.chunk}`).
+struct ResponsesSseToChatConverter {
+    model: String,
+    carry: Vec<u8>,
+    response_id: String,
+    role_sent: bool,
+    finished: bool,
+}
+
+impl ResponsesSseToChatConverter {
+    fn new(model: String) -> Self {
+        Self {
+            model,
+            carry: Vec::new(),
+            response_id: format!("chatcmpl-spur-{}", &Uuid::new_v4().simple().to_string()[..20]),
+            role_sent: false,
+            finished: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Bytes {
+        self.carry.extend_from_slice(chunk);
+        let mut out = String::new();
+        while let Some(boundary) = find_sse_event_boundary(&self.carry) {
+            let raw = self.carry.drain(..boundary).collect::<Vec<u8>>();
+            let block = trim_sse_block_separator(&raw);
+            if let Some(text) = self.convert_block(block) {
+                out.push_str(&text);
+            }
+        }
+        Bytes::from(out)
+    }
+
+    fn convert_block(&mut self, block: &[u8]) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        let text = std::str::from_utf8(block).ok()?;
+        let mut event_name = String::new();
+        let mut data_lines = Vec::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("event:") {
+                event_name = rest.trim().to_string();
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim_start());
+            }
+        }
+        let data_str = data_lines.join("\n");
+        if data_str.is_empty() || data_str == "[DONE]" {
+            if data_str == "[DONE]" && !self.finished {
+                self.finished = true;
+                return Some(format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    self.chat_chunk(None, Some("stop"))
+                ));
+            }
+            return None;
+        }
+        let data: Value = serde_json::from_str(&data_str).ok()?;
+        if let Some(id) = data
+            .pointer("/response/id")
+            .and_then(Value::as_str)
+            .or_else(|| data.get("id").and_then(Value::as_str))
+        {
+            if id.starts_with("resp_") || id.starts_with("chatcmpl-") {
+                self.response_id = format!("chatcmpl-{}", id.trim_start_matches("resp_"));
+            }
+        }
+        let event = if event_name.is_empty() {
+            data.get("type").and_then(Value::as_str).unwrap_or("")
+        } else {
+            event_name.as_str()
+        };
+        match event {
+            "response.created" | "response.in_progress" => {
+                if self.role_sent {
+                    return None;
+                }
+                self.role_sent = true;
+                Some(format!(
+                    "data: {}\n\n",
+                    self.chat_chunk(Some(json!({"role": "assistant", "content": ""})), None)
+                ))
+            }
+            "response.output_text.delta" => {
+                let delta = data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if delta.is_empty() {
+                    return None;
+                }
+                if !self.role_sent {
+                    self.role_sent = true;
+                }
+                Some(format!(
+                    "data: {}\n\n",
+                    self.chat_chunk(Some(json!({"content": delta})), None)
+                ))
+            }
+            "response.function_call_arguments.delta" => {
+                let delta = data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if delta.is_empty() {
+                    return None;
+                }
+                Some(format!(
+                    "data: {}\n\n",
+                    self.chat_chunk(
+                        Some(json!({
+                            "tool_calls": [{
+                                "index": 0,
+                                "function": { "arguments": delta }
+                            }]
+                        })),
+                        None
+                    )
+                ))
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                self.finished = true;
+                let reason = if event == "response.failed" {
+                    "stop"
+                } else {
+                    "stop"
+                };
+                Some(format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    self.chat_chunk(None, Some(reason))
+                ))
+            }
+            _ => {
+                // Some hosts only send output_item with nested text.
+                if event == "response.output_item.done" {
+                    if let Some(text) = data
+                        .pointer("/item/content/0/text")
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.is_empty())
+                    {
+                        return Some(format!(
+                            "data: {}\n\n",
+                            self.chat_chunk(Some(json!({"content": text})), None)
+                        ));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn chat_chunk(&self, delta: Option<Value>, finish_reason: Option<&str>) -> String {
+        let mut choice = json!({
+            "index": 0,
+            "delta": delta.unwrap_or_else(|| json!({})),
+            "finish_reason": finish_reason.map(Value::from).unwrap_or(Value::Null),
+        });
+        if finish_reason.is_none() {
+            if let Some(obj) = choice.as_object_mut() {
+                obj.insert("finish_reason".into(), Value::Null);
+            }
+        }
+        serde_json::to_string(&json!({
+            "id": self.response_id,
+            "object": "chat.completion.chunk",
+            "model": self.model,
+            "choices": [choice],
+        }))
+        .unwrap_or_else(|_| "{}".into())
+    }
 }
 
 /// Pure Chat Completions mid-station forward (no Desktop adapt).
@@ -3573,11 +3871,14 @@ const GENERIC_RESPONSES_TOOL_TYPES: &[&str] = &[
 /// Chat Completions only understands function tools (DeepSeek / Kimi / most gateways).
 const CHAT_COMPLETIONS_TOOL_TYPES: &[&str] = &["function"];
 
-/// ChatGPT Official family (`kind=openai`): OAuth / API Key / multi-account JSON
-/// all share this path — keep Codex-native tools (incl. freeform apply_patch).
-/// Aligns with CC Switch OpenAI Official (not third-party NativeResponses strip).
-fn keeps_codex_native_tools(kind: &str) -> bool {
-    kind.eq_ignore_ascii_case("openai")
+/// ChatGPT Official-class path: keep Codex-native tools (freeform `apply_patch`,
+/// `namespace`, Desktop function tools) and **do not port**.
+///
+/// Includes `kind=openai` (Official / JSON / API Key) **and** instances whose
+/// reasoning template is `openai_native` / `openai_compat` (OpenAI mid-stations
+/// such as 橙子便宜). CC Switch NativeResponses (xAI, non-OpenAI custom) still ports.
+fn keeps_codex_native_tools(kind: &str, reasoning_profile_id: &str) -> bool {
+    crate::providers::treats_as_chatgpt_official(kind, Some(reasoning_profile_id))
 }
 
 /// Allowed Responses tool types for a non-OpenAI kind.
@@ -3734,13 +4035,23 @@ fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
 /// drop **replayed** reasoning / historical compaction (OpenAI ciphertext is not
 /// xAI-decryptable), keep the live compact control carrier, and clamp fields so
 /// future subscriptions do not re-introduce 422s.
+/// Test helper: no reasoning profile (non–OpenAI-template custom strips freeform).
+#[cfg(test)]
 fn sanitize_responses_request_for_upstream(kind: &str, request: &mut Value) {
-    if keeps_codex_native_tools(kind) {
+    sanitize_responses_request_for_upstream_with_profile(kind, "", request);
+}
+
+fn sanitize_responses_request_for_upstream_with_profile(
+    kind: &str,
+    reasoning_profile_id: &str,
+    request: &mut Value,
+) {
+    if keeps_codex_native_tools(kind, reasoning_profile_id) {
         sanitize_openai_responses_input(request);
         return;
     }
-    sanitize_responses_tools_for_upstream(kind, request);
-    sanitize_responses_tool_choice_for_upstream(kind, request);
+    sanitize_responses_tools_for_upstream(kind, reasoning_profile_id, request);
+    sanitize_responses_tool_choice_for_upstream(kind, reasoning_profile_id, request);
     sanitize_responses_input_for_upstream(request);
     strip_unsupported_responses_fields(request);
     clamp_responses_fields_for_kind(kind, request);
@@ -3868,12 +4179,19 @@ fn sanitize_openai_input_message_ids(request: &mut Value) {
 ///
 /// Port tools for non-OpenAI Responses hosts.
 ///
-/// CC Switch **NativeResponses** profile: freeform `apply_patch` is not in the
-/// catalog and must not be re-injected here — edits use `shell_command`. Chat
-/// Completions bridge (ProxyChat) still injects portable apply_patch on its own
-/// path (`responses_tools_to_chat_tools`).
-fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
-    if keeps_codex_native_tools(kind) {
+/// CC Switch **NativeResponses** (xAI / custom Responses): freeform is not in the
+/// catalog and must not be re-injected — edits use `shell_command`.
+/// DeepSeek official Responses keeps freeform (ensure portable apply_patch).
+/// Chat Completions bridge injects apply_patch on its own path
+/// (`responses_tools_to_chat_tools`).
+///
+/// ChatGPT Official-class never enters this function ([`keeps_codex_native_tools`]).
+fn sanitize_responses_tools_for_upstream(
+    kind: &str,
+    reasoning_profile_id: &str,
+    request: &mut Value,
+) {
+    if keeps_codex_native_tools(kind, reasoning_profile_id) {
         return;
     }
     let allowed = responses_tool_types_for_kind(kind);
@@ -3885,16 +4203,17 @@ fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
     let mut kept = port_codex_tools(&items, allowed);
     // CCS NativeResponses: drop freeform tools if a stale Desktop session still
     // advertised them; never ensure-inject apply_patch on this path.
-    if responses_native_strips_freeform_apply_patch(kind) {
+    if responses_native_strips_freeform_apply_patch(kind, reasoning_profile_id) {
         kept.retain(|tool| {
             tool_name(tool)
                 .map(|n| !crate::tool_roundtrip::is_freeform_desktop_tool(n))
                 .unwrap_or(true)
         });
     }
-    // Legacy: only inject portable apply_patch when this kind would still use
-    // freeform (should not happen for Responses-native kinds after catalog heal).
-    if allowed.contains(&"function") && !responses_native_strips_freeform_apply_patch(kind) {
+    // DeepSeek official + any non-strip kind on Responses path: ensure portable apply_patch.
+    if allowed.contains(&"function")
+        && !responses_native_strips_freeform_apply_patch(kind, reasoning_profile_id)
+    {
         ensure_responses_apply_patch_tool(&mut kept);
     }
     let Some(object) = request.as_object_mut() else {
@@ -3910,16 +4229,20 @@ fn sanitize_responses_tools_for_upstream(kind: &str, request: &mut Value) {
 /// Whether Responses-path tool sanitization should **drop** freeform tools and
 /// skip apply_patch ensure-inject.
 ///
-/// - **openai**: Official — never strip (should not hit this path for tool port).
-/// - **deepseek**: Official Flash Responses — **keep** freeform (DeepSeek Codex script).
-/// - **xai** / other third-party Responses-native: strip freeform (CCS NativeResponses).
-/// - Chat-bridge kinds (kimi/minimax/…): false (they use chat tools path).
-fn responses_native_strips_freeform_apply_patch(kind: &str) -> bool {
+/// - ChatGPT Official-class (`kind=openai` or openai_native/compat profile): never
+///   strip (usually short-circuits via [`keeps_codex_native_tools`]).
+/// - **deepseek**: keep freeform (official DS Codex script).
+/// - **kimi / minimax / opencode-go**: false (Chat bridge path).
+/// - **xai** + custom **without** OpenAI template: strip freeform (CCS NativeResponses).
+fn responses_native_strips_freeform_apply_patch(kind: &str, reasoning_profile_id: &str) -> bool {
+    if crate::providers::treats_as_chatgpt_official(kind, Some(reasoning_profile_id)) {
+        return false;
+    }
     let k = kind.to_ascii_lowercase();
     match k.as_str() {
         "openai" | "kimi" | "minimax" | "opencode-go" | "deepseek" => false,
         "xai" => true,
-        // custom / unknown on Responses path → strip freeform (CCS native style).
+        // custom / unknown without OpenAI template → CCS NativeResponses strip.
         _ => true,
     }
 }
@@ -3928,8 +4251,12 @@ fn responses_native_strips_freeform_apply_patch(kind: &str) -> bool {
 ///
 /// Codex may send `{"type":"namespace",…}` or a function name that no longer
 /// exists after namespace/custom rows were dropped — upstream then 422s.
-fn sanitize_responses_tool_choice_for_upstream(kind: &str, request: &mut Value) {
-    if keeps_codex_native_tools(kind) {
+fn sanitize_responses_tool_choice_for_upstream(
+    kind: &str,
+    reasoning_profile_id: &str,
+    request: &mut Value,
+) {
+    if keeps_codex_native_tools(kind, reasoning_profile_id) {
         return;
     }
     let Some(choice) = request.get("tool_choice").cloned() else {
@@ -5696,6 +6023,94 @@ mod tests {
     }
 
     #[test]
+    fn resolve_relay_route_prefers_model_dot_provider() {
+        let key = StoredRelayApiKey {
+            id: "k1".into(),
+            label: "t".into(),
+            key_prefix: "sk…".into(),
+            key_hash: "h".into(),
+            enabled: true,
+            wire_type: "responses".into(),
+            name_style: "dotted".into(),
+            allowed_providers: vec![],
+            allowed_models: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_used_at: None,
+        };
+        let mut target = test_route_target("deepseek");
+        target.relay_enabled = true;
+        target.upstream_model = "deepseek-chat".into();
+        target.provider_id = "ds-main".into();
+        target.kind = "deepseek".into();
+        let slug = "deepseek-chat.deepseek";
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(slug.to_string(), target.clone());
+        routes.insert("legacy-id".into(), target.clone());
+
+        let hit = resolve_relay_route(&routes, slug, &key).expect("exact");
+        assert_eq!(hit.upstream_model, "deepseek-chat");
+
+        // gpt-4.1.openai — model may contain dots; rsplit once
+        let mut gpt = test_route_target("openai");
+        gpt.relay_enabled = true;
+        gpt.upstream_model = "gpt-4.1".into();
+        gpt.provider_id = "openai-work".into();
+        gpt.kind = "openai".into();
+        routes.insert("gpt-4.1.openai-work".into(), gpt.clone());
+        let hit2 = resolve_relay_route(&routes, "gpt-4.1.openai-work", &key).expect("dotted model");
+        assert_eq!(hit2.upstream_model, "gpt-4.1");
+    }
+
+    #[test]
+    fn chat_request_to_responses_and_back_roundtrip_text() {
+        let chat = json!({
+            "model": "client-id",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"}
+            ],
+            "stream": false
+        });
+        let req = chat_request_to_responses_request(&chat, "upstream-model");
+        assert_eq!(req["model"], "upstream-model");
+        assert_eq!(req["stream"], false);
+        let input = req["input"].as_array().expect("input");
+        assert!(input.len() >= 2);
+
+        let responses = json!({
+            "id": "resp_abc",
+            "model": "upstream-model",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        });
+        let back = responses_json_to_chat_completion(&responses);
+        assert_eq!(back["object"], "chat.completion");
+        assert_eq!(
+            back["choices"][0]["message"]["content"].as_str(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn responses_sse_to_chat_converter_emits_deltas() {
+        let mut conv = ResponsesSseToChatConverter::new("m1".into());
+        let event = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n";
+        let out = conv.push(event);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains("chat.completion.chunk"), "{text}");
+        assert!(text.contains("Hi"), "{text}");
+        let done = b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let out2 = conv.push(done);
+        let text2 = std::str::from_utf8(&out2).unwrap();
+        assert!(text2.contains("[DONE]"), "{text2}");
+    }
+
+    #[test]
     fn load_or_create_secret_is_stable_across_calls() {
         let dir = std::env::temp_dir().join(format!(
             "codex-spur-proxy-secret-{}-{}",
@@ -5746,7 +6161,7 @@ mod tests {
                 "sk-spur-relay…",
                 &relay_key_hash(secret),
                 "responses",
-                "flat",
+                "dotted",
                 &[],
                 &[],
             )
@@ -6686,9 +7101,8 @@ data: [DONE]
             let has_apply = tools.iter().any(|t| {
                 t["name"] == "apply_patch" || t["function"]["name"] == "apply_patch"
             });
-            // xAI / custom Responses: strip freeform. DeepSeek official + chat-bridge
-            // kinds that hit this path: keep/ensure apply_patch.
-            if responses_native_strips_freeform_apply_patch(kind) {
+            // Without OpenAI template: xAI/custom strip freeform; DeepSeek keeps.
+            if responses_native_strips_freeform_apply_patch(kind, "") {
                 assert!(
                     !has_apply,
                     "{kind} must strip freeform apply_patch"
@@ -6697,6 +7111,132 @@ data: [DONE]
                 assert!(has_apply, "{kind} must keep/ensure apply_patch");
             }
         }
+    }
+
+    #[test]
+    fn custom_responses_strips_freeform_without_openai_profile() {
+        // CCS NativeResponses: custom Responses + non-OpenAI template strips freeform.
+        let mut body = json!({
+            "tools": [
+                {"type": "namespace", "name": "codex"},
+                {"type": "custom", "name": "apply_patch"},
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        });
+        sanitize_responses_request_for_upstream_with_profile("custom", "xai", &mut body);
+        let tools = body["tools"].as_array().expect("tools");
+        assert!(
+            tools
+                .iter()
+                .all(|t| t.get("name").and_then(Value::as_str) != Some("apply_patch")),
+            "custom+xai profile must strip freeform apply_patch: {tools:?}"
+        );
+        assert!(responses_native_strips_freeform_apply_patch("custom", "xai"));
+    }
+
+    #[test]
+    fn custom_openai_native_midstation_keeps_codex_native_tools() {
+        // 橙子便宜 class: custom + openai_native → ChatGPT Official tool path.
+        let mut body = json!({
+            "tools": [
+                {"type": "custom", "name": "apply_patch"},
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"}
+                }
+            ],
+            "input": [{
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "call_id": "t1",
+                "input": "*** Begin Patch\n*** End Patch"
+            }]
+        });
+        sanitize_responses_request_for_upstream_with_profile(
+            "custom",
+            "openai_native",
+            &mut body,
+        );
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert_eq!(body["tools"][0]["name"], "apply_patch");
+        assert_eq!(body["input"][0]["type"], "custom_tool_call");
+        assert!(!responses_native_strips_freeform_apply_patch(
+            "custom",
+            "openai_native"
+        ));
+        assert!(keeps_codex_native_tools("custom", "openai_native"));
+        assert!(crate::providers::treats_as_chatgpt_official(
+            "custom",
+            Some("openai_compat")
+        ));
+    }
+
+    #[test]
+    fn openai_official_keeps_function_call_history_and_native_tools() {
+        // ChatGPT Official / API Key: no tool port; function_call trail stays native.
+        let mut request = json!({
+            "tools": [
+                {"type": "custom", "name": "apply_patch", "description": "patch"},
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+                }
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "tool_1",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "tool_1",
+                    "output": "Success"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "resp_x_msg",
+                    "content": [{"type": "output_text", "text": "done"}]
+                }
+            ]
+        });
+        sanitize_responses_request_for_upstream("openai", &mut request);
+        let tools = request["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2, "openai must not port/drop native tools");
+        assert_eq!(tools[0]["type"], "custom");
+        assert_eq!(tools[0]["name"], "apply_patch");
+        assert_eq!(tools[1]["name"], "exec_command");
+        let input = request["input"].as_array().expect("input");
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["name"], "exec_command");
+        assert_eq!(input[1]["type"], "function_call_output");
+        // Freeform history stays custom_tool_call (not rewritten to function_call).
+        assert_eq!(input[2]["type"], "custom_tool_call");
+        assert_eq!(input[2]["name"], "apply_patch");
+        assert_eq!(input[3]["type"], "custom_tool_call_output");
+        // Message ids still rewritten for OpenAI msg* rule.
+        assert_eq!(input[4]["id"], "msg_x");
     }
 
     #[test]
