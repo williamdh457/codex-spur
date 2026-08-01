@@ -305,53 +305,18 @@ async fn responses(
     }
 }
 
-/// Choose Chat Completions bridge vs native Responses (CC Switch–aligned).
+/// Three-lane upstream routing (see [`providers::UpstreamProtocolLane`]).
 ///
-/// Codex Desktop always speaks **Responses** to Spur (`/v1/responses`).
-/// Upstream protocol is decided here, matching CC Switch local routing:
-///
-/// | Kind | Upstream | Spur path |
-/// |---|---|---|
-/// | openai | Responses | passthrough (+ history sanitize) |
-/// | xai / Grok | Responses (`api.x.ai/v1/responses`) | passthrough |
-/// | deepseek-v4-flash/pro | Responses (official Codex script) | passthrough |
-/// | deepseek legacy chat ids | Chat Completions | Responses↔Chat bridge |
-/// | kimi | Chat Completions | bridge |
-/// | minimax | Chat Completions (CCS openai_chat presets) | bridge |
-/// | opencode-go | Chat Completions | bridge |
-/// | custom OpenAI-compatible | Chat unless protocol says Responses | bridge by default |
-///
-/// Do not invent extra product policies here (no retry circuit-breakers, etc.).
+/// Codex → Spur is always Responses. This only picks upstream dialect:
+/// - OpenAI official → Responses (OpenAI product)
+/// - Responses native → DeepSeek-style passthrough (DeepSeek Flash, xAI Grok, …)
+/// - Chat Completions bridge → CC Switch openai_chat conversion
+fn upstream_lane(target: &RouteTarget) -> providers::UpstreamProtocolLane {
+    providers::upstream_protocol_lane(&target.kind, &target.protocol, &target.upstream_model)
+}
+
 fn route_uses_chat_completions(target: &RouteTarget) -> bool {
-    let kind = target.kind.to_ascii_lowercase();
-    let protocol = target.protocol.to_ascii_lowercase();
-
-    // DeepSeek V4 Flash/Pro: official native Responses; legacy ids stay on Chat.
-    if kind == "deepseek" {
-        return providers::deepseek_route_uses_chat_completions(
-            &target.protocol,
-            &target.upstream_model,
-        );
-    }
-
-    // CCS Responses-native (no Chat rewrite).
-    if kind == "openai" || kind == "xai" {
-        return false;
-    }
-
-    // CCS "Needs Local Routing" / openai_chat style kinds.
-    if matches!(kind.as_str(), "kimi" | "minimax" | "opencode-go") {
-        return true;
-    }
-
-    // Custom OpenAI-compatible: default Chat bridge (CCS apiFormat=openai_chat).
-    // Only skip the bridge when the user explicitly stored a Responses protocol.
-    if kind == "custom" {
-        return !protocol.contains("response");
-    }
-
-    // Fallback: protocol string from kind_meta / user DB.
-    protocol.contains("chat")
+    upstream_lane(target).uses_chat_completions_bridge()
 }
 
 /// Local Remote Compaction V2 for every route (including OpenAI): summarize with
@@ -5341,26 +5306,50 @@ data: [DONE]
     }
 
     #[test]
-    fn ccs_aligned_chat_vs_responses_routing() {
-        // Responses passthrough (no Chat rewrite)
+    fn three_lane_routing_openai_responses_native_and_chat_bridge() {
+        use crate::providers::UpstreamProtocolLane as Lane;
+
+        // 1) OpenAI official
+        assert_eq!(
+            upstream_lane(&test_route_target_with_model(
+                "openai",
+                "gpt-5.6-terra",
+                "Responses"
+            )),
+            Lane::OpenAiOfficial
+        );
         assert!(!route_uses_chat_completions(&test_route_target_with_model(
             "openai",
             "gpt-5.6-terra",
             "Responses"
         )));
+
+        // 2) Responses native (DeepSeek-style) — includes Grok: xAI preferred API is Responses
+        assert_eq!(
+            upstream_lane(&test_route_target_with_model(
+                "xai", "grok-4.5", "Responses"
+            )),
+            Lane::ResponsesNative
+        );
+        assert_eq!(
+            upstream_lane(&test_route_target_with_model(
+                "deepseek",
+                "deepseek-v4-flash",
+                "Chat Completions" // stale row still native for Flash
+            )),
+            Lane::ResponsesNative
+        );
         assert!(!route_uses_chat_completions(&test_route_target_with_model(
             "xai", "grok-4.5", "Responses"
         )));
-        assert!(!route_uses_chat_completions(&test_route_target_with_model(
-            "deepseek",
-            "deepseek-v4-flash",
-            "Responses"
-        )));
 
-        // CCS openai_chat / Needs Local Routing kinds → Chat bridge
-        assert!(route_uses_chat_completions(&test_route_target_with_model(
-            "kimi", "k3", "Chat Completions"
-        )));
+        // 3) CC Switch Chat Completions bridge
+        assert_eq!(
+            upstream_lane(&test_route_target_with_model(
+                "kimi", "k3", "Chat Completions"
+            )),
+            Lane::ChatCompletionsBridge
+        );
         assert!(route_uses_chat_completions(&test_route_target_with_model(
             "minimax",
             "MiniMax-M2",
@@ -5371,18 +5360,29 @@ data: [DONE]
             "deepseek-v4-flash",
             "Chat Completions"
         )));
-        // Custom OpenAI-compatible defaults to Chat bridge
         assert!(route_uses_chat_completions(&test_route_target_with_model(
             "custom",
             "some-model",
             "OpenAI-compatible"
         )));
-        // Explicit Responses on custom skips bridge
-        assert!(!route_uses_chat_completions(&test_route_target_with_model(
-            "custom",
-            "some-model",
-            "Responses"
-        )));
+        // Explicit Responses on custom → native lane
+        assert_eq!(
+            upstream_lane(&test_route_target_with_model(
+                "custom",
+                "some-model",
+                "Responses"
+            )),
+            Lane::ResponsesNative
+        );
+        // DeepSeek legacy chat id → bridge
+        assert_eq!(
+            upstream_lane(&test_route_target_with_model(
+                "deepseek",
+                "deepseek-chat",
+                "Responses"
+            )),
+            Lane::ChatCompletionsBridge
+        );
     }
 
     #[test]

@@ -77,7 +77,9 @@ pub fn kind_meta(
             "Chat Completions",
             Some("https://api.minimaxi.com/v1"),
         )),
-        // xAI Grok: native Responses (same as CCS Grok/xAI Responses path).
+        // xAI Grok: official preferred path is Responses (`/v1/responses`).
+        // Chat Completions still exists on api.x.ai but is documented as legacy.
+        // Spur uses Responses passthrough (DeepSeek-style native lane), not CCS Chat bridge.
         "xai" => Some(("Grok", "Global", "Responses", Some("https://api.x.ai/v1"))),
         // Custom OpenAI-compatible gateways are Chat by default (CCS openai_chat).
         // Users who truly have a Responses-compatible custom host can set protocol
@@ -116,6 +118,86 @@ pub fn deepseek_model_supports_native_responses(upstream_model: &str) -> bool {
 /// Legacy ids (`deepseek-chat`, …) stay on Chat Completions.
 pub fn deepseek_route_uses_chat_completions(_protocol: &str, upstream_model: &str) -> bool {
     !deepseek_model_supports_native_responses(upstream_model)
+}
+
+/// Three product lanes for how Spur talks to an upstream (user-facing model).
+///
+/// Codex Desktop always hits Spur with **Responses**. The lane only picks the
+/// upstream dialect + which reference we follow:
+///
+/// 1. [`OpenAiOfficial`] — OpenAI / ChatGPT Codex backend (OpenAI product path).
+/// 2. [`ResponsesNative`] — pure Responses hosts, DeepSeek-official style
+///    (catalog freeform + lean prompts + `/responses` passthrough). Includes
+///    DeepSeek V4 Flash/Pro and **xAI Grok** (`api.x.ai/v1/responses` is xAI's
+///    preferred API; Chat Completions exists but is documented as legacy).
+/// 3. [`ChatCompletionsBridge`] — CC Switch `openai_chat` style: rewrite
+///    Responses↔Chat Completions for Kimi / MiniMax / OpenCode Go / most custom
+///    OpenAI-compatible gateways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamProtocolLane {
+    OpenAiOfficial,
+    ResponsesNative,
+    ChatCompletionsBridge,
+}
+
+impl UpstreamProtocolLane {
+    pub fn uses_chat_completions_bridge(self) -> bool {
+        matches!(self, Self::ChatCompletionsBridge)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiOfficial => "OpenAI official Responses",
+            Self::ResponsesNative => "Responses native (DeepSeek-style)",
+            Self::ChatCompletionsBridge => "Chat Completions bridge (CC Switch-style)",
+        }
+    }
+}
+
+/// Resolve the three-lane routing for a provider kind + protocol + model id.
+pub fn upstream_protocol_lane(kind: &str, protocol: &str, upstream_model: &str) -> UpstreamProtocolLane {
+    let kind = kind.to_ascii_lowercase();
+    let protocol = protocol.to_ascii_lowercase();
+
+    // 1) OpenAI product path
+    if kind == "openai" {
+        return UpstreamProtocolLane::OpenAiOfficial;
+    }
+
+    // 2) Pure Responses (DeepSeek-official style for non-OpenAI Responses hosts)
+    // xAI: docs.x.ai — Responses preferred; Chat Completions is legacy.
+    if kind == "xai" {
+        return UpstreamProtocolLane::ResponsesNative;
+    }
+    if kind == "deepseek" {
+        return if deepseek_model_supports_native_responses(upstream_model) {
+            UpstreamProtocolLane::ResponsesNative
+        } else {
+            UpstreamProtocolLane::ChatCompletionsBridge
+        };
+    }
+
+    // 3) CC Switch Chat Completions bridge
+    if matches!(kind.as_str(), "kimi" | "minimax" | "opencode-go") {
+        return UpstreamProtocolLane::ChatCompletionsBridge;
+    }
+    if kind == "custom" {
+        // Explicit Responses protocol → native lane; otherwise Chat bridge.
+        return if protocol.contains("response") {
+            UpstreamProtocolLane::ResponsesNative
+        } else {
+            UpstreamProtocolLane::ChatCompletionsBridge
+        };
+    }
+
+    // Fallback from stored protocol string
+    if protocol.contains("chat") {
+        UpstreamProtocolLane::ChatCompletionsBridge
+    } else if protocol.contains("response") {
+        UpstreamProtocolLane::ResponsesNative
+    } else {
+        UpstreamProtocolLane::ChatCompletionsBridge
+    }
 }
 
 #[allow(dead_code)]
@@ -1284,6 +1366,32 @@ mod tests {
         let meta = kind_meta("deepseek").expect("deepseek kind");
         assert_eq!(meta.2, "Responses");
         assert!(meta.3.unwrap_or("").contains("api.deepseek.com"));
+    }
+
+    #[test]
+    fn three_lane_labels_match_product_story() {
+        assert_eq!(
+            upstream_protocol_lane("openai", "Responses", "gpt-5.6-terra"),
+            UpstreamProtocolLane::OpenAiOfficial
+        );
+        assert_eq!(
+            upstream_protocol_lane("xai", "Responses", "grok-4.5"),
+            UpstreamProtocolLane::ResponsesNative
+        );
+        assert_eq!(
+            upstream_protocol_lane("deepseek", "Responses", "deepseek-v4-flash"),
+            UpstreamProtocolLane::ResponsesNative
+        );
+        assert_eq!(
+            upstream_protocol_lane("kimi", "Chat Completions", "k3"),
+            UpstreamProtocolLane::ChatCompletionsBridge
+        );
+        assert!(upstream_protocol_lane("xai", "Responses", "grok-4.5")
+            .label()
+            .contains("DeepSeek-style"));
+        assert!(upstream_protocol_lane("kimi", "Chat Completions", "k3")
+            .label()
+            .contains("CC Switch"));
     }
 
     #[test]

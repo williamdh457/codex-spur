@@ -2743,9 +2743,9 @@ function DiagnosticsPage({ snapshot }: { snapshot: AppSnapshot }) {
       <div className="callout">
         <strong>协议覆盖状态</strong>
         <p>
-          与 CC Switch 一致：Codex 始终打本地 Responses；Kimi / MiniMax / OpenCode Go / 自定义
-          Chat 上游走 Responses↔Chat Completions 桥（含流式 tool_calls）；OpenAI / Grok /
-          DeepSeek V4 Flash 走 Responses 透传。
+          三路：① OpenAI 官方按 OpenAI Responses；② 纯 Responses（DeepSeek Flash、xAI Grok
+          官方推荐 /responses）透传；③ 只会 Chat Completions 的（Kimi / MiniMax / OpenCode Go /
+          多数自定义中转）按 CC Switch 做 Completion↔Response 桥。
         </p>
       </div>
     </div>
