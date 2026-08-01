@@ -82,11 +82,45 @@ pub fn kind_meta(
         // Spur uses Responses passthrough (DeepSeek-style native lane), not CCS Chat bridge.
         "xai" => Some(("Grok", "Global", "Responses", Some("https://api.x.ai/v1"))),
         // Custom OpenAI-compatible gateways are Chat by default (CCS openai_chat).
-        // Users who truly have a Responses-compatible custom host can set protocol
-        // to contain "Responses" on the provider row later.
+        // Users pick Responses vs Chat Completions in the add/edit UI
+        // (`set_provider_protocol` → `providers.protocol`).
         "custom" => Some(("自定义供应商", "Custom", "Chat Completions", None)),
         _ => None,
     }
+}
+
+/// Canonical stored values for `providers.protocol`.
+pub const PROTOCOL_RESPONSES: &str = "Responses";
+pub const PROTOCOL_CHAT_COMPLETIONS: &str = "Chat Completions";
+
+/// Normalize a user/UI wire choice into the stored protocol label.
+///
+/// Accepts short ids (`responses` / `completions`), UI labels, and legacy strings
+/// that already contain "response" or "chat".
+pub fn normalize_provider_protocol(value: &str) -> Option<&'static str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "responses"
+        || lower == "response"
+        || lower == "responses api"
+        || lower.contains("response")
+    {
+        return Some(PROTOCOL_RESPONSES);
+    }
+    if lower == "completions"
+        || lower == "completion"
+        || lower == "chat"
+        || lower == "chat completions"
+        || lower == "chat_completions"
+        || lower.contains("chat")
+        || lower.contains("completion")
+    {
+        return Some(PROTOCOL_CHAT_COMPLETIONS);
+    }
+    None
 }
 
 pub fn default_base_url_for_kind(kind: &str) -> Option<String> {
@@ -1142,6 +1176,7 @@ pub fn catalog_model(
         provider_label,
         model,
         reasoning_profile_id_for_kind(kind),
+        None,
     )
 }
 
@@ -1151,6 +1186,7 @@ pub fn catalog_model_with_profile(
     provider_label: &str,
     model: &DiscoveredProviderModel,
     profile: crate::reasoning_map::ReasoningProfileId,
+    protocol_override: Option<&str>,
 ) -> CatalogModel {
     // GPT-class models used with ChatGPT backend expect larger windows; others keep 128k default.
     let is_openai_family =
@@ -1180,8 +1216,11 @@ pub fn catalog_model_with_profile(
     let slug = desktop_native_model_slug(&model.id)
         .map(str::to_string)
         .unwrap_or_else(|| opaque_route_slug(provider_id, &model.id));
-    let protocol = kind_meta(kind)
-        .map(|(_, _, p, _)| p)
+    // Prefer the instance's stored protocol (custom Responses vs Chat); fall back to kind default.
+    let protocol = protocol_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| kind_meta(kind).map(|(_, _, p, _)| p))
         .unwrap_or("Chat Completions");
     let mut catalog = CatalogModel {
         slug,
@@ -1299,6 +1338,7 @@ pub fn route_catalog_json(
         provider_label,
         model,
         reasoning_profile_id_for_kind(kind),
+        None,
     )
 }
 
@@ -1308,9 +1348,17 @@ pub fn route_catalog_json_with_profile(
     provider_label: &str,
     model: &DiscoveredProviderModel,
     profile: crate::reasoning_map::ReasoningProfileId,
+    protocol_override: Option<&str>,
 ) -> anyhow::Result<String> {
     let payload = RouteCatalogPayload {
-        model: catalog_model_with_profile(provider_id, kind, provider_label, model, profile),
+        model: catalog_model_with_profile(
+            provider_id,
+            kind,
+            provider_label,
+            model,
+            profile,
+            protocol_override,
+        ),
         reasoning_profile: reasoning_profile_for(profile, &model.id),
     };
     Ok(serde_json::to_string(&payload)?)
@@ -1450,6 +1498,36 @@ mod tests {
         let meta = kind_meta("deepseek").expect("deepseek kind");
         assert_eq!(meta.2, "Responses");
         assert!(meta.3.unwrap_or("").contains("api.deepseek.com"));
+    }
+
+    #[test]
+    fn normalize_provider_protocol_accepts_short_and_full_labels() {
+        assert_eq!(
+            normalize_provider_protocol("responses"),
+            Some(PROTOCOL_RESPONSES)
+        );
+        assert_eq!(
+            normalize_provider_protocol("Responses"),
+            Some(PROTOCOL_RESPONSES)
+        );
+        assert_eq!(
+            normalize_provider_protocol("completions"),
+            Some(PROTOCOL_CHAT_COMPLETIONS)
+        );
+        assert_eq!(
+            normalize_provider_protocol("Chat Completions"),
+            Some(PROTOCOL_CHAT_COMPLETIONS)
+        );
+        assert_eq!(
+            upstream_protocol_lane("custom", PROTOCOL_RESPONSES, "m"),
+            UpstreamProtocolLane::ResponsesNative
+        );
+        assert_eq!(
+            upstream_protocol_lane("custom", PROTOCOL_CHAT_COMPLETIONS, "m"),
+            UpstreamProtocolLane::ChatCompletionsBridge
+        );
+        assert!(normalize_provider_protocol("").is_none());
+        assert!(normalize_provider_protocol("grpc").is_none());
     }
 
     #[test]

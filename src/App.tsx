@@ -56,6 +56,7 @@ import {
   deleteRelayApiKey,
   revealDefaultRelayApiKey,
   setProviderReasoningProfile,
+  setProviderProtocol,
   setProviderRouting,
   startOpenAiBrowserLogin,
   startXaiDeviceLogin,
@@ -827,6 +828,10 @@ function AddProviderWizard({
   const [openCodeGoStatus, setOpenCodeGoStatus] = useState<string | null>(null);
   const [reasoningOptions, setReasoningOptions] = useState<ReasoningProfileOption[]>([]);
   const [reasoningProfileId, setReasoningProfileId] = useState("openai_native");
+  /** Custom host wire: Responses vs Chat Completions. Kind defaults ignore this. */
+  const [wireProtocol, setWireProtocol] = useState<"Responses" | "Chat Completions">(
+    "Chat Completions",
+  );
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   /** OpenAI official subscription — browser PKCE session (no secrets). */
@@ -910,6 +915,8 @@ function AddProviderWizard({
       "opencode-go": "openai_native",
     };
     setReasoningProfileId(defaults[next.kind] ?? "openai_native");
+    // Custom defaults to Chat Completions (CCS openai_chat); user can pick Responses.
+    setWireProtocol("Chat Completions");
     if (next.kind === "opencode-go") {
       void inspectOpenCodeGoCredential()
         .then((status) => setOpenCodeGoStatus(`${status.message}（${status.pathLabel}）`))
@@ -956,6 +963,11 @@ function AddProviderWizard({
     await setProviderReasoningProfile(providerId, reasoningProfileId);
   };
 
+  const applyWizardWireProtocol = async (providerId: string) => {
+    if (method.kind !== "custom") return;
+    await setProviderProtocol(providerId, wireProtocol);
+  };
+
   const submitOpenCodeGoImport = async () => {
     setBusy(true);
     setMessage(null);
@@ -988,6 +1000,7 @@ function AddProviderWizard({
       const created = await createProviderInstance(method.kind, displayName.trim() || undefined);
       createdId = created.id;
       await applyWizardReasoningProfile(created.id);
+      await applyWizardWireProtocol(created.id);
       const routes = await discoverProviderModels(created.id, baseUrl, apiKey || undefined);
       const count = routes.filter((route) => route.providerId === created.id).length;
       finishCreate(created, count);
@@ -1007,6 +1020,7 @@ function AddProviderWizard({
       const created = await createProviderInstance(method.kind, displayName.trim() || undefined);
       createdId = created.id;
       await applyWizardReasoningProfile(created.id);
+      await applyWizardWireProtocol(created.id);
       const routes = await importProviderConfigJson(created.id, await file.text());
       const count = routes.filter((route) => route.providerId === created.id).length;
       finishCreate(created, count);
@@ -1278,6 +1292,27 @@ function AddProviderWizard({
                   ?? "按真实上游厂商选择；custom 接 GPT 选 OpenAI 原生，接杂牌选兼容保守或对应厂商。"}
               </small>
             </label>
+            {method.kind === "custom" && (
+              <label className="field">
+                <span>上游 API 格式</span>
+                <select
+                  value={wireProtocol}
+                  onChange={(event) =>
+                    setWireProtocol(
+                      event.target.value === "Responses" ? "Responses" : "Chat Completions",
+                    )
+                  }
+                  disabled={busy}
+                >
+                  <option value="Chat Completions">Chat Completions（/v1/chat/completions）</option>
+                  <option value="Responses">Responses（/v1/responses）</option>
+                </select>
+                <small className="field-help">
+                  Codex 始终以 Responses 打进 Spur；这里选上游真实接口。只会 Completions 的网关选 Chat
+                  Completions；原生支持 /responses 的选 Responses。
+                </small>
+              </label>
+            )}
 
             {method.mode === "oauth" && method.kind === "openai" && (
               <section className="modal-section" aria-label="OpenAI 官方订阅登录">
@@ -1645,6 +1680,9 @@ function EditProviderSheet({
   const [reasoningOptions, setReasoningOptions] = useState<ReasoningProfileOption[]>([]);
   const [reasoningProfileId, setReasoningProfileId] = useState(
     provider.reasoningProfileId || "openai_native",
+  );
+  const [wireProtocol, setWireProtocol] = useState<"Responses" | "Chat Completions">(() =>
+    /response/i.test(provider.protocol) ? "Responses" : "Chat Completions",
   );
   const deleteBusy = deletingCredentialId != null || deletingProvider;
 
@@ -2110,6 +2148,43 @@ function EditProviderSheet({
                     ?? "决定 Codex 推理档如何改写到上游；custom / OpenCode Go 请按真实厂商选择。"}
                 </small>
               </label>
+              {provider.kind === "custom" && (
+                <label className="field">
+                  <span>上游 API 格式</span>
+                  <select
+                    value={wireProtocol}
+                    disabled={busy}
+                    onChange={(event) => {
+                      const next =
+                        event.target.value === "Responses" ? "Responses" : "Chat Completions";
+                      setWireProtocol(next);
+                      void (async () => {
+                        setBusy(true);
+                        setMessage(null);
+                        try {
+                          await setProviderProtocol(provider.id, next);
+                          setMessage(
+                            next === "Responses"
+                              ? "已切换为 Responses 上游（原生 /v1/responses）。"
+                              : "已切换为 Chat Completions 上游（Responses→Chat 桥接）。",
+                          );
+                          await onChanged();
+                        } catch (error) {
+                          setMessage(error instanceof Error ? error.message : String(error));
+                        } finally {
+                          setBusy(false);
+                        }
+                      })();
+                    }}
+                  >
+                    <option value="Chat Completions">Chat Completions（/v1/chat/completions）</option>
+                    <option value="Responses">Responses（/v1/responses）</option>
+                  </select>
+                  <small className="field-help">
+                    Codex 始终以 Responses 打进 Spur；这里选上游真实接口。改完会刷新 catalog 的工具广告策略。
+                  </small>
+                </label>
+              )}
             </section>
 
             <section className="modal-section" aria-label="连接">

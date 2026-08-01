@@ -52,6 +52,13 @@ pub struct StoredRelayApiKey {
     pub key_prefix: String,
     pub key_hash: String,
     pub enabled: bool,
+    /// `responses` | `completions` — client wire + upstream class.
+    pub wire_type: String,
+    /// `dotted` (供应商.模型) | `flat` (按供应商选、扁平 id).
+    pub name_style: String,
+    /// Flat mode: allowed provider instance ids.
+    pub allowed_providers: Vec<String>,
+    /// Dotted mode (or legacy): allowed public model / route ids.
     pub allowed_models: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -427,6 +434,36 @@ impl Storage {
         Ok(())
     }
 
+    /// Set upstream wire protocol: `Responses` or `Chat Completions`.
+    ///
+    /// Used by custom OpenAI-compatible hosts so the proxy picks native
+    /// `/responses` vs Responses→Chat Completions bridge.
+    pub async fn set_provider_protocol(
+        &self,
+        provider_id: &str,
+        protocol: &str,
+    ) -> Result<(), sqlx::Error> {
+        let normalized = crate::providers::normalize_provider_protocol(protocol).ok_or_else(
+            || {
+                sqlx::Error::Protocol(
+                    format!(
+                        "未知上游协议：{protocol}（请选 Responses 或 Chat Completions）"
+                    )
+                    .into(),
+                )
+            },
+        )?;
+        let result = sqlx::query("UPDATE providers SET protocol = ? WHERE id = ?")
+            .bind(normalized)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::Protocol("供应商不存在".into()));
+        }
+        Ok(())
+    }
+
     pub async fn delete_provider_instance(&self, provider_id: &str) -> Result<(), sqlx::Error> {
         let result = sqlx::query("DELETE FROM providers WHERE id = ?")
             .bind(provider_id)
@@ -702,12 +739,26 @@ impl Storage {
     fn parse_relay_key_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredRelayApiKey, sqlx::Error> {
         let allowed_raw: String = row.get("allowed_models_json");
         let allowed_models: Vec<String> = serde_json::from_str(&allowed_raw).unwrap_or_default();
+        let providers_raw: String = row
+            .try_get::<String, _>("allowed_providers_json")
+            .unwrap_or_else(|_| "[]".into());
+        let allowed_providers: Vec<String> =
+            serde_json::from_str(&providers_raw).unwrap_or_default();
+        let wire_type = row
+            .try_get::<String, _>("wire_type")
+            .unwrap_or_else(|_| "responses".into());
+        let name_style = row
+            .try_get::<String, _>("name_style")
+            .unwrap_or_else(|_| "flat".into());
         Ok(StoredRelayApiKey {
             id: row.get("id"),
             label: row.get("label"),
             key_prefix: row.get("key_prefix"),
             key_hash: row.get("key_hash"),
             enabled: row.get::<i64, _>("enabled") != 0,
+            wire_type,
+            name_style,
+            allowed_providers,
             allowed_models,
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -715,9 +766,14 @@ impl Storage {
         })
     }
 
+    // Static SQL only: sqlx 0.9 rejects dynamic format! strings without AssertSqlSafe.
     pub async fn list_relay_api_keys(&self) -> Result<Vec<StoredRelayApiKey>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, label, key_prefix, key_hash, enabled, allowed_models_json, created_at, updated_at, last_used_at
+            "SELECT id, label, key_prefix, key_hash, enabled,
+             COALESCE(wire_type, 'responses') AS wire_type,
+             COALESCE(name_style, 'flat') AS name_style,
+             COALESCE(allowed_providers_json, '[]') AS allowed_providers_json,
+             allowed_models_json, created_at, updated_at, last_used_at
              FROM relay_api_keys ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -730,7 +786,11 @@ impl Storage {
         key_hash: &str,
     ) -> Result<Option<StoredRelayApiKey>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, label, key_prefix, key_hash, enabled, allowed_models_json, created_at, updated_at, last_used_at
+            "SELECT id, label, key_prefix, key_hash, enabled,
+             COALESCE(wire_type, 'responses') AS wire_type,
+             COALESCE(name_style, 'flat') AS name_style,
+             COALESCE(allowed_providers_json, '[]') AS allowed_providers_json,
+             allowed_models_json, created_at, updated_at, last_used_at
              FROM relay_api_keys WHERE key_hash = ? AND enabled = 1 LIMIT 1",
         )
         .bind(key_hash)
@@ -745,18 +805,37 @@ impl Storage {
         label: &str,
         key_prefix: &str,
         key_hash: &str,
+        wire_type: &str,
+        name_style: &str,
+        allowed_providers: &[String],
         allowed_models: &[String],
     ) -> Result<StoredRelayApiKey, sqlx::Error> {
         let allowed_json = serde_json::to_string(allowed_models)
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        let providers_json = serde_json::to_string(allowed_providers)
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        let wire = if wire_type == "completions" {
+            "completions"
+        } else {
+            "responses"
+        };
+        let style = if name_style == "dotted" {
+            "dotted"
+        } else {
+            "flat"
+        };
         sqlx::query(
-            "INSERT INTO relay_api_keys (id, label, key_prefix, key_hash, enabled, allowed_models_json)
-             VALUES (?, ?, ?, ?, 1, ?)",
+            "INSERT INTO relay_api_keys
+             (id, label, key_prefix, key_hash, enabled, wire_type, name_style, allowed_providers_json, allowed_models_json)
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(label)
         .bind(key_prefix)
         .bind(key_hash)
+        .bind(wire)
+        .bind(style)
+        .bind(providers_json)
         .bind(allowed_json)
         .execute(&self.pool)
         .await?;
@@ -770,7 +849,11 @@ impl Storage {
         id: &str,
     ) -> Result<Option<StoredRelayApiKey>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, label, key_prefix, key_hash, enabled, allowed_models_json, created_at, updated_at, last_used_at
+            "SELECT id, label, key_prefix, key_hash, enabled,
+             COALESCE(wire_type, 'responses') AS wire_type,
+             COALESCE(name_style, 'flat') AS name_style,
+             COALESCE(allowed_providers_json, '[]') AS allowed_providers_json,
+             allowed_models_json, created_at, updated_at, last_used_at
              FROM relay_api_keys WHERE id = ?",
         )
         .bind(id)
@@ -784,6 +867,9 @@ impl Storage {
         id: &str,
         label: Option<&str>,
         enabled: Option<bool>,
+        wire_type: Option<&str>,
+        name_style: Option<&str>,
+        allowed_providers: Option<&[String]>,
         allowed_models: Option<&[String]>,
     ) -> Result<Option<StoredRelayApiKey>, sqlx::Error> {
         let Some(existing) = self.get_relay_api_key(id).await? else {
@@ -791,14 +877,33 @@ impl Storage {
         };
         let label = label.unwrap_or(existing.label.as_str());
         let enabled = enabled.unwrap_or(existing.enabled);
+        let wire = wire_type
+            .map(|w| {
+                if w == "completions" {
+                    "completions"
+                } else {
+                    "responses"
+                }
+            })
+            .unwrap_or(existing.wire_type.as_str());
+        let style = name_style
+            .map(|s| if s == "dotted" { "dotted" } else { "flat" })
+            .unwrap_or(existing.name_style.as_str());
         let allowed_models = allowed_models.unwrap_or(existing.allowed_models.as_slice());
+        let allowed_providers = allowed_providers.unwrap_or(existing.allowed_providers.as_slice());
         let allowed_json = serde_json::to_string(allowed_models)
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        let providers_json = serde_json::to_string(allowed_providers)
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         sqlx::query(
-            "UPDATE relay_api_keys SET label = ?, enabled = ?, allowed_models_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE relay_api_keys SET label = ?, enabled = ?, wire_type = ?, name_style = ?,
+             allowed_providers_json = ?, allowed_models_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(label)
         .bind(enabled as i64)
+        .bind(wire)
+        .bind(style)
+        .bind(providers_json)
         .bind(allowed_json)
         .bind(id)
         .execute(&self.pool)
@@ -3746,12 +3851,17 @@ mod relay_storage_tests {
                 "Default",
                 "sk-spur-test…",
                 &hash,
+                "responses",
+                "flat",
+                &[],
                 &["route-a".into()],
             )
             .await
             .expect("insert");
         assert_eq!(created.label, "Default");
         assert_eq!(created.allowed_models, vec!["route-a".to_string()]);
+        assert_eq!(created.wire_type, "responses");
+        assert_eq!(created.name_style, "flat");
 
         let found = storage
             .find_relay_api_key_by_hash(&hash)
@@ -3761,7 +3871,15 @@ mod relay_storage_tests {
         assert_eq!(found.id, "key-1");
 
         let updated = storage
-            .update_relay_api_key("key-1", Some("Team"), Some(false), Some(&[]))
+            .update_relay_api_key(
+                "key-1",
+                Some("Team"),
+                Some(false),
+                None,
+                None,
+                None,
+                Some(&[]),
+            )
             .await
             .expect("update")
             .expect("row");
@@ -3786,7 +3904,7 @@ mod relay_storage_tests {
 
         // Re-enable after regenerate.
         let _ = storage
-            .update_relay_api_key("key-1", None, Some(true), None)
+            .update_relay_api_key("key-1", None, Some(true), None, None, None, None)
             .await
             .expect("enable");
         assert!(storage

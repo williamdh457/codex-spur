@@ -126,7 +126,13 @@ pub struct RelayApiKeySummary {
     pub label: String,
     pub key_prefix: String,
     pub enabled: bool,
-    /// Empty = all `relay_enabled` models.
+    /// `responses` | `completions`
+    pub wire_type: String,
+    /// `dotted` | `flat` (加点 / 不加点)
+    pub name_style: String,
+    /// Flat mode: provider instance ids.
+    pub allowed_providers: Vec<String>,
+    /// Dotted mode or legacy: public model / route ids. Empty = all allowed by style.
     pub allowed_models: Vec<String>,
     pub created_at: String,
     pub updated_at: String,

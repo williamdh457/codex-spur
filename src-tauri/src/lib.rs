@@ -118,6 +118,9 @@ impl AppState {
                     "Default",
                     &proxy::relay_key_prefix(&secret),
                     &proxy::relay_key_hash(&secret),
+                    "responses",
+                    "flat",
+                    &[],
                     &[],
                 )
                 .await;
@@ -382,6 +385,9 @@ fn stored_relay_key_to_summary(key: storage::StoredRelayApiKey) -> RelayApiKeySu
         label: key.label,
         key_prefix: key.key_prefix,
         enabled: key.enabled,
+        wire_type: key.wire_type,
+        name_style: key.name_style,
+        allowed_providers: key.allowed_providers,
         allowed_models: key.allowed_models,
         created_at: key.created_at,
         updated_at: key.updated_at,
@@ -1204,6 +1210,7 @@ async fn publish_discovered_models(
                 &provider.name,
                 model,
                 profile,
+                Some(provider.protocol.as_str()),
             )
             .map(|catalog_json| (model.id.clone(), model.display_name.clone(), catalog_json))
         })
@@ -1591,6 +1598,28 @@ async fn set_provider_reasoning_profile(
         .await
         .map_err(|error| error.to_string())?;
     // Re-heal route catalog_json so mapping cards + catalog levels match the new template.
+    let _ = state.storage.heal_all_route_catalogs().await;
+    state.rebuild_runtime().await.map_err(|e| e.to_string())?;
+    state
+        .storage
+        .get_provider(&provider_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "供应商不存在".to_string())
+}
+
+#[tauri::command]
+async fn set_provider_protocol(
+    state: State<'_, AppState>,
+    provider_id: String,
+    protocol: String,
+) -> Result<ProviderSummary, String> {
+    state
+        .storage
+        .set_provider_protocol(&provider_id, &protocol)
+        .await
+        .map_err(|error| error.to_string())?;
+    // Protocol flips freeform/apply_patch ads for custom Responses vs Chat bridge.
     let _ = state.storage.heal_all_route_catalogs().await;
     state.rebuild_runtime().await.map_err(|e| e.to_string())?;
     state
@@ -2507,6 +2536,9 @@ async fn list_relay_api_keys(
 async fn create_relay_api_key(
     state: State<'_, AppState>,
     label: Option<String>,
+    wire_type: Option<String>,
+    name_style: Option<String>,
+    allowed_providers: Option<Vec<String>>,
     allowed_models: Option<Vec<String>>,
 ) -> Result<RelayApiKeyCreated, String> {
     let secret = proxy::generate_relay_api_key_secret();
@@ -2515,7 +2547,10 @@ async fn create_relay_api_key(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Client key".into());
-    let allowed = allowed_models.unwrap_or_default();
+    let wire = wire_type.unwrap_or_else(|| "responses".into());
+    let style = name_style.unwrap_or_else(|| "flat".into());
+    let providers = allowed_providers.unwrap_or_default();
+    let models = allowed_models.unwrap_or_default();
     let stored = state
         .storage
         .insert_relay_api_key(
@@ -2523,7 +2558,10 @@ async fn create_relay_api_key(
             &label,
             &proxy::relay_key_prefix(&secret),
             &proxy::relay_key_hash(&secret),
-            &allowed,
+            &wire,
+            &style,
+            &providers,
+            &models,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -2539,6 +2577,9 @@ async fn update_relay_api_key(
     id: String,
     label: Option<String>,
     enabled: Option<bool>,
+    wire_type: Option<String>,
+    name_style: Option<String>,
+    allowed_providers: Option<Vec<String>>,
     allowed_models: Option<Vec<String>>,
 ) -> Result<RelayApiKeySummary, String> {
     let stored = state
@@ -2547,6 +2588,9 @@ async fn update_relay_api_key(
             &id,
             label.as_deref(),
             enabled,
+            wire_type.as_deref(),
+            name_style.as_deref(),
+            allowed_providers.as_deref(),
             allowed_models.as_deref(),
         )
         .await
@@ -3717,6 +3761,7 @@ pub fn run() {
             create_provider_instance,
             list_reasoning_profile_options,
             set_provider_reasoning_profile,
+            set_provider_protocol,
             delete_provider_instance,
             rename_provider_instance,
             rename_credential,

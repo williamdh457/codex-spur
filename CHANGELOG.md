@@ -4,13 +4,21 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-08-01
+
 ### Features
 
+- **自定义供应商上游 API 格式**: 添加 / 编辑 **custom**（Base URL + API Key）时，除推理映射模板外可选 **Responses**（`/v1/responses`）或 **Chat Completions**（`/v1/chat/completions`，默认）。写入 `providers.protocol`；代理与 catalog freeform 策略随实例协议刷新，不再只用 kind 默认值。
+- **API 反代 Key：wire + 命名**: 反代 client key 支持 `wire_type`（responses / completions）、`name_style`（flat / dotted）与 `allowed_providers`；`POST /v1/responses` 与 `/v1/chat/completions` 按 key 与上游能力校验。迁移 `0011_relay_wire_and_naming.sql`。
 - **API 反代中转站（Responses 外放）**: Models 页为每个模型增加独立的 **Codex / 反代** 双开关；反代与 Codex catalog 互不绑定。同进程第二监听器（默认 `127.0.0.1:17862`）提供 `GET /healthz`、`GET /v1/models`、`POST /v1/responses`，鉴权用多把 client API Key（每把可设模型白名单）。可选局域网 bind（`0.0.0.0`）并展示 LAN Base URL。转发核复用现有三车道，不新做 tool 工程；不改 Codex `config.toml`。
 
 ### Fixed
 
 - **Three-lane upstream routing (OpenAI / Responses-native / Chat bridge)**: Codex always hits Spur `/v1/responses`. **(1) OpenAI official** — OpenAI product Responses. **(2) Responses-native (DeepSeek-style)** — DeepSeek V4 Flash/Pro and **xAI Grok** (`api.x.ai` preferred API is Responses; Chat Completions is legacy). **(3) Chat Completions bridge (CC Switch-style)** — Kimi, MiniMax, OpenCode Go, custom OpenAI-compatible by default, legacy DeepSeek chat ids. Explicit `Responses` on custom stays native.
+
+### Packaging
+
+- macOS Apple Silicon build for **0.1.13**.
 - **Grok/third-party apply_patch dialect (Desktop verification loop)**: Codex Desktop requires the freeform body first line to be exactly `*** Begin Patch` (no trailing stars). Grok and some bridges emit `*** Begin Patch ***`, path glued as `file.ts***`, or invented `*** End of File ***`, causing endless `apply_patch verification failed` retries (session 019fb8d7 ×44). Spur now normalizes apply_patch freeform input on the inbound tool-roundtrip path (JSON + SSE + already-shaped custom_tool_call) and tightens the portable tool description to the Desktop dialect. CC Switch routes Grok via Responses but does not rewrite patch text — this is a Spur multi-vendor fix.
 
 ### Features

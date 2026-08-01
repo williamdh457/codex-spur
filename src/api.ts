@@ -239,6 +239,14 @@ export async function setProviderReasoningProfile(
   return invoke("set_provider_reasoning_profile", { providerId, profileId });
 }
 
+/** Upstream wire: `Responses` or `Chat Completions` (custom OpenAI-compatible hosts). */
+export async function setProviderProtocol(
+  providerId: string,
+  protocol: string,
+): Promise<import("./types").ProviderSummary> {
+  return invoke("set_provider_protocol", { providerId, protocol });
+}
+
 export type OpenCodeGoCredentialStatus = {
   found: boolean;
   pathLabel: string;
