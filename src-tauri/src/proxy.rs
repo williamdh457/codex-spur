@@ -534,7 +534,9 @@ async fn responses(
     }
 }
 
-/// Relay `/v1/responses`: only **Response** keys; pure passthrough to Responses upstream.
+/// Relay `/v1/responses`: unified client key (Sub2API-style).
+/// - Responses upstream → raw passthrough
+/// - Chat Completions upstream → Responses→Chat bridge, reply as Responses
 async fn relay_responses_entry(
     state: &ProxyState,
     relay_key: Option<StoredRelayApiKey>,
@@ -547,13 +549,7 @@ async fn relay_responses_entry(
             "Relay requires a client API key",
         );
     };
-    if key.wire_type == "completions" {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "wire_mismatch",
-            "Completion API keys only support POST /v1/chat/completions",
-        );
-    }
+    // wire_type is legacy storage only; routing is by client path + upstream protocol.
     let model = parsed
         .get("model")
         .and_then(Value::as_str)
@@ -568,13 +564,6 @@ async fn relay_responses_entry(
         );
     };
     drop(routes);
-    if !route_upstream_is_responses(&target) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "upstream_wire_mismatch",
-            "Response keys require a Responses-capable upstream (not Chat Completions-only).",
-        );
-    }
     if target.base_url.is_empty() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -602,8 +591,15 @@ async fn relay_responses_entry(
         object.insert("model".into(), Value::String(target.upstream_model.clone()));
     }
     let affinity = affinity_inputs(&HeaderMap::new(), &parsed);
-    // Pure mid-station: no sanitize / freeform rewrite / compact hijack.
-    relay_forward_responses_raw(state, &target, parsed, &affinity).await
+    if route_upstream_is_responses(&target) {
+        // Pure mid-station: no sanitize / freeform rewrite / compact hijack.
+        return relay_forward_responses_raw(state, &target, parsed, &affinity).await;
+    }
+    // Chat Completions-only upstream: reuse Codex Responses→Chat bridge.
+    if media_sanitizer::should_strip_images(&target.kind, &target.upstream_model) {
+        media_sanitizer::replace_images_with_marker(&mut parsed);
+    }
+    forward_chat_compatible(state, &target, parsed, &affinity).await
 }
 
 /// Responses mid-station forward: auth + model rewrite only; stream raw body.
@@ -820,10 +816,9 @@ fn upstream_lane(target: &RouteTarget) -> providers::UpstreamProtocolLane {
     providers::upstream_protocol_lane(&target.kind, &target.protocol, &target.upstream_model)
 }
 
-/// Relay `/v1/chat/completions`:
-/// - **Completion** keys → pure Chat Completions passthrough to Completions upstream.
-/// - **Response** keys → convert Completions → Responses, forward to Responses upstream,
-///   convert response back to Completions for the client.
+/// Relay `/v1/chat/completions`: unified client key (Sub2API-style).
+/// - Chat Completions upstream → pure Chat passthrough
+/// - Responses upstream → Chat→Responses→Chat convert (stream + non-stream)
 async fn relay_chat_completions(
     State(state): State<ProxyState>,
     mut headers: HeaderMap,
@@ -894,26 +889,12 @@ async fn relay_chat_completions(
     }
     let affinity = affinity_inputs(&HeaderMap::new(), &parsed);
 
-    if key.wire_type == "completions" {
-        // Completion key: only Completions upstream, pure passthrough.
-        if route_upstream_is_responses(&target) {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "upstream_wire_mismatch",
-                "Completion API keys only bind Completions-capable upstreams.",
-            );
-        }
+    // Unified key: branch on upstream protocol, not key.wire_type.
+    if !route_upstream_is_responses(&target) {
         return relay_forward_chat_raw(&state, &target, parsed, &affinity).await;
     }
 
-    // Response key: Completions-in → Responses-up → Completions-out.
-    if !route_upstream_is_responses(&target) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "upstream_wire_mismatch",
-            "Response keys require a Responses-capable upstream when converting Completions.",
-        );
-    }
+    // Responses upstream: Completions-in → Responses-up → Completions-out.
     let wants_stream = parsed
         .get("stream")
         .and_then(Value::as_bool)

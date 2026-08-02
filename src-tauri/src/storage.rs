@@ -52,7 +52,7 @@ pub struct StoredRelayApiKey {
     pub key_prefix: String,
     pub key_hash: String,
     pub enabled: bool,
-    /// `responses` | `completions` — client wire + upstream class.
+    /// Legacy `responses` | `completions`; routing no longer branches on this.
     pub wire_type: String,
     /// `dotted` (供应商.模型) | `flat` (按供应商选、扁平 id).
     pub name_style: String,

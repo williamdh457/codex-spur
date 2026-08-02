@@ -12,11 +12,12 @@ All notable changes to Codex Spur are documented in this file.
 
 ### Features
 
-- **反代中转站（Codex Tools / Sub2API 式）**: 侧栏独立「反代」页；Client Key 分 **Response** / **Completion**。
-  - Response Key：`POST /v1/responses` 原样透传；`POST /v1/chat/completions` 转 Responses 上游，**回包再转 Chat**（含 stream）。
-  - Completion Key：仅 `/v1/chat/completions` 纯透传，仅 Completions 上游；拒 `/responses`。
-- **统一模型 id：`模型.供应商`**: Codex catalog slug 与反代 `/v1/models` 同一约定（如 `deepseek-chat.deepseek`、`gpt-5.6-sol.官方订阅`）；旧 `spur-route-*` / 裸 `gpt-5.6-*` dual-key 兼容。
-- **模型页**: Codex / 反代用途分 tab 勾选；反代服务与 Key 管理挪到侧栏「反代」。
+- **反代 Key 统一（Sub2API 式）**: 不再分 Response / Completion Key。一把 Key 同时支持 `POST /v1/responses` 与 `POST /v1/chat/completions`；按**上游协议**分流（Responses 透传 / Chat 桥 / Chat raw），不按 Key 类型拒入口。
+- **反代页精简**: 去掉 Key 协议选择、下方编辑区（白名单 / 重新生成）、常驻接入说明；删除在 Key 行最右侧；接入说明改右下角 ⋯；Base URL 展示本机/局域网 × 根路径/`/v1` 多种格式。模型外放只在「模型」页勾选，反代页不再二次选模。
+- **反代 Client Key 常显 + 复制**: 本机 `relay_api_keys/<id>`（0600）缓存明文，Key 行始终显示 secret 与「复制 Key」；重启后仍可恢复（旧 Key 无缓存则提示新建）。
+- **展示名 `供应商 · 模型`**: 模型列表与反代表显示名用中间点间隔、供应商在前；对外机器 id 仍为 `模型.供应商`。
+- **反代中转站**: 侧栏独立「反代」页；模型 id 统一 `模型.供应商`；与 Codex 发布 id 同一约定。
+- **模型页**: Codex / 反代用途分 tab 勾选；反代服务与 Key 管理在侧栏「反代」。
 
 ## [0.1.13] - 2026-08-01
 

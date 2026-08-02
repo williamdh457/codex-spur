@@ -95,7 +95,10 @@ export type ApiRelayStatus = {
   lastError: string | null;
 };
 
-/** Client API key wire protocol for the reverse-proxy mid-station. */
+/**
+ * Legacy storage field only. Routing ignores this: every key is dual-entry
+ * (Responses + Chat Completions), Sub2API-style.
+ */
 export type RelayWireType = "responses" | "completions";
 
 /**
@@ -108,13 +111,13 @@ export type RelayApiKeySummary = {
   label: string;
   keyPrefix: string;
   enabled: boolean;
-  /** Response = dual entry; Completion = chat only. */
+  /** Legacy; ignored for routing (unified dual-entry key). */
   wireType: RelayWireType;
   /** Always `dotted` for new keys (模型.供应商). */
   nameStyle: RelayNameStyle;
   /** Legacy flat provider allow-list. */
   allowedProviders: string[];
-  /** Allowed public ids (`模型.供应商`). Empty = all relay-enabled models. */
+  /** Allowed public ids (`模型.供应商`). Empty = all relay-enabled models. UI no longer edits. */
   allowedModels: string[];
   createdAt: string;
   updatedAt: string;

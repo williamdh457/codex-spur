@@ -126,7 +126,8 @@ pub struct RelayApiKeySummary {
     pub label: String,
     pub key_prefix: String,
     pub enabled: bool,
-    /// `responses` | `completions`
+    /// Legacy column (`responses` | `completions`). Routing ignores this:
+    /// every client key is dual-entry (Responses + Chat Completions).
     pub wire_type: String,
     /// Always `dotted` (模型.供应商) for product UI; `flat` kept for legacy keys only.
     pub name_style: String,

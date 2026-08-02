@@ -443,19 +443,18 @@ export async function listRelayApiKeys(): Promise<RelayApiKeySummary[]> {
   return invoke<RelayApiKeySummary[]>("list_relay_api_keys");
 }
 
+/** Create a unified dual-entry relay key (Responses + Chat Completions). */
 export async function createRelayApiKey(input?: {
   label?: string;
-  wireType?: "responses" | "completions";
   nameStyle?: "dotted" | "flat";
-  allowedProviders?: string[];
-  allowedModels?: string[];
 }): Promise<RelayApiKeyCreated> {
   return invoke<RelayApiKeyCreated>("create_relay_api_key", {
     label: input?.label ?? null,
-    wireType: input?.wireType ?? null,
+    // Always unified dual-entry; wire_type column kept for schema compat.
+    wireType: "responses",
     nameStyle: input?.nameStyle ?? "dotted",
-    allowedProviders: input?.allowedProviders ?? null,
-    allowedModels: input?.allowedModels ?? null,
+    allowedProviders: null,
+    allowedModels: null,
   });
 }
 
@@ -463,28 +462,26 @@ export async function updateRelayApiKey(input: {
   id: string;
   label?: string;
   enabled?: boolean;
-  wireType?: "responses" | "completions";
-  nameStyle?: "dotted" | "flat";
-  allowedProviders?: string[];
-  allowedModels?: string[];
 }): Promise<RelayApiKeySummary> {
   return invoke<RelayApiKeySummary>("update_relay_api_key", {
     id: input.id,
     label: input.label ?? null,
     enabled: input.enabled ?? null,
-    wireType: input.wireType ?? null,
-    nameStyle: input.nameStyle ?? null,
-    allowedProviders: input.allowedProviders ?? null,
-    allowedModels: input.allowedModels ?? null,
+    wireType: null,
+    nameStyle: null,
+    allowedProviders: null,
+    allowedModels: null,
   });
-}
-
-export async function regenerateRelayApiKey(id: string): Promise<RelayApiKeyCreated> {
-  return invoke<RelayApiKeyCreated>("regenerate_relay_api_key", { id });
 }
 
 export async function deleteRelayApiKey(id: string): Promise<boolean> {
   return invoke<boolean>("delete_relay_api_key", { id });
+}
+
+/** Reveal plaintext for a relay client key from the local 0600 cache. */
+export async function revealRelayApiKey(id: string): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<string | null>("reveal_relay_api_key", { id });
 }
 
 export async function revealDefaultRelayApiKey(): Promise<string | null> {

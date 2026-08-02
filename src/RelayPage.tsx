@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createRelayApiKey,
   deleteRelayApiKey,
   getApiRelayStatus,
   listModelRoutes,
   listRelayApiKeys,
-  regenerateRelayApiKey,
-  revealDefaultRelayApiKey,
+  revealRelayApiKey,
   setApiRelaySettings,
   startApiRelay,
   stopApiRelay,
@@ -16,7 +15,6 @@ import type {
   ApiRelayStatus,
   ModelRouteSummary,
   RelayApiKeySummary,
-  RelayWireType,
   StatusTone,
 } from "./types";
 
@@ -42,7 +40,7 @@ function EmptyState({
   );
 }
 
-/** Published id preview: 模型.供应商 */
+/** Machine id preview: 模型.供应商 (API / catalog slug). */
 function dottedModelId(route: ModelRouteSummary): string {
   const model = (route.upstreamModel || route.displayName || route.id)
     .trim()
@@ -57,8 +55,33 @@ function dottedModelId(route: ModelRouteSummary): string {
   return `${model || "model"}.${provider || "provider"}`;
 }
 
-function wireLabel(wire: string | undefined): string {
-  return wire === "completions" ? "Completion" : "Response";
+/** Human label: 供应商 · 模型 (middle-dot separator). */
+function humanModelLabel(route: ModelRouteSummary): string {
+  const model = (route.upstreamModel || route.displayName || route.id).trim();
+  const provider = (route.providerName || route.providerId).trim();
+  if (provider && model) return `${provider} · ${model}`;
+  return model || provider || route.id;
+}
+
+type BaseUrlEntry = {
+  label: string;
+  url: string;
+};
+
+function baseUrlVariants(
+  baseV1: string | null | undefined,
+  lanV1: string | null | undefined,
+): BaseUrlEntry[] {
+  const out: BaseUrlEntry[] = [];
+  if (baseV1) {
+    out.push({ label: "本机 · OpenAI /v1", url: baseV1 });
+    out.push({ label: "本机 · 根路径", url: baseV1.replace(/\/v1\/?$/, "") });
+  }
+  if (lanV1) {
+    out.push({ label: "局域网 · OpenAI /v1", url: lanV1 });
+    out.push({ label: "局域网 · 根路径", url: lanV1.replace(/\/v1\/?$/, "") });
+  }
+  return out;
 }
 
 export function RelayPage() {
@@ -68,26 +91,36 @@ export function RelayPage() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [messageTone, setMessageTone] = useState<"ok" | "error">("ok");
-  const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
+  /** key id → plaintext secret (local cache; always shown when available). */
+  const [secretsById, setSecretsById] = useState<Record<string, string>>({});
   const [portDraft, setPortDraft] = useState("17862");
-
-  // Create form
   const [newLabel, setNewLabel] = useState("");
-  const [newWire, setNewWire] = useState<RelayWireType>("responses");
-  const [newAllowed, setNewAllowed] = useState<string[]>([]);
-
-  // Edit
-  const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
+  const [docsOpen, setDocsOpen] = useState(false);
+  const docsRef = useRef<HTMLDivElement | null>(null);
 
   const relayRoutes = useMemo(
     () => routes.filter((route) => route.relayEnabled),
     [routes],
   );
 
-  const selectedKey = useMemo(
-    () => keys.find((key) => key.id === selectedKeyId) ?? null,
-    [keys, selectedKeyId],
+  const urlEntries = useMemo(
+    () => baseUrlVariants(status?.baseUrl, status?.lanBaseUrl),
+    [status?.baseUrl, status?.lanBaseUrl],
   );
+
+  const loadSecrets = useCallback(async (nextKeys: RelayApiKeySummary[]) => {
+    const entries = await Promise.all(
+      nextKeys.map(async (key) => {
+        const secret = await revealRelayApiKey(key.id);
+        return secret ? ([key.id, secret] as const) : null;
+      }),
+    );
+    const map: Record<string, string> = {};
+    for (const entry of entries) {
+      if (entry) map[entry[0]] = entry[1];
+    }
+    setSecretsById(map);
+  }, []);
 
   const reload = useCallback(async () => {
     const [nextStatus, nextKeys, nextRoutes] = await Promise.all([
@@ -99,29 +132,24 @@ export function RelayPage() {
     setKeys(nextKeys);
     setRoutes(nextRoutes);
     setPortDraft(String(nextStatus.port));
-    setSelectedKeyId((current) => {
-      if (current && nextKeys.some((key) => key.id === current)) return current;
-      return nextKeys[0]?.id ?? null;
-    });
-  }, []);
+    await loadSecrets(nextKeys);
+  }, [loadSecrets]);
 
   useEffect(() => {
     let active = true;
     void (async () => {
       try {
-        const [nextStatus, nextKeys, nextRoutes, defaultSecret] = await Promise.all([
+        const [nextStatus, nextKeys, nextRoutes] = await Promise.all([
           getApiRelayStatus(),
           listRelayApiKeys(),
           listModelRoutes(),
-          revealDefaultRelayApiKey(),
         ]);
         if (!active) return;
         setStatus(nextStatus);
         setKeys(nextKeys);
         setRoutes(nextRoutes);
         setPortDraft(String(nextStatus.port));
-        setSelectedKeyId(nextKeys[0]?.id ?? null);
-        if (defaultSecret) setRevealedSecret(defaultSecret);
+        await loadSecrets(nextKeys);
       } catch (caught) {
         if (active) {
           setMessageTone("error");
@@ -132,7 +160,26 @@ export function RelayPage() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [loadSecrets]);
+
+  useEffect(() => {
+    if (!docsOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setDocsOpen(false);
+    };
+    const onPointer = (event: MouseEvent) => {
+      const el = docsRef.current;
+      if (el && !el.contains(event.target as Node)) {
+        setDocsOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onPointer);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onPointer);
+    };
+  }, [docsOpen]);
 
   const copyText = async (label: string, value: string) => {
     try {
@@ -165,15 +212,14 @@ export function RelayPage() {
 
   return (
     <div className="page-stack relay-page">
-      {/* Status strip */}
       <section className="panel relay-status">
         <div className="panel__header">
           <div>
             <h2>反代中转站</h2>
             <p>
-              纯转发：把已开「反代」的模型以 Base URL + API Key 外放。Response Key 支持
-              Responses 原样与 Chat→Responses 双转换；Completion Key 仅 Chat。
-              模型 id 统一为 <code>模型.供应商</code>。
+              纯转发：把已开「反代」的模型以 Base URL + API Key 外放。一把 Key 同时支持{" "}
+              <code>/v1/responses</code> 与 <code>/v1/chat/completions</code>
+              （按上游协议自动适配）。模型 id 为 <code>模型.供应商</code>。
             </p>
           </div>
           <StatusDot tone={status?.running ? "healthy" : "muted"} />
@@ -185,38 +231,6 @@ export function RelayPage() {
             <dd>{status?.running ? "运行中" : "已停止"}</dd>
           </div>
           <div>
-            <dt>Local Base URL</dt>
-            <dd>
-              <code className="mono-copy">{status?.baseUrl ?? "—"}</code>
-              {status?.baseUrl ? (
-                <button
-                  type="button"
-                  className="button button--ghost"
-                  disabled={busy}
-                  onClick={() => void copyText("Base URL", status.baseUrl!)}
-                >
-                  复制
-                </button>
-              ) : null}
-            </dd>
-          </div>
-          {status?.lanBaseUrl ? (
-            <div>
-              <dt>LAN Base URL</dt>
-              <dd>
-                <code className="mono-copy">{status.lanBaseUrl}</code>
-                <button
-                  type="button"
-                  className="button button--ghost"
-                  disabled={busy}
-                  onClick={() => void copyText("LAN Base URL", status.lanBaseUrl!)}
-                >
-                  复制
-                </button>
-              </dd>
-            </div>
-          ) : null}
-          <div>
             <dt>反代模型</dt>
             <dd>{status?.relayModelCount ?? relayRoutes.length}</dd>
           </div>
@@ -225,6 +239,30 @@ export function RelayPage() {
             <dd>{status?.keyCount ?? keys.length}</dd>
           </div>
         </dl>
+
+        {urlEntries.length > 0 ? (
+          <div className="relay-base-urls">
+            <div className="relay-base-urls__title">Base URL</div>
+            <ul className="relay-base-urls__list">
+              {urlEntries.map((entry) => (
+                <li key={entry.label + entry.url} className="relay-base-urls__item">
+                  <span className="relay-base-urls__label">{entry.label}</span>
+                  <code className="mono-copy">{entry.url}</code>
+                  <button
+                    type="button"
+                    className="button button--ghost"
+                    disabled={busy}
+                    onClick={() => void copyText(entry.label, entry.url)}
+                  >
+                    复制
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p className="caption">启动反代后显示 Base URL。</p>
+        )}
 
         <div className="form-actions form-actions--wrap relay-status__actions">
           {status?.running ? (
@@ -311,322 +349,144 @@ export function RelayPage() {
         ) : null}
       </section>
 
-      {revealedSecret ? (
-        <div className="inline-success relay-secret" role="status">
-          <div>API Key 明文（请立即复制；重新生成后失效）</div>
-          <code className="mono-copy">{revealedSecret}</code>
-          <button
-            type="button"
-            className="button button--ghost"
-            onClick={() => void copyText("API Key", revealedSecret)}
-          >
-            复制 Key
-          </button>
+      {message ? (
+        <div
+          className={messageTone === "error" ? "inline-warning" : "inline-success"}
+          role="status"
+        >
+          {message}
         </div>
       ) : null}
 
-      {/* Two-column: keys + docs */}
-      <div className="relay-split">
-        <section className="panel">
-          <div className="panel__header">
-            <div>
-              <h2>Client Keys</h2>
-              <p>每把 Key 绑定一种协议类型。模型 id 固定为 模型.供应商。</p>
-            </div>
+      <section className="panel">
+        <div className="panel__header">
+          <div>
+            <h2>Client Keys</h2>
+            <p>
+              一把 Key 双入口。明文常显（本机缓存）；模型是否外放请在「模型」页勾选反代开关。
+            </p>
           </div>
+        </div>
 
-          <div className="relay-create">
-            <input
-              className="input"
-              placeholder="名称（可选）"
-              value={newLabel}
-              disabled={busy}
-              onChange={(event) => setNewLabel(event.target.value)}
+        <div className="relay-create">
+          <input
+            className="input"
+            placeholder="名称（可选）"
+            value={newLabel}
+            disabled={busy}
+            onChange={(event) => setNewLabel(event.target.value)}
+          />
+          <button
+            type="button"
+            className="button button--secondary"
+            disabled={busy}
+            onClick={() =>
+              void run(async () => {
+                const created = await createRelayApiKey({
+                  label: newLabel.trim() || undefined,
+                  nameStyle: "dotted",
+                });
+                setSecretsById((prev) => ({ ...prev, [created.key.id]: created.secret }));
+                setNewLabel("");
+                setMessageTone("ok");
+                setMessage(`已创建 Key「${created.key.label}」`);
+              })
+            }
+          >
+            新建 Key
+          </button>
+        </div>
+
+        <div className="relay-key-list">
+          {keys.length === 0 ? (
+            <EmptyState
+              title="还没有 Client Key"
+              body="创建一把 Key，再把 Base URL 给第三方客户端。"
+              action="等待创建"
             />
-            <div className="segmented" role="group" aria-label="协议类型">
-              <button
-                type="button"
-                className={`segmented__item${newWire === "responses" ? " segmented__item--active" : ""}`}
-                disabled={busy}
-                onClick={() => setNewWire("responses")}
-              >
-                Response
-              </button>
-              <button
-                type="button"
-                className={`segmented__item${newWire === "completions" ? " segmented__item--active" : ""}`}
-                disabled={busy}
-                onClick={() => setNewWire("completions")}
-              >
-                Completion
-              </button>
-            </div>
-            <button
-              type="button"
-              className="button button--secondary"
-              disabled={busy}
-              onClick={() =>
-                void run(async () => {
-                  const created = await createRelayApiKey({
-                    label: newLabel.trim() || undefined,
-                    wireType: newWire,
-                    nameStyle: "dotted",
-                    allowedModels: newAllowed.length > 0 ? newAllowed : undefined,
-                  });
-                  setRevealedSecret(created.secret);
-                  setNewLabel("");
-                  setNewAllowed([]);
-                  setSelectedKeyId(created.key.id);
-                  setMessageTone("ok");
-                  setMessage(`已创建 ${wireLabel(created.key.wireType)} Key「${created.key.label}」`);
-                })
-              }
-            >
-              新建 Key
-            </button>
-          </div>
-          <p className="caption relay-create__hint">
-            {newWire === "responses"
-              ? "Response：/v1/responses 原样；/v1/chat/completions 转 Responses 再转回 Chat。"
-              : "Completion：仅 /v1/chat/completions，仅 Completions 上游，不转换。"}
-          </p>
-
-          <div className="relay-key-list">
-            {keys.length === 0 ? (
-              <EmptyState
-                title="还没有 Client Key"
-                body="创建一把 Response 或 Completion Key，再把 Base URL 给第三方客户端。"
-                action="等待创建"
-              />
-            ) : (
-              keys.map((key) => {
-                const active = key.id === selectedKeyId;
-                return (
-                  <button
-                    key={key.id}
-                    type="button"
-                    className={`relay-key-row${active ? " relay-key-row--active" : ""}`}
-                    onClick={() => setSelectedKeyId(key.id)}
-                  >
-                    <span
-                      className={`switch${key.enabled ? " switch--on" : ""}`}
-                      role="switch"
-                      aria-checked={key.enabled}
-                      onClick={(event) => {
-                        event.stopPropagation();
+          ) : (
+            keys.map((key) => {
+              const secret = secretsById[key.id];
+              return (
+                <div key={key.id} className="relay-key-row">
+                  <span
+                    className={`switch${key.enabled ? " switch--on" : ""}`}
+                    role="switch"
+                    aria-checked={key.enabled}
+                    aria-label={`${key.enabled ? "关闭" : "开启"} ${key.label}`}
+                    tabIndex={0}
+                    onClick={() => {
+                      void run(async () => {
+                        await updateRelayApiKey({ id: key.id, enabled: !key.enabled });
+                      });
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
                         void run(async () => {
                           await updateRelayApiKey({ id: key.id, enabled: !key.enabled });
                         });
-                      }}
-                    >
-                      <span className="switch__track" aria-hidden="true" />
-                    </span>
-                    <span className="relay-key-row__main">
-                      <strong>{key.label}</strong>
-                      <small>
-                        <span className="badge">{wireLabel(key.wireType)}</span>
-                        <span className="badge badge--muted">加点</span>
-                        <code>{key.keyPrefix}</code>
-                        {key.allowedModels.length === 0
-                          ? " · 全部反代模型"
-                          : ` · 白名单 ${key.allowedModels.length}`}
-                      </small>
-                    </span>
-                  </button>
-                );
-              })
-            )}
-          </div>
-
-          {selectedKey ? (
-            <div className="relay-key-detail">
-              <div className="relay-key-detail__header">
-                <h3>编辑 · {selectedKey.label}</h3>
-                <div className="form-actions form-actions--wrap">
-                  <button
-                    type="button"
-                    className="button button--ghost"
-                    disabled={busy}
-                    onClick={() =>
-                      void run(async () => {
-                        const created = await regenerateRelayApiKey(selectedKey.id);
-                        setRevealedSecret(created.secret);
-                        setMessageTone("ok");
-                        setMessage(`已重新生成「${selectedKey.label}」`);
-                      })
-                    }
+                      }
+                    }}
                   >
-                    重新生成
-                  </button>
+                    <span className="switch__track" aria-hidden="true" />
+                  </span>
+                  <span className="relay-key-row__main">
+                    <strong>{key.label}</strong>
+                    <span className="relay-key-secret">
+                      {secret ? (
+                        <>
+                          <code className="mono-copy">{secret}</code>
+                          <button
+                            type="button"
+                            className="button button--ghost"
+                            disabled={busy}
+                            onClick={() => void copyText("API Key", secret)}
+                          >
+                            复制 Key
+                          </button>
+                        </>
+                      ) : (
+                        <small className="caption">
+                          明文不可恢复（仅有 <code>{key.keyPrefix}</code>
+                          ）。删除后新建即可常显。
+                        </small>
+                      )}
+                    </span>
+                  </span>
                   <button
                     type="button"
-                    className="button button--ghost"
+                    className="button button--ghost relay-key-row__delete"
                     disabled={busy}
+                    aria-label={`删除 ${key.label}`}
                     onClick={() =>
                       void run(async () => {
-                        await deleteRelayApiKey(selectedKey.id);
+                        await deleteRelayApiKey(key.id);
+                        setSecretsById((prev) => {
+                          const next = { ...prev };
+                          delete next[key.id];
+                          return next;
+                        });
                         setMessageTone("ok");
-                        setMessage(`已删除「${selectedKey.label}」`);
+                        setMessage(`已删除「${key.label}」`);
                       })
                     }
                   >
                     删除
                   </button>
                 </div>
-              </div>
-
-              <label className="field">
-                <span>协议类型</span>
-                <div className="segmented" role="group" aria-label="协议类型">
-                  <button
-                    type="button"
-                    className={`segmented__item${(selectedKey.wireType ?? "responses") === "responses" ? " segmented__item--active" : ""}`}
-                    disabled={busy}
-                    onClick={() =>
-                      void run(async () => {
-                        await updateRelayApiKey({
-                          id: selectedKey.id,
-                          wireType: "responses",
-                        });
-                      })
-                    }
-                  >
-                    Response
-                  </button>
-                  <button
-                    type="button"
-                    className={`segmented__item${selectedKey.wireType === "completions" ? " segmented__item--active" : ""}`}
-                    disabled={busy}
-                    onClick={() =>
-                      void run(async () => {
-                        await updateRelayApiKey({
-                          id: selectedKey.id,
-                          wireType: "completions",
-                        });
-                      })
-                    }
-                  >
-                    Completion
-                  </button>
-                </div>
-              </label>
-
-              <div className="relay-allowlist">
-                <p className="caption">
-                  模型白名单（空 = 全部已开反代的模型）。id 格式为 模型.供应商。
-                </p>
-                {relayRoutes.length === 0 ? (
-                  <p className="caption">请先在「模型」页打开至少一个模型的反代开关。</p>
-                ) : (
-                  <div className="relay-allowlist__grid">
-                    {relayRoutes.map((route) => {
-                      const slug = dottedModelId(route);
-                      const checked =
-                        selectedKey.allowedModels.includes(route.id) ||
-                        selectedKey.allowedModels.includes(slug) ||
-                        selectedKey.allowedModels.includes(route.upstreamModel);
-                      return (
-                        <label key={route.id} className="relay-allowlist__item">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            disabled={busy}
-                            onChange={() => {
-                              const current = selectedKey.allowedModels;
-                              const next = checked
-                                ? current.filter(
-                                    (item) =>
-                                      item !== route.id &&
-                                      item !== slug &&
-                                      item !== route.upstreamModel,
-                                  )
-                                : [...current, slug];
-                              void run(async () => {
-                                await updateRelayApiKey({
-                                  id: selectedKey.id,
-                                  allowedModels: next,
-                                });
-                              });
-                            }}
-                          />
-                          <span>
-                            {route.providerName} · {route.displayName}
-                            <small>
-                              <code>{slug}</code>
-                            </small>
-                          </span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : null}
-        </section>
-
-        <section className="panel relay-docs">
-          <div className="panel__header">
-            <div>
-              <h2>接入说明</h2>
-              <p>随选中 Key 变化；复制后即可在第三方客户端使用。</p>
-            </div>
-          </div>
-          {!selectedKey ? (
-            <p className="caption">选中左侧一把 Key 查看示例。</p>
-          ) : (
-            <div className="relay-docs__body">
-              <dl className="diagnostic-grid">
-                <div>
-                  <dt>协议</dt>
-                  <dd>{wireLabel(selectedKey.wireType)}</dd>
-                </div>
-                <div>
-                  <dt>命名</dt>
-                  <dd>
-                    <code>模型.供应商</code>
-                  </dd>
-                </div>
-                <div>
-                  <dt>Base URL</dt>
-                  <dd>
-                    <code className="mono-copy">{baseV1 ?? "—"}</code>
-                  </dd>
-                </div>
-              </dl>
-              {selectedKey.wireType === "completions" ? (
-                <pre className="relay-code">{`# Completion Key — 仅 Chat Completions
-curl -sS ${baseV1 ?? "http://127.0.0.1:17862/v1"}/chat/completions \\
-  -H "Authorization: Bearer sk-spur-…" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"${exampleModel}","messages":[{"role":"user","content":"hi"}]}'
-`}</pre>
-              ) : (
-                <pre className="relay-code">{`# Response Key — Responses 原样
-curl -sS ${baseV1 ?? "http://127.0.0.1:17862/v1"}/responses \\
-  -H "Authorization: Bearer sk-spur-…" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"${exampleModel}","input":"hi","stream":true}'
-
-# Response Key — Chat 入口（转 Responses 上去，Chat 回来）
-curl -sS ${baseV1 ?? "http://127.0.0.1:17862/v1"}/chat/completions \\
-  -H "Authorization: Bearer sk-spur-…" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"${exampleModel}","messages":[{"role":"user","content":"hi"}]}'
-`}</pre>
-              )}
-            </div>
+              );
+            })
           )}
-        </section>
-      </div>
+        </div>
+      </section>
 
-      {/* Model inventory */}
       <section className="panel">
         <div className="panel__header">
           <div>
             <h2>可反代模型</h2>
             <p>
-              在「模型」页打开反代开关后出现在此。对外 id 为 模型.供应商；与 Codex 发布 id 同一约定。
+              在「模型」页打开反代开关后出现在此。展示名 供应商 · 模型；对外 id 为 模型.供应商。
             </p>
           </div>
         </div>
@@ -647,7 +507,7 @@ curl -sS ${baseV1 ?? "http://127.0.0.1:17862/v1"}/chat/completions \\
             {relayRoutes.map((route) => (
               <div className="relay-model-table__row" role="row" key={route.id}>
                 <code role="cell">{dottedModelId(route)}</code>
-                <span role="cell">{route.displayName}</span>
+                <span role="cell">{humanModelLabel(route)}</span>
                 <span role="cell">{route.protocol}</span>
                 <span role="cell">{route.providerName || route.providerId}</span>
               </div>
@@ -656,14 +516,64 @@ curl -sS ${baseV1 ?? "http://127.0.0.1:17862/v1"}/chat/completions \\
         )}
       </section>
 
-      {message ? (
-        <div
-          className={messageTone === "ok" ? "inline-success" : "inline-warning"}
-          role="status"
+      <div className="relay-fab" ref={docsRef}>
+        {docsOpen ? (
+          <div className="relay-docs-sheet" role="dialog" aria-label="接入说明">
+            <div className="relay-docs-sheet__header">
+              <h3>接入说明</h3>
+              <button
+                type="button"
+                className="button button--ghost"
+                onClick={() => setDocsOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+            <p className="caption">
+              同一 Key 可用于 Responses 与 Chat Completions。模型 id：
+              <code>模型.供应商</code>
+            </p>
+            {urlEntries.length > 0 ? (
+              <ul className="relay-base-urls__list relay-base-urls__list--compact">
+                {urlEntries.map((entry) => (
+                  <li key={`docs-${entry.label}`} className="relay-base-urls__item">
+                    <span className="relay-base-urls__label">{entry.label}</span>
+                    <code className="mono-copy">{entry.url}</code>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      onClick={() => void copyText(entry.label, entry.url)}
+                    >
+                      复制
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <pre className="relay-code">{`# Responses
+curl -sS ${baseV1 ?? "http://127.0.0.1:17862/v1"}/responses \\
+  -H "Authorization: Bearer sk-spur-…" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${exampleModel}","input":"hi","stream":true}'
+
+# Chat Completions
+curl -sS ${baseV1 ?? "http://127.0.0.1:17862/v1"}/chat/completions \\
+  -H "Authorization: Bearer sk-spur-…" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${exampleModel}","messages":[{"role":"user","content":"hi"}]}'
+`}</pre>
+          </div>
+        ) : null}
+        <button
+          type="button"
+          className="relay-fab__button"
+          aria-label="接入说明"
+          aria-expanded={docsOpen}
+          onClick={() => setDocsOpen((open) => !open)}
         >
-          {message}
-        </div>
-      ) : null}
+          ⋯
+        </button>
+      </div>
     </div>
   );
 }

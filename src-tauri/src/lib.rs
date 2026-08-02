@@ -117,9 +117,10 @@ impl AppState {
             .unwrap_or(true)
         {
             let secret = proxy::generate_relay_api_key_secret();
+            let key_id = Uuid::new_v4().to_string();
             let _ = storage
                 .insert_relay_api_key(
-                    &Uuid::new_v4().to_string(),
+                    &key_id,
                     "Default",
                     &proxy::relay_key_prefix(&secret),
                     &proxy::relay_key_hash(&secret),
@@ -129,7 +130,8 @@ impl AppState {
                     &[],
                 )
                 .await;
-            // Persist plaintext once to a 0600 file so the UI can reveal it until regenerate.
+            // Per-id + legacy default file so UI can always show the secret.
+            write_relay_api_key_secret(&data_dir, &key_id, &secret);
             let key_path = data_dir.join("relay_default_api_key");
             let _ = std::fs::write(&key_path, format!("{secret}\n"));
             #[cfg(unix)]
@@ -405,6 +407,67 @@ fn stored_relay_key_to_summary(key: storage::StoredRelayApiKey) -> RelayApiKeySu
         updated_at: key.updated_at,
         last_used_at: key.last_used_at,
     }
+}
+
+/// Local-only plaintext cache for relay client keys (not provider credentials).
+/// Files live under `app_data/relay_api_keys/<id>` with 0600 perms so the UI can
+/// always show + copy the secret without a one-shot banner.
+fn relay_api_key_secret_path(data_dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || id.chars().any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+    {
+        return None;
+    }
+    Some(data_dir.join("relay_api_keys").join(id))
+}
+
+fn write_relay_api_key_secret(data_dir: &std::path::Path, id: &str, secret: &str) {
+    let Some(path) = relay_api_key_secret_path(data_dir, id) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    if std::fs::write(&path, format!("{secret}\n")).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+fn remove_relay_api_key_secret(data_dir: &std::path::Path, id: &str) {
+    if let Some(path) = relay_api_key_secret_path(data_dir, id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Read plaintext if present and still matching the stored key hash.
+fn read_relay_api_key_secret(
+    data_dir: &std::path::Path,
+    id: &str,
+    expected_hash: &str,
+) -> Option<String> {
+    let path = relay_api_key_secret_path(data_dir, id)?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if proxy::relay_key_hash(&trimmed) != expected_hash {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(trimmed)
 }
 
 impl AppState {
@@ -2551,6 +2614,7 @@ async fn list_relay_api_keys(
 
 #[tauri::command]
 async fn create_relay_api_key(
+    app: AppHandle,
     state: State<'_, AppState>,
     label: Option<String>,
     wire_type: Option<String>,
@@ -2583,6 +2647,9 @@ async fn create_relay_api_key(
         )
         .await
         .map_err(|error| error.to_string())?;
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        write_relay_api_key_secret(&data_dir, &id, &secret);
+    }
     Ok(RelayApiKeyCreated {
         key: stored_relay_key_to_summary(stored),
         secret,
@@ -2634,8 +2701,9 @@ async fn regenerate_relay_api_key(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "API Key 不存在".to_string())?;
-    // Drop stale bootstrap plaintext if any key was rotated.
     if let Ok(data_dir) = app.path().app_data_dir() {
+        write_relay_api_key_secret(&data_dir, &id, &secret);
+        // Drop stale bootstrap plaintext if any key was rotated.
         let _ = std::fs::remove_file(data_dir.join("relay_default_api_key"));
     }
     Ok(RelayApiKeyCreated {
@@ -2657,20 +2725,61 @@ async fn delete_relay_api_key(
         .map_err(|error| error.to_string())?;
     if deleted {
         if let Ok(data_dir) = app.path().app_data_dir() {
+            remove_relay_api_key_secret(&data_dir, &id);
             let _ = std::fs::remove_file(data_dir.join("relay_default_api_key"));
         }
     }
     Ok(deleted)
 }
 
+/// Reveal a relay client key plaintext from the local 0600 cache (if still valid).
+#[tauri::command]
+async fn reveal_relay_api_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<String>, String> {
+    let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let keys = state
+        .storage
+        .list_relay_api_keys()
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(key) = keys.into_iter().find(|item| item.id == id) else {
+        remove_relay_api_key_secret(&data_dir, &id);
+        return Ok(None);
+    };
+    if let Some(secret) = read_relay_api_key_secret(&data_dir, &id, &key.key_hash) {
+        return Ok(Some(secret));
+    }
+    // Fall back to legacy bootstrap file for the first matching hash.
+    let legacy = data_dir.join("relay_default_api_key");
+    if let Ok(raw) = std::fs::read_to_string(&legacy) {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() && proxy::relay_key_hash(&trimmed) == key.key_hash {
+            write_relay_api_key_secret(&data_dir, &id, &trimmed);
+            return Ok(Some(trimmed));
+        }
+    }
+    Ok(None)
+}
+
 /// Reveal the one-time default key file written on first bootstrap (if still present
-/// and still matching a live key hash).
+/// and still matching a live key hash). Prefer `reveal_relay_api_key` for per-key UI.
 #[tauri::command]
 async fn reveal_default_relay_api_key(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    // Prefer first key's per-id file (covers post-bootstrap creates).
+    if let Ok(keys) = state.storage.list_relay_api_keys().await {
+        for key in keys {
+            if let Some(secret) = read_relay_api_key_secret(&data_dir, &key.id, &key.key_hash) {
+                return Ok(Some(secret));
+            }
+        }
+    }
     let path = data_dir.join("relay_default_api_key");
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Ok(None);
@@ -2680,16 +2789,17 @@ async fn reveal_default_relay_api_key(
         return Ok(None);
     }
     let hash = proxy::relay_key_hash(&trimmed);
-    let still_valid = state
+    let matched = state
         .storage
         .find_relay_api_key_by_hash(&hash)
         .await
-        .map_err(|error| error.to_string())?
-        .is_some();
-    if !still_valid {
+        .map_err(|error| error.to_string())?;
+    let Some(key) = matched else {
         let _ = std::fs::remove_file(&path);
         return Ok(None);
-    }
+    };
+    // Migrate legacy file into per-id cache.
+    write_relay_api_key_secret(&data_dir, &key.id, &trimmed);
     Ok(Some(trimmed))
 }
 
@@ -3810,6 +3920,7 @@ pub fn run() {
             update_relay_api_key,
             regenerate_relay_api_key,
             delete_relay_api_key,
+            reveal_relay_api_key,
             reveal_default_relay_api_key,
             import_credentials_json,
             import_session_json,

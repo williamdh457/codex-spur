@@ -2542,11 +2542,12 @@ function ReasoningTable({ route }: { route: ModelRouteSummary }) {
   );
 }
 
-/** Models list title: `模型.供应商` (same convention as catalog / relay ids). */
+/** Models list title: human label `供应商 · 模型` (machine id stays 模型.供应商). */
 function modelListLabel(route: ModelRouteSummary): string {
   const model = (route.upstreamModel || route.displayName || route.id).trim();
   const provider = (route.providerName || route.providerId).trim();
-  return `${model}.${provider}`;
+  if (provider && model) return `${provider} · ${model}`;
+  return model || provider || route.id;
 }
 
 function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> }) {
@@ -2859,7 +2860,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
               </div>
             )}
             <p className="caption model-table-panel__footer">
-              模型 id 为 模型.供应商。服务与 Client Key 请到侧栏「反代」。
+              展示名为 供应商 · 模型；对外 id 为 模型.供应商。服务与 Client Key 请到侧栏「反代」。
             </p>
           </section>
         </div>
