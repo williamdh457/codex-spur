@@ -928,13 +928,48 @@ async fn apply_kimi_publish(
     kimi_publish_core(&state).await
 }
 
+async fn resolve_zcode_relay_endpoint(
+    app: &AppHandle,
+    state: &AppState,
+) -> zcode_target::ZcodeRelayEndpoint {
+    let status = state.relay_status_inner().await.ok();
+    let base_url = status
+        .as_ref()
+        .and_then(|item| item.base_url.clone())
+        .or_else(|| Some("http://127.0.0.1:17862/v1".into()));
+
+    let mut api_key = None;
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        if let Ok(keys) = state.storage.list_relay_api_keys().await {
+            for key in keys {
+                if let Some(secret) = read_relay_api_key_secret(&data_dir, &key.id, &key.key_hash) {
+                    api_key = Some(secret);
+                    break;
+                }
+            }
+        }
+        if api_key.is_none() {
+            if let Ok(raw) = std::fs::read_to_string(data_dir.join("relay_default_api_key")) {
+                let trimmed = raw.trim().to_string();
+                if !trimmed.is_empty() {
+                    api_key = Some(trimmed);
+                }
+            }
+        }
+    }
+
+    zcode_target::ZcodeRelayEndpoint { base_url, api_key }
+}
+
 #[tauri::command]
 async fn apply_zcode_publish(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<zcode_target::ZcodePublishOutcome, String> {
     state.rebuild_runtime().await?;
     let routes = state.routes.read().await.clone();
-    zcode_target::apply(&routes).map_err(|error| error.to_string())
+    let endpoint = resolve_zcode_relay_endpoint(&app, &state).await;
+    zcode_target::apply(&routes, endpoint).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

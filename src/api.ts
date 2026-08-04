@@ -444,6 +444,8 @@ export type ZcodePublishOutcome = {
   removedModelCount: number;
   configPath: string;
   backupPath: string;
+  providerId: string;
+  providerCreated: boolean;
   warnings: string[];
 };
 
