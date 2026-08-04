@@ -65,7 +65,8 @@ pub fn encode_spur_compaction_summary(summary: &str) -> String {
 
 /// Decode Spur or OpenCodex portable envelopes. Real OpenAI ciphertext → None.
 pub fn decode_portable_compaction_summary(encrypted_content: &str) -> Option<String> {
-    let (prefix, rest) = if let Some(rest) = encrypted_content.strip_prefix(SPUR_COMPACTION_PREFIX) {
+    let (prefix, rest) = if let Some(rest) = encrypted_content.strip_prefix(SPUR_COMPACTION_PREFIX)
+    {
         (SPUR_COMPACTION_PREFIX, rest)
     } else if let Some(rest) = encrypted_content.strip_prefix(OCX_COMPACTION_PREFIX) {
         (OCX_COMPACTION_PREFIX, rest)
@@ -127,7 +128,10 @@ pub fn portable_transcript_for_compact(request: &Value) -> String {
         match item_type {
             "compaction" | "compaction_summary" | "context_compaction" => {
                 let encrypted = item.get("encrypted_content").and_then(Value::as_str);
-                lines.push(format!("[compaction]\n{}", compaction_item_to_text(encrypted)));
+                lines.push(format!(
+                    "[compaction]\n{}",
+                    compaction_item_to_text(encrypted)
+                ));
             }
             "reasoning" => {
                 // Prefer plaintext summary if present; never invent from ciphertext.
@@ -173,10 +177,7 @@ pub fn portable_transcript_for_compact(request: &Value) -> String {
                 lines.push(format!("[tool_call {name}]\n{body}"));
             }
             "function_call_output" | "custom_tool_call_output" => {
-                let out = match item
-                    .get("output")
-                    .or_else(|| item.get("result"))
-                {
+                let out = match item.get("output").or_else(|| item.get("result")) {
                     Some(Value::String(s)) => s.clone(),
                     Some(v) => v.to_string(),
                     None => String::new(),
@@ -190,11 +191,7 @@ pub fn portable_transcript_for_compact(request: &Value) -> String {
                 let text = item
                     .get("content")
                     .map(content_plain_text)
-                    .or_else(|| {
-                        item.get("text")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
+                    .or_else(|| item.get("text").and_then(Value::as_str).map(str::to_string))
                     .unwrap_or_default();
                 if !text.trim().is_empty() {
                     lines.push(format!("[{role}]\n{}", text.trim()));
@@ -225,7 +222,9 @@ fn live_compaction_index(request: &Value) -> Option<usize> {
 /// Rough char budget for the summarizer input (~4 chars/token). Cap so a
 /// 258k OpenAI thread is not dumped into a smaller model raw.
 pub fn compact_input_char_budget(context_window_tokens: Option<i64>) -> usize {
-    let tokens = context_window_tokens.unwrap_or(32_000).clamp(4_000, 200_000) as usize;
+    let tokens = context_window_tokens
+        .unwrap_or(32_000)
+        .clamp(4_000, 200_000) as usize;
     // Leave headroom for the compact instruction and the summary response.
     let usable = tokens.saturating_mul(60) / 100;
     usable.saturating_mul(4).min(400_000)
@@ -279,7 +278,10 @@ pub fn synthetic_compaction_response(model: &str, summary: &str) -> Value {
 /// Minimal SSE lifecycle for a compact turn (non-streaming Desktop still OK with JSON).
 pub fn synthetic_compaction_sse(model: &str, summary: &str) -> String {
     let response = synthetic_compaction_response(model, summary);
-    let response_id = response.get("id").and_then(Value::as_str).unwrap_or("resp_cmp");
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp_cmp");
     let item = response
         .pointer("/output/0")
         .cloned()

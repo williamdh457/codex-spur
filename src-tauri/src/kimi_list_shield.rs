@@ -67,7 +67,9 @@ impl KimiListShield {
                 blocked_hosts: BLOCKED_HOSTS.iter().map(|s| (*s).to_string()).collect(),
                 blocked_connects: s.metrics.blocked.load(Ordering::Relaxed),
                 tunneled_connects: s.metrics.tunneled.load(Ordering::Relaxed),
-                note: "系统 HTTPS 代理需指向此地址后，Kimi 才会走拦截。勿拦 agent-gw（已自动放行）。".into(),
+                note:
+                    "系统 HTTPS 代理需指向此地址后，Kimi 才会走拦截。勿拦 agent-gw（已自动放行）。"
+                        .into(),
             },
             None => KimiListShieldStatus {
                 running: false,
@@ -197,7 +199,10 @@ async fn run_accept_loop(
 }
 
 fn host_is_blocked(host: &str) -> bool {
-    let host = host.trim().trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let host = host
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
     // Never block localhost / spur / agent-gw
     if host == "127.0.0.1"
         || host == "localhost"

@@ -93,7 +93,10 @@ async fn main() -> anyhow::Result<()> {
         println!("warning: {warning}");
     }
     if live.state != "applied" {
-        anyhow::bail!("publish 后 live state 仍是 {}，未绑定 codex_select", live.state);
+        anyhow::bail!(
+            "publish 后 live state 仍是 {}，未绑定 codex_select",
+            live.state
+        );
     }
     if !visibility.ready {
         eprintln!(
@@ -101,7 +104,11 @@ async fn main() -> anyhow::Result<()> {
             visibility.status_label
         );
     }
-    println!("OK published {} models to {}", result.model_count, home.display());
+    println!(
+        "OK published {} models to {}",
+        result.model_count,
+        home.display()
+    );
     Ok(())
 }
 

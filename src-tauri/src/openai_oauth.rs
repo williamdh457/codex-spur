@@ -35,8 +35,7 @@ const USER_AGENT: &str = "codex_cli_rs/0.144.1";
 /// Refresh access tokens this many seconds before JWT/exp expiry.
 const REFRESH_LEAD_SECS: i64 = 120;
 /// ChatGPT multi-account check — map keys are ChatGPT account / workspace ids.
-const ACCOUNTS_CHECK_URL: &str =
-    "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
+const ACCOUNTS_CHECK_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 /// Codex personal-access-token whoami (tokens starting with `at-`).
 const CODEX_PAT_WHOAMI_URL: &str =
     "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami";
@@ -286,8 +285,8 @@ impl OpenAiOAuthManager {
         let code_challenge = base64url_encode_nopad(&Sha256::digest(code_verifier.as_bytes()));
         let redirect_uri = format!("http://localhost:{redirect_port}/auth/callback");
 
-        let mut url = url::Url::parse(OAUTH_AUTHORIZE_URL)
-            .map_err(|e| format!("构造授权 URL 失败：{e}"))?;
+        let mut url =
+            url::Url::parse(OAUTH_AUTHORIZE_URL).map_err(|e| format!("构造授权 URL 失败：{e}"))?;
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", CODEX_CLIENT_ID)
@@ -385,13 +384,9 @@ async fn exchange_from_callback_url(
         .ok_or_else(|| "回调链接缺少 code 参数".to_string())?;
 
     let client = auth_http_client()?;
-    let oauth = exchange_code_for_tokens(
-        &client,
-        code,
-        &pending.code_verifier,
-        &pending.redirect_uri,
-    )
-    .await?;
+    let oauth =
+        exchange_code_for_tokens(&client, code, &pending.code_verifier, &pending.redirect_uri)
+            .await?;
     finalize_login_tokens(tokens_from_oauth(oauth)?).await
 }
 
@@ -504,9 +499,7 @@ pub fn access_token_needs_refresh(access_token: &str, stored_expires_at: Option<
 }
 
 pub fn jwt_exp_unix(token: &str) -> Option<i64> {
-    parse_jwt_payload(token)?
-        .get("exp")
-        .and_then(Value::as_i64)
+    parse_jwt_payload(token)?.get("exp").and_then(Value::as_i64)
 }
 
 /// Extract ChatGPT account id from an access or id token JWT (no network).
@@ -630,15 +623,12 @@ fn tokens_from_oauth(tokens: OAuthTokenResponse) -> Result<DeviceLoginTokens, St
 /// After OAuth login, require a usable account_id (JWT or network).
 async fn finalize_login_tokens(mut tokens: DeviceLoginTokens) -> Result<DeviceLoginTokens, String> {
     if tokens.account_id.trim().is_empty() {
-        tokens.account_id = ensure_chatgpt_account_id(
-            &tokens.access_token,
-            tokens.id_token.as_deref(),
-            None,
-        )
-        .await
-        .map_err(|error| {
-            format!("无法从 token 解析 ChatGPT account_id，网络补拉也失败：{error}")
-        })?;
+        tokens.account_id =
+            ensure_chatgpt_account_id(&tokens.access_token, tokens.id_token.as_deref(), None)
+                .await
+                .map_err(|error| {
+                    format!("无法从 token 解析 ChatGPT account_id，网络补拉也失败：{error}")
+                })?;
     }
     Ok(tokens)
 }
@@ -709,7 +699,10 @@ fn account_id_from_claims(claims: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| claims.get("chatgpt_account_id").and_then(Value::as_str))
         .or_else(|| claims.get("account_id").and_then(Value::as_str))
-        .or_else(|| auth.and_then(|a| a.get("account_id")).and_then(Value::as_str))
+        .or_else(|| {
+            auth.and_then(|a| a.get("account_id"))
+                .and_then(Value::as_str)
+        })
         .or_else(|| organization_id_from_auth(auth))
         // poid is the workspace/org id used as accounts/check map key for many tokens.
         .or_else(|| auth.and_then(|a| a.get("poid")).and_then(Value::as_str))
@@ -731,7 +724,10 @@ fn organization_id_from_auth(auth: Option<&Value>) -> Option<&str> {
             None
         }
     });
-    default_org.or_else(|| orgs.first().and_then(|org| org.get("id").and_then(Value::as_str)))
+    default_org.or_else(|| {
+        orgs.first()
+            .and_then(|org| org.get("id").and_then(Value::as_str))
+    })
 }
 
 /// Hint used to pick the right entry from multi-account `accounts/check`.
@@ -751,10 +747,7 @@ fn is_usable_account_candidate(acct: &Value) -> bool {
     if has_deactivated_marker(acct) {
         return false;
     }
-    if acct
-        .get("account")
-        .is_some_and(has_deactivated_marker)
-    {
+    if acct.get("account").is_some_and(has_deactivated_marker) {
         return false;
     }
     // Expired entitlement → skip when we can parse expires_at.
@@ -813,7 +806,11 @@ fn chrono_rfc3339_to_unix(value: &str) -> Result<i64, ()> {
             return Err(());
         }
         let (head, offset) = trimmed.split_at(idx);
-        let sign = if offset.starts_with('+') { 1_i64 } else { -1_i64 };
+        let sign = if offset.starts_with('+') {
+            1_i64
+        } else {
+            -1_i64
+        };
         let offset_body = &offset[1..];
         let parts: Vec<&str> = offset_body.split(':').collect();
         if parts.len() != 2 {
@@ -937,8 +934,7 @@ fn urlencoding_encode(value: &str) -> String {
 }
 
 fn base64url_encode_nopad(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -966,9 +962,12 @@ fn base64url_encode_nopad(bytes: &[u8]) -> String {
 fn extract_identity(tokens: &OAuthTokenResponse) -> (Option<String>, Option<String>) {
     let mut account_id = None;
     let mut email = None;
-    for token in [tokens.id_token.as_deref(), Some(tokens.access_token.as_str())]
-        .into_iter()
-        .flatten()
+    for token in [
+        tokens.id_token.as_deref(),
+        Some(tokens.access_token.as_str()),
+    ]
+    .into_iter()
+    .flatten()
     {
         if let Some(claims) = parse_jwt_payload(token) {
             if account_id.is_none() {
@@ -1094,10 +1093,9 @@ mod tests {
 
     #[test]
     fn parse_callback_extracts_query() {
-        let url = parse_oauth_callback_url(
-            "http://localhost:1455/auth/callback?code=abc&state=xyz",
-        )
-        .expect("url");
+        let url =
+            parse_oauth_callback_url("http://localhost:1455/auth/callback?code=abc&state=xyz")
+                .expect("url");
         assert_eq!(url.path(), "/auth/callback");
         let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(params.get("code").map(String::as_str), Some("abc"));
@@ -1186,16 +1184,12 @@ mod tests {
     fn access_token_needs_refresh_respects_exp() {
         // exp far in the future
         let far = chrono_now_secs() + 3600;
-        let payload = base64url_encode_nopad(
-            format!(r#"{{"exp":{far}}}"#).as_bytes(),
-        );
+        let payload = base64url_encode_nopad(format!(r#"{{"exp":{far}}}"#).as_bytes());
         let token = format!("x.{payload}.y");
         assert!(!access_token_needs_refresh(&token, Some(far)));
 
         let past = chrono_now_secs() - 10;
-        let payload = base64url_encode_nopad(
-            format!(r#"{{"exp":{past}}}"#).as_bytes(),
-        );
+        let payload = base64url_encode_nopad(format!(r#"{{"exp":{past}}}"#).as_bytes());
         let token = format!("x.{payload}.y");
         assert!(access_token_needs_refresh(&token, Some(past)));
     }
@@ -1214,10 +1208,10 @@ mod tests {
                 .expect("prepare");
             assert!(start.auth_url.contains("auth.openai.com/oauth/authorize"));
             assert!(start.auth_url.contains("code_challenge_method=S256"));
-            assert!(start.auth_url.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
             assert!(start
-                .redirect_uri
-                .contains("localhost:1455/auth/callback"));
+                .auth_url
+                .contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+            assert!(start.redirect_uri.contains("localhost:1455/auth/callback"));
             assert_eq!(pending.redirect_uri, start.redirect_uri);
             assert!(!pending.code_verifier.is_empty());
             assert!(!pending.state.is_empty());

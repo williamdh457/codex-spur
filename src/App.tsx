@@ -26,6 +26,7 @@ import {
   importOpenCodeGoCredential,
   inspectOpenCodeGoCredential,
   importSessionJson,
+  inspectThreadHistory,
   importProviderConfigJson,
   installAppUpdate,
   kimiTargetStatus,
@@ -74,6 +75,7 @@ import type {
   QuotaWindow,
   ReasoningProfileOption,
   StatusTone,
+  ThreadHistoryHealthReport,
 } from "./types";
 import { RelayPage } from "./RelayPage";
 import { UsagePage } from "./usage";
@@ -2888,6 +2890,10 @@ function DiagnosticsPage({ snapshot }: { snapshot: AppSnapshot }) {
   const [events, setEvents] = useState<ProxyRequestEvent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [threadId, setThreadId] = useState("");
+  const [historyReport, setHistoryReport] = useState<ThreadHistoryHealthReport | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setBusy(true);
@@ -2950,6 +2956,57 @@ function DiagnosticsPage({ snapshot }: { snapshot: AppSnapshot }) {
           <div><dt>Binding state</dt><dd>{snapshot.binding.state}</dd></div>
           <div><dt>Published models</dt><dd>{snapshot.publishedModels}</dd></div>
         </dl>
+      </section>
+
+      <section className="panel" aria-label="Codex 历史体检">
+        <div className="panel__header">
+          <div>
+            <h2>Codex 历史体检</h2>
+            <p>只读检查 thread 索引和 rollout JSONL；不读取凭据、prompt、命令参数或工具输出。</p>
+          </div>
+        </div>
+        <div className="form-row">
+          <label>
+            Codex task ID
+            <input value={threadId} onChange={(event) => setThreadId(event.target.value)} placeholder="019fbe06-c7b0-7f12-af4e-0523f10956b5" spellCheck={false} />
+          </label>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="button button--secondary"
+              disabled={historyBusy || !threadId.trim()}
+              onClick={() => {
+                setHistoryBusy(true);
+                setHistoryError(null);
+                void inspectThreadHistory(threadId)
+                  .then(setHistoryReport)
+                  .catch((error: unknown) => setHistoryError(String(error)))
+                  .finally(() => setHistoryBusy(false));
+              }}
+            >
+              {historyBusy ? "检查中…" : "只读检查"}
+            </button>
+          </div>
+        </div>
+        {historyError && <div className="callout callout--warning">{historyError}</div>}
+        {historyReport && (
+          <>
+            <dl className="diagnostic-grid">
+              <div><dt>有效记录</dt><dd>{historyReport.parsedRows}</dd></div>
+              <div><dt>工具 / 结果</dt><dd>{historyReport.toolCalls} / {historyReport.toolOutputs}</dd></div>
+              <div><dt>缺失 / 孤儿结果</dt><dd>{historyReport.missingOutputs} / {historyReport.orphanOutputs}</dd></div>
+              <div><dt>重复 ID</dt><dd>{historyReport.duplicateCallIds + historyReport.duplicateOutputCallIds + historyReport.duplicateResponseItemIds}</dd></div>
+              <div><dt>Compaction</dt><dd>{historyReport.compactionEvents}（不会视为删除）</dd></div>
+              <div><dt>活跃 turn</dt><dd>{historyReport.activeTurns}</dd></div>
+              <div><dt>文件大小</dt><dd>{historyReport.rolloutBytes.toLocaleString()} bytes</dd></div>
+              <div><dt>尾部写入</dt><dd>{historyReport.trailingPartialLine ? "检测到未完成最后一行（活跃写入）" : "完整"}</dd></div>
+            </dl>
+            <div className="callout">
+              <strong>工具时间线</strong>
+              <p>{historyReport.timeline.length === 0 ? "没有可投影的工具事件。" : historyReport.timeline.map((entry) => `${entry.timestamp} · ${entry.category} · ${entry.toolName}`).join("\n")}{historyReport.timelineTruncated ? "\n已截断至 500 项。" : ""}</p>
+            </div>
+          </>
+        )}
       </section>
 
       <section className="panel diagnostics-split" aria-label="请求调度诊断">

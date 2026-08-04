@@ -5,6 +5,7 @@ import type {
   PoolSchedulerConfig,
   ProviderRouting,
   ProxyRequestEvent,
+  ThreadHistoryHealthReport,
   AppSnapshot,
   ApplyPreview,
   CodexApplyOutcome,
@@ -438,6 +439,18 @@ export async function setApiRelaySettings(input: {
   });
 }
 
+export type ZcodePublishOutcome = {
+  modelCount: number;
+  configPath: string;
+  backupPath: string;
+  warnings: string[];
+};
+
+/** Sync currently published Spur routes and reasoning capabilities into Z Code. */
+export async function applyZcodePublish(): Promise<ZcodePublishOutcome> {
+  return invoke<ZcodePublishOutcome>("apply_zcode_publish");
+}
+
 export async function listRelayApiKeys(): Promise<RelayApiKeySummary[]> {
   if (!isTauriRuntime()) return [];
   return invoke<RelayApiKeySummary[]>("list_relay_api_keys");
@@ -594,6 +607,10 @@ export async function listProxyRequestEvents(limit = 100): Promise<ProxyRequestE
 export async function clearProxyRequestEvents(): Promise<void> {
   if (!isTauriRuntime()) return;
   return invoke<void>("clear_proxy_request_events");
+}
+
+export async function inspectThreadHistory(threadId: string): Promise<ThreadHistoryHealthReport> {
+  return invoke<ThreadHistoryHealthReport>("inspect_thread_history", { threadId });
 }
 
 export async function getDiagnosticsMaxEvents(): Promise<number> {

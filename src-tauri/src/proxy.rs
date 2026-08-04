@@ -33,7 +33,7 @@ use crate::{
     domain::ProxyRequestEvent,
     media_sanitizer, providers,
     scheduler::{ScheduleState, SelectionLayer},
-    storage::{Lease, StoredRelayApiKey, Storage, UsageDelta},
+    storage::{Lease, Storage, StoredRelayApiKey, UsageDelta},
     upstream_errors::{
         body_is_usage_or_rate_limit, content_session_seed, is_failover_status_with_options,
         now_unix, resolve_rate_limit_cooldown, status_category,
@@ -223,11 +223,7 @@ async fn authorize_request(
     }
 }
 
-fn model_allowed_by_key(
-    key: &StoredRelayApiKey,
-    model: &str,
-    target: &RouteTarget,
-) -> bool {
+fn model_allowed_by_key(key: &StoredRelayApiKey, model: &str, target: &RouteTarget) -> bool {
     // Flat style: restrict by provider instance when list non-empty.
     if key.name_style == "flat" && !key.allowed_providers.is_empty() {
         if !key
@@ -242,9 +238,9 @@ fn model_allowed_by_key(
     if key.allowed_models.is_empty() {
         return true;
     }
-    key.allowed_models.iter().any(|item| {
-        item == model || item == &target.route_id || item == &target.upstream_model
-    })
+    key.allowed_models
+        .iter()
+        .any(|item| item == model || item == &target.route_id || item == &target.upstream_model)
 }
 
 /// Whether this route's upstream should be called with Responses (not Chat Completions).
@@ -731,9 +727,9 @@ async fn passthrough_raw(
             )
             .await;
         use futures_util::StreamExt;
-        let mapped = response.bytes_stream().map(|chunk| {
-            chunk.map_err(|error| std::io::Error::other(error.to_string()))
-        });
+        let mapped = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())));
         let mut builder = Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -788,15 +784,13 @@ async fn passthrough_raw(
             if let Some(content_type) = content_type {
                 builder = builder.header(header::CONTENT_TYPE, content_type);
             }
-            builder
-                .body(Body::from(bytes))
-                .unwrap_or_else(|_| {
-                    error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "proxy_response_error",
-                        "Failed to build proxy response",
-                    )
-                })
+            builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "proxy_response_error",
+                    "Failed to build proxy response",
+                )
+            })
         }
         Err(error) => error_response(
             StatusCode::BAD_GATEWAY,
@@ -953,7 +947,9 @@ async fn relay_chat_via_responses_stream(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let is_sse = content_type.to_ascii_lowercase().contains("text/event-stream");
+    let is_sse = content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream");
     if !status.is_success() {
         let bytes = response.bytes().await.unwrap_or_default();
         return Response::builder()
@@ -1034,7 +1030,10 @@ impl ResponsesSseToChatConverter {
         Self {
             model,
             carry: Vec::new(),
-            response_id: format!("chatcmpl-spur-{}", &Uuid::new_v4().simple().to_string()[..20]),
+            response_id: format!(
+                "chatcmpl-spur-{}",
+                &Uuid::new_v4().simple().to_string()[..20]
+            ),
             role_sent: false,
             finished: false,
         }
@@ -1260,16 +1259,15 @@ fn chat_request_to_responses_request(chat: &Value, upstream_model: &str) -> Valu
     if let Some(messages) = chat.get("messages").and_then(Value::as_array) {
         for msg in messages {
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-            let content = msg.get("content").cloned().unwrap_or(Value::String(String::new()));
+            let content = msg
+                .get("content")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
             let text = match &content {
                 Value::String(s) => s.clone(),
                 Value::Array(parts) => parts
                     .iter()
-                    .filter_map(|p| {
-                        p.get("text")
-                            .and_then(Value::as_str)
-                            .or_else(|| p.as_str())
-                    })
+                    .filter_map(|p| p.get("text").and_then(Value::as_str).or_else(|| p.as_str()))
                     .collect::<Vec<_>>()
                     .join("\n"),
                 other => other.to_string(),
@@ -1292,7 +1290,14 @@ fn chat_request_to_responses_request(chat: &Value, upstream_model: &str) -> Valu
         "stream": chat.get("stream").cloned().unwrap_or(Value::Bool(false)),
     });
     if let Some(obj) = out.as_object_mut() {
-        for key in ["temperature", "top_p", "max_tokens", "tools", "tool_choice", "user"] {
+        for key in [
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "tools",
+            "tool_choice",
+            "user",
+        ] {
             if let Some(v) = chat.get(key) {
                 if !v.is_null() {
                     obj.insert(key.to_string(), v.clone());
@@ -1326,7 +1331,11 @@ async fn relay_responses_http_to_chat_json(response: Response) -> Response {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .unwrap_or_else(|_| {
-                error_response(StatusCode::BAD_GATEWAY, "proxy_response_error", "build failed")
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "proxy_response_error",
+                    "build failed",
+                )
             });
     }
     let responses_body: Value = match serde_json::from_slice(&bytes) {
@@ -1346,7 +1355,11 @@ async fn relay_responses_http_to_chat_json(response: Response) -> Response {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(out))
             .unwrap_or_else(|_| {
-                error_response(StatusCode::BAD_GATEWAY, "proxy_response_error", "build failed")
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "proxy_response_error",
+                    "build failed",
+                )
             }),
         Err(error) => error_response(
             StatusCode::BAD_GATEWAY,
@@ -1476,7 +1489,8 @@ async fn summarize_for_local_compact(
             ]
         });
         let endpoint = endpoint(&target.base_url, &target.kind, "chat/completions");
-        let request = apply_upstream_headers(state.client.post(&endpoint).json(&chat_body), auth, target);
+        let request =
+            apply_upstream_headers(state.client.post(&endpoint).json(&chat_body), auth, target);
         let response = request
             .timeout(Duration::from_secs(120))
             .send()
@@ -1515,8 +1529,11 @@ async fn summarize_for_local_compact(
         }]
     });
     let endpoint = endpoint(&target.base_url, &target.kind, "responses");
-    let request =
-        apply_upstream_headers(state.client.post(&endpoint).json(&responses_body), auth, target);
+    let request = apply_upstream_headers(
+        state.client.post(&endpoint).json(&responses_body),
+        auth,
+        target,
+    );
     let response = request
         .timeout(Duration::from_secs(120))
         .send()
@@ -1690,6 +1707,7 @@ async fn forward_responses_compatible(
                     &target.provider_id,
                     &target.upstream_model,
                     is_remote_compaction_request(&request_body),
+                    requires_freeform_responses_restore(&target.kind),
                 )
                 .await;
             };
@@ -1833,6 +1851,7 @@ async fn forward_responses_compatible(
             &target.provider_id,
             &target.upstream_model,
             is_remote_compaction_request(&request_body),
+            requires_freeform_responses_restore(&target.kind),
         )
         .await;
     }
@@ -1857,8 +1876,7 @@ async fn forward_chat_compatible(
     // Chat Completions; DeepSeek V4 Flash/Pro use native Responses (official path).
     // Naive passthrough of Responses `tools` (type/name/parameters, local_shell, …)
     // makes upstream reject with 400. Convert like Nice Switch's transform_codex_chat.
-    let chat_body =
-        responses_to_chat_completions(&request_body, &target.upstream_model, target);
+    let chat_body = responses_to_chat_completions(&request_body, &target.upstream_model, target);
     let endpoint = endpoint(&target.base_url, &target.kind, "chat/completions");
     let max_switches = state
         .storage
@@ -2437,19 +2455,42 @@ fn sse_event(event: &str, data: &Value) -> String {
 #[derive(Default)]
 struct FreeformSseRestorer {
     carry: Vec<u8>,
-    /// Keyed by upstream item_id (as sent in argument events).
+    /// Keyed by upstream item_id. A call is only released after Desktop has
+    /// received its corresponding `output_item.added`.
     pending: HashMap<String, PendingFreeformCall>,
+    /// Secondary lookup for providers that put `call_id` on later events but
+    /// omit or change their item id.
+    pending_call_ids: HashMap<String, String>,
+    /// Some third-party Responses implementations send arguments before their
+    /// output item. Hold those events until we can determine whether the item
+    /// is freeform; never leak an orphan custom-input update to Desktop.
+    deferred_arguments: HashMap<String, DeferredArgumentEvents>,
+    completed_items: std::collections::HashSet<String>,
+    diagnostics: FreeformSseDiagnostics,
+}
+
+#[derive(Default)]
+struct FreeformSseDiagnostics {
+    synthesized_added: u64,
+    reordered_event: u64,
+    incomplete_at_completed: u64,
+    duplicate_event: u64,
+}
+
+#[derive(Default)]
+struct DeferredArgumentEvents {
+    events: Vec<Value>,
 }
 
 struct PendingFreeformCall {
     name: String,
     call_id: String,
     output_index: Value,
-    /// Accumulated JSON arguments (or extracted freeform input after args.done).
+    /// Accumulated JSON arguments until the provider marks them complete.
     args: String,
     desktop_item_id: String,
-    /// True after we emitted custom_tool_call_input.* for this call.
     input_events_emitted: bool,
+    added_emitted: bool,
 }
 
 impl FreeformSseRestorer {
@@ -2502,6 +2543,7 @@ impl FreeformSseRestorer {
             "response.output_item.done" => self.on_output_item_done(&data),
             "response.completed" => {
                 let mut data = data;
+                let mut out = self.flush_pending_at_completed(&data);
                 if let Some(response) = data.get_mut("response") {
                     crate::tool_roundtrip::restore_freeform_in_responses_body(response);
                 } else {
@@ -2511,7 +2553,9 @@ impl FreeformSseRestorer {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("response.completed");
-                sse_event(name, &data)
+                out.push_str(&sse_event(name, &data));
+                self.log_diagnostics();
+                out
             }
             _ => format!("{block}\n\n"),
         }
@@ -2521,70 +2565,42 @@ impl FreeformSseRestorer {
         let Some(item) = data.get("item") else {
             return sse_event("response.output_item.added", data);
         };
+        let original_id = item.get("id").and_then(Value::as_str).unwrap_or("");
         if item.get("type").and_then(Value::as_str) != Some("function_call") {
-            return sse_event("response.output_item.added", data);
+            return self.flush_deferred_and_forward(
+                original_id,
+                data,
+                "response.output_item.added",
+            );
         }
         let name = item.get("name").and_then(Value::as_str).unwrap_or("");
         if !crate::tool_roundtrip::is_freeform_desktop_tool(name) {
-            return sse_event("response.output_item.added", data);
+            return self.flush_deferred_and_forward(
+                original_id,
+                data,
+                "response.output_item.added",
+            );
         }
-        let original_id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let call_id = item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let args = item
-            .get("arguments")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let restored = crate::tool_roundtrip::restore_freeform_output_item(item);
-        let desktop_item_id = restored
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let key = if !original_id.is_empty() {
-            original_id.clone()
-        } else {
-            desktop_item_id.clone()
-        };
-        self.pending.insert(
-            key,
-            PendingFreeformCall {
-                name: name.to_string(),
-                call_id: call_id.clone(),
-                output_index: data
-                    .get("output_index")
-                    .cloned()
-                    .unwrap_or(Value::from(0)),
-                args,
-                desktop_item_id: desktop_item_id.clone(),
-                input_events_emitted: false,
-            },
-        );
-        let mut in_progress = restored;
-        if let Some(object) = in_progress.as_object_mut() {
-            object.insert("status".into(), Value::String("in_progress".into()));
-            // Args may still stream; start with empty freeform input.
-            object.insert("input".into(), Value::String(String::new()));
+        let key = self.upstream_key(data, item);
+        if self.pending.contains_key(&key) || self.completed_items.contains(&key) {
+            self.diagnostics.duplicate_event += 1;
+            return String::new();
         }
-        let mut rewritten = data.clone();
-        if let Some(object) = rewritten.as_object_mut() {
-            object.insert("item".into(), in_progress);
+        let pending = self.pending_from_item(item, data, &key);
+        if !pending.call_id.is_empty() {
+            self.pending_call_ids
+                .insert(pending.call_id.clone(), key.clone());
         }
-        sse_event("response.output_item.added", &rewritten)
+        self.pending.insert(key.clone(), pending);
+        let mut out = self.emit_added(&key, false);
+        out.push_str(&self.apply_deferred_arguments(&key));
+        out
     }
 
     fn on_function_args_delta(&mut self, data: &Value) -> String {
-        let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
-        let Some(pending) = self.pending.get_mut(item_id) else {
-            return sse_event("response.function_call_arguments.delta", data);
+        let item_id = self.resolve_pending_key(data);
+        let Some(pending) = self.pending.get_mut(&item_id) else {
+            return self.defer_arguments(&item_id, data);
         };
         if let Some(delta) = data.get("delta").and_then(Value::as_str) {
             pending.args.push_str(delta);
@@ -2594,43 +2610,16 @@ impl FreeformSseRestorer {
     }
 
     fn on_function_args_done(&mut self, data: &Value) -> String {
-        let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
-        let Some(pending) = self.pending.get_mut(item_id) else {
-            return sse_event("response.function_call_arguments.done", data);
+        let item_id = self.resolve_pending_key(data);
+        let Some(pending) = self.pending.get_mut(&item_id) else {
+            return self.defer_arguments(&item_id, data);
         };
         if let Some(arguments) = data.get("arguments").and_then(Value::as_str) {
             if !arguments.is_empty() {
                 pending.args = arguments.to_string();
             }
         }
-        let input = crate::tool_roundtrip::extract_freeform_input_for_tool(
-            &pending.name,
-            &pending.args,
-        );
-        let desktop_item_id = pending.desktop_item_id.clone();
-        let output_index = pending.output_index.clone();
-        pending.args = input.clone();
-        pending.input_events_emitted = true;
-        let mut out = String::new();
-        out.push_str(&sse_event(
-            "response.custom_tool_call_input.delta",
-            &json!({
-                "type": "response.custom_tool_call_input.delta",
-                "item_id": desktop_item_id,
-                "output_index": output_index,
-                "delta": input
-            }),
-        ));
-        out.push_str(&sse_event(
-            "response.custom_tool_call_input.done",
-            &json!({
-                "type": "response.custom_tool_call_input.done",
-                "item_id": desktop_item_id,
-                "output_index": output_index,
-                "input": input
-            }),
-        ));
-        out
+        self.emit_input_events(&item_id)
     }
 
     fn on_output_item_done(&mut self, data: &Value) -> String {
@@ -2641,77 +2630,276 @@ impl FreeformSseRestorer {
         let name = item.get("name").and_then(Value::as_str).unwrap_or("");
         let is_freeform_fc = item.get("type").and_then(Value::as_str) == Some("function_call")
             && crate::tool_roundtrip::is_freeform_desktop_tool(name);
-        let pending = self.pending.remove(original_id);
-        if !is_freeform_fc && pending.is_none() {
-            // Also try desktop id key if upstream already used ctc_ (unlikely).
-            return sse_event("response.output_item.done", data);
+        let key = self.resolve_output_key(data, item);
+        if !is_freeform_fc && !self.pending.contains_key(&key) {
+            return self.flush_deferred_and_forward(original_id, data, "response.output_item.done");
         }
-        let mut restored = crate::tool_roundtrip::restore_freeform_output_item(item);
-        let mut input_events_emitted = false;
-        if let Some(p) = pending {
-            input_events_emitted = p.input_events_emitted;
-            if !p.args.is_empty() {
-                if let Some(object) = restored.as_object_mut() {
-                    // p.args is freeform body after args.done; if never streamed,
-                    // it still holds JSON arguments — extract again for safety.
-                    let input = if p.input_events_emitted {
-                        // Already normalized in on_function_args_done.
-                        p.args
-                    } else {
-                        crate::tool_roundtrip::extract_freeform_input_for_tool(&p.name, &p.args)
-                    };
-                    object.insert("input".into(), Value::String(input));
-                    object.insert("id".into(), Value::String(p.desktop_item_id));
-                    if !p.call_id.is_empty() {
-                        object.insert("call_id".into(), Value::String(p.call_id));
+        if self.completed_items.contains(&key) {
+            self.diagnostics.duplicate_event += 1;
+            return String::new();
+        }
+        if !self.pending.contains_key(&key) {
+            self.diagnostics.reordered_event += 1;
+            let pending = self.pending_from_item(item, data, &key);
+            if !pending.call_id.is_empty() {
+                self.pending_call_ids
+                    .insert(pending.call_id.clone(), key.clone());
+            }
+            self.pending.insert(key.clone(), pending);
+        }
+        let mut out = self.emit_added(&key, true);
+        out.push_str(&self.apply_deferred_arguments(&key));
+        out.push_str(&self.emit_input_events(&key));
+        out.push_str(&self.emit_done(&key));
+        if let Some(call_id) = self
+            .pending
+            .get(&key)
+            .map(|pending| pending.call_id.clone())
+        {
+            self.pending_call_ids.remove(&call_id);
+        }
+        self.pending.remove(&key);
+        self.completed_items.insert(key);
+        out
+    }
+
+    fn upstream_key(&self, data: &Value, item: &Value) -> String {
+        item.get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "anonymous-{}",
+                    data.get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                )
+            })
+    }
+
+    fn resolve_pending_key(&self, data: &Value) -> String {
+        let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
+        if self.pending.contains_key(item_id) || self.deferred_arguments.contains_key(item_id) {
+            return item_id.to_string();
+        }
+        data.get("call_id")
+            .and_then(Value::as_str)
+            .and_then(|call_id| self.pending_call_ids.get(call_id))
+            .cloned()
+            .unwrap_or_else(|| item_id.to_string())
+    }
+
+    fn resolve_output_key(&self, data: &Value, item: &Value) -> String {
+        let key = self.upstream_key(data, item);
+        if self.pending.contains_key(&key) || self.completed_items.contains(&key) {
+            return key;
+        }
+        item.get("call_id")
+            .and_then(Value::as_str)
+            .and_then(|call_id| self.pending_call_ids.get(call_id))
+            .cloned()
+            .unwrap_or(key)
+    }
+
+    fn pending_from_item(&self, item: &Value, data: &Value, key: &str) -> PendingFreeformCall {
+        let seed = format!(
+            "sse:{key}:{}",
+            data.get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        );
+        let restored = crate::tool_roundtrip::restore_freeform_output_item_with_seed(item, &seed);
+        PendingFreeformCall {
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            call_id: restored
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            output_index: data.get("output_index").cloned().unwrap_or(Value::from(0)),
+            args: item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            desktop_item_id: restored
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            input_events_emitted: false,
+            added_emitted: false,
+        }
+    }
+
+    fn emit_added(&mut self, key: &str, synthesized: bool) -> String {
+        let Some(pending) = self.pending.get_mut(key) else {
+            return String::new();
+        };
+        if pending.added_emitted {
+            return String::new();
+        }
+        pending.added_emitted = true;
+        if synthesized {
+            self.diagnostics.synthesized_added += 1;
+        }
+        sse_event(
+            "response.output_item.added",
+            &json!({
+                "type":"response.output_item.added", "output_index": pending.output_index,
+                "item":{"id":pending.desktop_item_id, "type":"custom_tool_call", "status":"in_progress", "call_id":pending.call_id, "name":pending.name, "input":""}
+            }),
+        )
+    }
+
+    fn emit_input_events(&mut self, key: &str) -> String {
+        let Some(pending) = self.pending.get_mut(key) else {
+            return String::new();
+        };
+        if pending.input_events_emitted || !pending.added_emitted {
+            return String::new();
+        }
+        let input =
+            crate::tool_roundtrip::extract_freeform_input_for_tool(&pending.name, &pending.args);
+        pending.args = input.clone();
+        pending.input_events_emitted = true;
+        let common = json!({"item_id":pending.desktop_item_id, "call_id":pending.call_id, "output_index":pending.output_index});
+        let mut delta = common.clone();
+        delta["type"] = Value::String("response.custom_tool_call_input.delta".into());
+        delta["delta"] = Value::String(input.clone());
+        let mut done = common;
+        done["type"] = Value::String("response.custom_tool_call_input.done".into());
+        done["input"] = Value::String(input);
+        format!(
+            "{}{}",
+            sse_event("response.custom_tool_call_input.delta", &delta),
+            sse_event("response.custom_tool_call_input.done", &done)
+        )
+    }
+
+    fn emit_done(&mut self, key: &str) -> String {
+        let Some(pending) = self.pending.get(key) else {
+            return String::new();
+        };
+        sse_event(
+            "response.output_item.done",
+            &json!({
+                "type":"response.output_item.done", "output_index":pending.output_index,
+                "item":{"id":pending.desktop_item_id, "type":"custom_tool_call", "status":"completed", "call_id":pending.call_id, "name":pending.name, "input":pending.args}
+            }),
+        )
+    }
+
+    fn defer_arguments(&mut self, item_id: &str, data: &Value) -> String {
+        if item_id.is_empty() {
+            return sse_event(
+                data.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("response.function_call_arguments.delta"),
+                data,
+            );
+        }
+        self.diagnostics.reordered_event += 1;
+        self.deferred_arguments
+            .entry(item_id.to_string())
+            .or_default()
+            .events
+            .push(data.clone());
+        String::new()
+    }
+
+    fn apply_deferred_arguments(&mut self, key: &str) -> String {
+        let Some(deferred) = self.deferred_arguments.remove(key) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for event in deferred.events {
+            match event.get("type").and_then(Value::as_str).unwrap_or("") {
+                "response.function_call_arguments.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        if let Some(p) = self.pending.get_mut(key) {
+                            p.args.push_str(delta);
+                        }
                     }
                 }
+                "response.function_call_arguments.done" => {
+                    if let Some(args) = event
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if let Some(p) = self.pending.get_mut(key) {
+                            p.args = args.to_string();
+                        }
+                    }
+                    out.push_str(&self.emit_input_events(key));
+                }
+                _ => {}
             }
         }
-        if let Some(object) = restored.as_object_mut() {
-            object.insert("status".into(), Value::String("completed".into()));
-        }
-        let input = restored
-            .get("input")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let item_id = restored
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let output_index = data
-            .get("output_index")
-            .cloned()
-            .unwrap_or(Value::from(0));
-        let mut out = String::new();
-        if !input_events_emitted && !input.is_empty() {
-            out.push_str(&sse_event(
-                "response.custom_tool_call_input.delta",
-                &json!({
-                    "type": "response.custom_tool_call_input.delta",
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "delta": input
-                }),
-            ));
-            out.push_str(&sse_event(
-                "response.custom_tool_call_input.done",
-                &json!({
-                    "type": "response.custom_tool_call_input.done",
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "input": input
-                }),
-            ));
-        }
-        let mut rewritten = data.clone();
-        if let Some(object) = rewritten.as_object_mut() {
-            object.insert("item".into(), restored);
-        }
-        out.push_str(&sse_event("response.output_item.done", &rewritten));
         out
+    }
+
+    fn flush_deferred_and_forward(&mut self, item_id: &str, data: &Value, event: &str) -> String {
+        let mut out = String::new();
+        if let Some(deferred) = self.deferred_arguments.remove(item_id) {
+            for delayed in deferred.events {
+                out.push_str(&sse_event(
+                    delayed
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("response.function_call_arguments.delta"),
+                    &delayed,
+                ));
+            }
+        }
+        out.push_str(&sse_event(event, data));
+        out
+    }
+
+    fn flush_pending_at_completed(&mut self, _data: &Value) -> String {
+        let keys: Vec<String> = self.pending.keys().cloned().collect();
+        let mut out = String::new();
+        for key in keys {
+            self.diagnostics.incomplete_at_completed += 1;
+            out.push_str(&self.emit_added(&key, true));
+            out.push_str(&self.apply_deferred_arguments(&key));
+            out.push_str(&self.emit_input_events(&key));
+            out.push_str(&self.emit_done(&key));
+            if let Some(call_id) = self
+                .pending
+                .get(&key)
+                .map(|pending| pending.call_id.clone())
+            {
+                self.pending_call_ids.remove(&call_id);
+            }
+            self.pending.remove(&key);
+            self.completed_items.insert(key);
+        }
+        out
+    }
+
+    fn log_diagnostics(&self) {
+        if self.diagnostics.synthesized_added
+            + self.diagnostics.reordered_event
+            + self.diagnostics.incomplete_at_completed
+            + self.diagnostics.duplicate_event
+            == 0
+        {
+            return;
+        }
+        tracing::debug!(
+            freeform_synthesized_added = self.diagnostics.synthesized_added,
+            freeform_reordered_event = self.diagnostics.reordered_event,
+            freeform_incomplete_at_completed = self.diagnostics.incomplete_at_completed,
+            freeform_duplicate_event = self.diagnostics.duplicate_event,
+            "normalized freeform Responses SSE lifecycle"
+        );
     }
 }
 
@@ -3813,15 +4001,39 @@ fn affinity_inputs(headers: &HeaderMap, request: &Value) -> AffinityInputs {
 }
 
 fn map_reasoning(target: &RouteTarget, request: &mut Value) {
-    let Some(codex_effort) = request.pointer("/reasoning/effort").and_then(Value::as_str) else {
+    let Some(codex_effort) = normalize_client_reasoning_effort(request) else {
         return;
     };
     let profile = crate::reasoning_map::ReasoningProfileId::parse(&target.reasoning_profile_id)
         .unwrap_or_else(|| {
             crate::reasoning_map::ReasoningProfileId::default_for_kind(&target.kind)
         });
-    let patch = crate::reasoning_map::patch_for(profile, codex_effort);
+    let patch = crate::reasoning_map::patch_for_model(
+        &target.kind,
+        &target.upstream_model,
+        profile,
+        &codex_effort,
+    );
     crate::reasoning_map::apply_patch_to_responses_request(request, &patch);
+}
+
+/// Z Code's OpenAI-compatible adapter may send either camelCase or snake_case
+/// at the top level. Normalize every accepted spelling into Responses shape.
+fn normalize_client_reasoning_effort(request: &mut Value) -> Option<String> {
+    let effort = request
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .or_else(|| request.get("reasoning_effort").and_then(Value::as_str))
+        .or_else(|| request.get("reasoningEffort").and_then(Value::as_str))
+        .map(ToOwned::to_owned)?;
+    let object = request.as_object_mut()?;
+    object.remove("reasoning_effort");
+    object.remove("reasoningEffort");
+    let reasoning = object.entry("reasoning").or_insert_with(|| json!({}));
+    reasoning
+        .as_object_mut()?
+        .insert("effort".into(), Value::String(effort.clone()));
+    Some(effort)
 }
 
 /// Tool `type` values accepted by xAI's Responses API (from upstream 422 enum).
@@ -3930,7 +4142,8 @@ fn port_codex_tools(tools: &[Value], allowed: &[&str]) -> Vec<Value> {
 
         // Official freeform tools (apply_patch, exec, …) → portable function for third-party.
         if let Some(name) = tool_name(tool) {
-            if crate::tool_roundtrip::is_freeform_desktop_tool(name) && allowed.contains(&"function")
+            if crate::tool_roundtrip::is_freeform_desktop_tool(name)
+                && allowed.contains(&"function")
             {
                 if tool.get("function").is_some() {
                     let mut row = tool.clone();
@@ -4719,15 +4932,18 @@ fn responses_to_chat_completions(
     }
 
     // Map Codex reasoning effort through the provider's user-selected template.
-    if let Some(effort) = request_body
-        .pointer("/reasoning/effort")
-        .and_then(Value::as_str)
-    {
+    let mut normalized_request = request_body.clone();
+    if let Some(effort) = normalize_client_reasoning_effort(&mut normalized_request) {
         let profile = crate::reasoning_map::ReasoningProfileId::parse(&target.reasoning_profile_id)
             .unwrap_or_else(|| {
                 crate::reasoning_map::ReasoningProfileId::default_for_kind(&target.kind)
             });
-        let patch = crate::reasoning_map::patch_for(profile, effort);
+        let patch = crate::reasoning_map::patch_for_model(
+            &target.kind,
+            &target.upstream_model,
+            profile,
+            &effort,
+        );
         crate::reasoning_map::apply_patch_to_chat_request(&mut chat, &patch);
     }
 
@@ -4944,10 +5160,7 @@ fn response_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         // JSON `{"input":"…"}` — same wrap as Responses rewrite path.
                         // Non-freeform custom tools with a string body still wrap so
                         // the portable `{input:string}` schema accepts them.
-                        let arguments = match item
-                            .get("input")
-                            .or_else(|| item.get("arguments"))
-                        {
+                        let arguments = match item.get("input").or_else(|| item.get("arguments")) {
                             Some(Value::String(s))
                                 if crate::tool_roundtrip::is_freeform_desktop_tool(&name)
                                     || name == APPLY_PATCH_TOOL_NAME
@@ -5337,6 +5550,7 @@ async fn passthrough(
     provider_id: &str,
     model_id: &str,
     expects_compaction: bool,
+    restore_freeform: bool,
 ) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -5371,7 +5585,11 @@ async fn passthrough(
                 &message,
             );
         }
-        let bytes = restore_freeform_in_buffered_responses_bytes(&bytes, is_sse);
+        let bytes = if restore_freeform {
+            restore_freeform_in_buffered_responses_bytes(&bytes, is_sse)
+        } else {
+            bytes
+        };
         let mut builder = Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -5391,7 +5609,7 @@ async fn passthrough(
     // True streaming for normal Responses SSE: forward chunks as they arrive so Desktop
     // sees first token promptly. Rewrite freeform function_call → custom_tool_call so
     // every provider matches official Desktop freeform shape (Grok 019fb6c5 abort).
-    if is_sse && status.is_success() {
+    if is_sse && status.is_success() && restore_freeform {
         // Usage is approximate for live streams (full JSON parse only on buffered paths).
         metrics.output_tokens.fetch_add(1, Ordering::Relaxed);
         let _ = storage
@@ -5410,15 +5628,13 @@ async fn passthrough(
             .await;
         use futures_util::{stream, StreamExt};
         let mut restorer = FreeformSseRestorer::default();
-        let upstream = response.bytes_stream().map(|chunk| {
-            chunk.map_err(|error| std::io::Error::other(error.to_string()))
-        });
+        let upstream = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())));
         // Empty trailing chunk flushes incomplete SSE remainder through restorer.finish().
         let mapped = upstream
             .chain(stream::once(async { Ok(Bytes::new()) }))
-            .map(move |chunk| {
-                chunk.map(|bytes| Bytes::from(restorer.push(bytes.as_ref())))
-            });
+            .map(move |chunk| chunk.map(|bytes| Bytes::from(restorer.push(bytes.as_ref()))));
         let mut builder = Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -5529,6 +5745,13 @@ async fn passthrough(
             &format!("Failed to read upstream response: {error}"),
         ),
     }
+}
+
+/// Official OpenAI Responses already emits Desktop-compatible custom tool
+/// lifecycle events. Third-party Responses hosts frequently emit freeform tools
+/// as `function_call`, so only those routes need the atomic restorer.
+fn requires_freeform_responses_restore(kind: &str) -> bool {
+    !kind.eq_ignore_ascii_case("openai")
 }
 
 /// Kimi Desktop agent-gw compatible entry (experimental).
@@ -5995,7 +6218,11 @@ mod tests {
         target_route2.route_id = "route-2".into();
         assert!(model_allowed_by_key(&key, "spur-route-abc", &target_route1));
         assert!(model_allowed_by_key(&key, "route-1", &target_route2));
-        assert!(!model_allowed_by_key(&key, "spur-route-abc", &target_route2));
+        assert!(!model_allowed_by_key(
+            &key,
+            "spur-route-abc",
+            &target_route2
+        ));
         let open = StoredRelayApiKey {
             allowed_models: vec![],
             ..key.clone()
@@ -6128,11 +6355,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
-        let storage = Arc::new(
-            crate::storage::Storage::open(&dir)
-                .await
-                .expect("storage"),
-        );
+        let storage = Arc::new(crate::storage::Storage::open(&dir).await.expect("storage"));
         let vault = Arc::new(SecretVault::load_or_create(&dir).expect("vault"));
         let secret = "sk-spur-relay-http-test";
         storage
@@ -6150,10 +6373,8 @@ mod tests {
             .expect("key");
 
         let catalog = Arc::new(RwLock::new(ModelsResponse { models: vec![] }));
-        let mut relay_model = crate::catalog::placeholder_model(
-            "spur-route-relay-test".into(),
-            "Relay Test".into(),
-        );
+        let mut relay_model =
+            crate::catalog::placeholder_model("spur-route-relay-test".into(), "Relay Test".into());
         relay_model.slug = "spur-route-relay-test".into();
         let relay_catalog = Arc::new(RwLock::new(ModelsResponse {
             models: vec![relay_model],
@@ -6781,11 +7002,8 @@ data: [DONE]
 
     #[test]
     fn deepseek_v4_flash_prefers_native_responses_over_legacy_chat_protocol() {
-        let flash = test_route_target_with_model(
-            "deepseek",
-            "deepseek-v4-flash",
-            "Chat Completions",
-        );
+        let flash =
+            test_route_target_with_model("deepseek", "deepseek-v4-flash", "Chat Completions");
         assert!(
             !route_uses_chat_completions(&flash),
             "official V4 Flash must use Responses even if provider row still says Chat"
@@ -6821,7 +7039,9 @@ data: [DONE]
         // 2) Responses native (DeepSeek-style) — includes Grok: xAI preferred API is Responses
         assert_eq!(
             upstream_lane(&test_route_target_with_model(
-                "xai", "grok-4.5", "Responses"
+                "xai",
+                "grok-4.5",
+                "Responses"
             )),
             Lane::ResponsesNative
         );
@@ -6834,13 +7054,17 @@ data: [DONE]
             Lane::ResponsesNative
         );
         assert!(!route_uses_chat_completions(&test_route_target_with_model(
-            "xai", "grok-4.5", "Responses"
+            "xai",
+            "grok-4.5",
+            "Responses"
         )));
 
         // 3) CC Switch Chat Completions bridge
         assert_eq!(
             upstream_lane(&test_route_target_with_model(
-                "kimi", "k3", "Chat Completions"
+                "kimi",
+                "k3",
+                "Chat Completions"
             )),
             Lane::ChatCompletionsBridge
         );
@@ -7079,15 +7303,12 @@ data: [DONE]
                     .any(|t| t["name"] == "get_weather" || t["function"]["name"] == "get_weather"),
                 "{kind} should keep ordinary function tools"
             );
-            let has_apply = tools.iter().any(|t| {
-                t["name"] == "apply_patch" || t["function"]["name"] == "apply_patch"
-            });
+            let has_apply = tools
+                .iter()
+                .any(|t| t["name"] == "apply_patch" || t["function"]["name"] == "apply_patch");
             // Without OpenAI template: xAI/custom strip freeform; DeepSeek keeps.
             if responses_native_strips_freeform_apply_patch(kind, "") {
-                assert!(
-                    !has_apply,
-                    "{kind} must strip freeform apply_patch"
-                );
+                assert!(!has_apply, "{kind} must strip freeform apply_patch");
             } else {
                 assert!(has_apply, "{kind} must keep/ensure apply_patch");
             }
@@ -7116,7 +7337,9 @@ data: [DONE]
                 .all(|t| t.get("name").and_then(Value::as_str) != Some("apply_patch")),
             "custom+xai profile must strip freeform apply_patch: {tools:?}"
         );
-        assert!(responses_native_strips_freeform_apply_patch("custom", "xai"));
+        assert!(responses_native_strips_freeform_apply_patch(
+            "custom", "xai"
+        ));
     }
 
     #[test]
@@ -7138,11 +7361,7 @@ data: [DONE]
                 "input": "*** Begin Patch\n*** End Patch"
             }]
         });
-        sanitize_responses_request_for_upstream_with_profile(
-            "custom",
-            "openai_native",
-            &mut body,
-        );
+        sanitize_responses_request_for_upstream_with_profile("custom", "openai_native", &mut body);
         assert_eq!(body["tools"][0]["type"], "custom");
         assert_eq!(body["tools"][0]["name"], "apply_patch");
         assert_eq!(body["input"][0]["type"], "custom_tool_call");
@@ -7240,11 +7459,9 @@ data: [DONE]
                 .any(|t| t.get("name").and_then(Value::as_str) == Some("apply_patch")),
             "DeepSeek official Responses must ensure portable apply_patch: {tools:?}"
         );
-        assert!(
-            tools
-                .iter()
-                .any(|t| t.get("name").and_then(Value::as_str) == Some("lookup"))
-        );
+        assert!(tools
+            .iter()
+            .any(|t| t.get("name").and_then(Value::as_str) == Some("lookup")));
     }
 
     #[test]
@@ -7278,11 +7495,9 @@ data: [DONE]
                 .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("apply_patch")),
             "proxy must inject apply_patch when Desktop did not send freeform"
         );
-        assert!(
-            tools
-                .iter()
-                .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("get_weather"))
-        );
+        assert!(tools
+            .iter()
+            .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("get_weather")));
     }
 
     #[test]
@@ -7447,6 +7662,82 @@ data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"i
     }
 
     #[test]
+    fn responses_sse_restorer_synthesizes_added_before_done_only_freeform_call() {
+        let sse = r#"event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":7,"item":{"id":"fc_late","type":"function_call","status":"completed","call_id":"call_late","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** End Patch\"}"}}
+
+"#;
+        let mut restorer = FreeformSseRestorer::default();
+        let out = String::from_utf8(restorer.push(sse.as_bytes())).unwrap();
+        let added = out.find("response.output_item.added").expect("added");
+        let input = out
+            .find("response.custom_tool_call_input.done")
+            .expect("input done");
+        let done = out.rfind("response.output_item.done").expect("done");
+        assert!(added < input && input < done, "out={out}");
+        assert!(out.contains("\"item_id\":\"ctc_late\""), "out={out}");
+        assert!(out.contains("\"call_id\":\"call_late\""), "out={out}");
+        assert_eq!(restorer.diagnostics.synthesized_added, 1);
+    }
+
+    #[test]
+    fn responses_sse_restorer_buffers_arguments_until_added() {
+        let sse = r#"event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_reordered","output_index":0,"arguments":"{\"input\":\"*** Begin Patch\\n*** End Patch\"}"}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_reordered","type":"function_call","status":"in_progress","call_id":"call_reordered","name":"apply_patch","arguments":""}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_reordered","type":"function_call","status":"completed","call_id":"call_reordered","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** End Patch\"}"}}
+
+"#;
+        let mut restorer = FreeformSseRestorer::default();
+        let out = String::from_utf8(restorer.push(sse.as_bytes())).unwrap();
+        assert!(
+            !out.contains("response.function_call_arguments.done"),
+            "out={out}"
+        );
+        let added = out.find("response.output_item.added").expect("added");
+        let input = out
+            .find("response.custom_tool_call_input.done")
+            .expect("input done");
+        assert!(added < input, "out={out}");
+        assert!(restorer.diagnostics.reordered_event >= 1);
+    }
+
+    #[test]
+    fn responses_sse_restorer_flushes_pending_call_at_completed() {
+        let sse = r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_pending","type":"function_call","status":"in_progress","call_id":"call_pending","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** End Patch\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"output":[]}}
+
+"#;
+        let mut restorer = FreeformSseRestorer::default();
+        let out = String::from_utf8(restorer.push(sse.as_bytes())).unwrap();
+        assert!(out.contains("response.output_item.done"), "out={out}");
+        assert!(out.contains("response.completed"), "out={out}");
+        assert_eq!(restorer.diagnostics.incomplete_at_completed, 1);
+    }
+
+    #[test]
+    fn responses_sse_restorer_keeps_parallel_calls_separate() {
+        let calls = [("fc_a", "call_a", 0), ("fc_b", "call_b", 1)];
+        let mut sse = String::new();
+        for (item_id, call_id, output_index) in calls {
+            sse.push_str(&format!("event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":{output_index},\"item\":{{\"id\":\"{item_id}\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"{call_id}\",\"name\":\"apply_patch\",\"arguments\":\"{{\\\"input\\\":\\\"*** Begin Patch\\\\n*** End Patch\\\"}}\"}}}}\n\n"));
+        }
+        let mut restorer = FreeformSseRestorer::default();
+        let out = String::from_utf8(restorer.push(sse.as_bytes())).unwrap();
+        assert!(out.contains("\"item_id\":\"ctc_a\""), "out={out}");
+        assert!(out.contains("\"item_id\":\"ctc_b\""), "out={out}");
+        assert!(out.contains("\"call_id\":\"call_a\""), "out={out}");
+        assert!(out.contains("\"call_id\":\"call_b\""), "out={out}");
+    }
+
+    #[test]
     fn responses_sse_restorer_leaves_exec_command_function_call() {
         let sse = r#"event: response.output_item.added
 data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_s","type":"function_call","status":"in_progress","call_id":"c1","name":"exec_command","arguments":""}}
@@ -7463,6 +7754,14 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
         assert!(out.contains("function_call_arguments.done"));
         assert!(out.contains("exec_command"));
         assert!(!out.contains("custom_tool_call"));
+    }
+
+    #[test]
+    fn official_openai_does_not_use_third_party_freeform_restorer() {
+        assert!(!requires_freeform_responses_restore("openai"));
+        assert!(!requires_freeform_responses_restore("OpenAI"));
+        assert!(requires_freeform_responses_restore("custom"));
+        assert!(requires_freeform_responses_restore("xai"));
     }
 
     #[test]
@@ -7654,9 +7953,9 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
             "exec description must be preserved: {exec}"
         );
         assert!(
-            tools
-                .iter()
-                .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("exec_command")),
+            tools.iter().any(
+                |t| t.pointer("/function/name").and_then(Value::as_str) == Some("exec_command")
+            ),
             "exec_command must remain"
         );
     }
@@ -7781,7 +8080,11 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
         // Still Responses path shape: input[] with function_call, not chat messages.
         assert!(body.get("messages").is_none());
         let input = body["input"].as_array().expect("input");
-        assert_eq!(input.len(), 4, "all history rows kept (rewritten, not dropped): {input:?}");
+        assert_eq!(
+            input.len(),
+            4,
+            "all history rows kept (rewritten, not dropped): {input:?}"
+        );
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["name"], "apply_patch");
@@ -7950,9 +8253,7 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
         assert!(
             input.iter().any(|item| {
                 item.get("type") == Some(&json!("message"))
-                    && item
-                        .to_string()
-                        .contains("cannot read")
+                    && item.to_string().contains("cannot read")
             }),
             "foreign compact should expand to opaque note: {input:?}"
         );
@@ -7985,7 +8286,11 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
         });
         sanitize_responses_request_for_upstream("openai", &mut body);
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2, "user message + live compaction only: {input:?}");
+        assert_eq!(
+            input.len(),
+            2,
+            "user message + live compaction only: {input:?}"
+        );
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[1]["type"], "compaction");
         assert!(input[1].get("encrypted_content").is_none());
@@ -8232,6 +8537,24 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s","
         );
         assert_eq!(xhigh["reasoning_effort"], "max");
         assert_ne!(xhigh["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn zcode_reasoning_effort_spelling_maps_k3_and_grok_by_model() {
+        let kimi = test_route_target_with_model("kimi", "k3", "Chat Completions");
+        let chat = responses_to_chat_completions(
+            &json!({"input": "hi", "reasoningEffort": "max"}),
+            "k3",
+            &kimi,
+        );
+        assert_eq!(chat["reasoning_effort"], "max");
+        assert!(chat.get("thinking").is_none());
+
+        let grok = test_route_target_with_model("xai", "grok-4.5", "Responses");
+        let mut request = json!({"input": "hi", "reasoning_effort": "none"});
+        map_reasoning(&grok, &mut request);
+        assert_eq!(request["reasoning"]["effort"], "low");
+        assert!(request.get("reasoning_effort").is_none());
     }
 
     #[test]

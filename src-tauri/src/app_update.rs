@@ -143,8 +143,9 @@ fn pick_asset<'a>(assets: &'a [GhAsset], platform: &str, arch: &str) -> Option<&
                 is_dmg && arch_ok
             }
             "Windows" => {
-                let is_installer =
-                    lower.ends_with(".exe") || lower.ends_with(".msi") || lower.ends_with(".nsis.zip");
+                let is_installer = lower.ends_with(".exe")
+                    || lower.ends_with(".msi")
+                    || lower.ends_with(".nsis.zip");
                 let arch_ok = lower.contains("x64")
                     || lower.contains("x86_64")
                     || lower.contains("amd64")
@@ -173,9 +174,7 @@ pub async fn check_for_app_update() -> Result<AppUpdateInfo, String> {
     let platform = host_platform().to_string();
     let architecture = host_architecture().to_string();
     let client = http_client()?;
-    let url = format!(
-        "https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-    );
+    let url = format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest");
     let response = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -257,15 +256,12 @@ async fn install_app_update_macos(app: AppHandle) -> Result<AppUpdateInstallResu
             info.current_version
         ));
     }
-    let asset_url = info
-        .asset_url
-        .clone()
-        .ok_or_else(|| {
-            format!(
-                "最新版本 v{} 没有适用于 {} {} 的安装包。请打开 Release 页面手动下载，或从源码构建。",
-                info.latest_version, info.platform, info.architecture
-            )
-        })?;
+    let asset_url = info.asset_url.clone().ok_or_else(|| {
+        format!(
+            "最新版本 v{} 没有适用于 {} {} 的安装包。请打开 Release 页面手动下载，或从源码构建。",
+            info.latest_version, info.platform, info.architecture
+        )
+    })?;
     let asset_name = info
         .asset_name
         .clone()
@@ -341,10 +337,7 @@ async fn install_app_update_macos(app: AppHandle) -> Result<AppUpdateInstallResu
     });
 
     Ok(AppUpdateInstallResult {
-        message: format!(
-            "已下载 v{}，正在替换应用并重启…",
-            info.latest_version
-        ),
+        message: format!("已下载 v{}，正在替换应用并重启…", info.latest_version),
         install_path: install_path.display().to_string(),
         version: info.latest_version,
         will_relaunch: true,
@@ -565,10 +558,7 @@ mod tests {
             compare_versions("v0.1.5", "0.1.5"),
             std::cmp::Ordering::Equal
         );
-        assert_eq!(
-            compare_versions("0.1.4", "0.1.5"),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(compare_versions("0.1.4", "0.1.5"), std::cmp::Ordering::Less);
         assert_eq!(
             compare_versions("0.2.0", "0.1.99"),
             std::cmp::Ordering::Greater

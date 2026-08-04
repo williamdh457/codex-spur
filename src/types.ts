@@ -259,6 +259,38 @@ export type ProxyRequestEvent = {
   errorSummary: string | null;
 };
 
+export type ThreadHistoryTimelineEntry = {
+  timestamp: string;
+  category: "command" | "file_change" | "web_search" | "tool";
+  toolName: string;
+  status: string | null;
+};
+
+/** Read-only rollout integrity report. No prompts, arguments, outputs, or credentials. */
+export type ThreadHistoryHealthReport = {
+  threadId: string;
+  rolloutPath: string;
+  rolloutBytes: number;
+  sha256: string;
+  parsedRows: number;
+  invalidCompleteLines: number;
+  trailingPartialLine: boolean;
+  compactionEvents: number;
+  turnStarts: number;
+  turnFinishes: number;
+  activeTurns: number;
+  toolCalls: number;
+  toolOutputs: number;
+  missingOutputs: number;
+  orphanOutputs: number;
+  duplicateCallIds: number;
+  duplicateOutputCallIds: number;
+  duplicateResponseItemIds: number;
+  missingCallIds: number;
+  timeline: ThreadHistoryTimelineEntry[];
+  timelineTruncated: boolean;
+};
+
 export type QuotaWindow = {
   usedPercent: number;
   remainingPercent: number;

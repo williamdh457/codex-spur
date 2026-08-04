@@ -24,6 +24,7 @@
 //! ```
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 pub const EXEC_FREEFORM_TOOL_NAME: &str = "exec";
@@ -274,8 +275,7 @@ pub fn normalize_apply_patch_input(raw: &str) -> String {
         // strip a trailing *** that Grok often appends after the path.
         if let Some(stripped) = trimmed.strip_suffix("***") {
             let s = stripped.trim_end();
-            if s.contains('/') || s.ends_with(".ts") || s.ends_with(".tsx") || s.ends_with(".rs")
-            {
+            if s.contains('/') || s.ends_with(".ts") || s.ends_with(".tsx") || s.ends_with(".rs") {
                 // Only if it looks like a bare path line under a file action — rare.
                 out_lines.push(line.to_string());
                 continue;
@@ -496,7 +496,9 @@ fn portable_function_arguments_from_custom(item: &Value, name: &str) -> String {
         }
     }
     match item.get("input") {
-        Some(Value::String(s)) if is_freeform_desktop_tool(name) || name == APPLY_PATCH_TOOL_NAME => {
+        Some(Value::String(s))
+            if is_freeform_desktop_tool(name) || name == APPLY_PATCH_TOOL_NAME =>
+        {
             serde_json::to_string(&json!({ "input": s }))
                 .unwrap_or_else(|_| format!(r#"{{"input":{}}}"#, json!(s)))
         }
@@ -523,7 +525,11 @@ pub fn custom_tool_call_to_function_call(item: &Value) -> Option<Value> {
     if item_type != "custom_tool_call" {
         return None;
     }
-    let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let call_id = item
         .get("call_id")
         .or_else(|| item.get("id"))
@@ -590,7 +596,11 @@ pub fn custom_tool_call_output_to_function_call_output(item: &Value) -> Option<V
 /// `function_call` + JSON `arguments`. Desktop freeform executors require
 /// `custom_tool_call` + freeform `input` or they **abort**. Idempotent for
 /// items already in the official shape.
-pub fn restore_freeform_output_item(item: &Value) -> Value {
+/// Restore a freeform Responses item using `fallback_seed` to create
+/// deterministic, collision-safe ids when an upstream omitted them. Callers
+/// that know a Responses output index should include it in the seed so two
+/// anonymous calls in the same response cannot collapse into one Desktop item.
+pub fn restore_freeform_output_item_with_seed(item: &Value, fallback_seed: &str) -> Value {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
 
@@ -614,10 +624,7 @@ pub fn restore_freeform_output_item(item: &Value) -> Value {
     if !is_freeform_desktop_tool(name) {
         return item.clone();
     }
-    let arguments = item
-        .get("arguments")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
     let call_id = item
         .get("call_id")
         .and_then(Value::as_str)
@@ -641,12 +648,10 @@ pub fn restore_freeform_output_item(item: &Value) -> Value {
             }
         }
         _ if !call_id.is_empty() => format!("ctc_{call_id}"),
-        _ => format!("ctc_{name}"),
+        _ => format!("ctc_{}", stable_freeform_id("item", fallback_seed)),
     };
-    let desktop_call_id = if call_id.is_empty() {
-        format!("call_{name}")
-    } else if call_id.starts_with("ctc_") {
-        format!("call_{name}")
+    let desktop_call_id = if call_id.is_empty() || call_id.starts_with("ctc_") {
+        format!("call_{}", stable_freeform_id("call", fallback_seed))
     } else {
         call_id
     };
@@ -658,6 +663,11 @@ pub fn restore_freeform_output_item(item: &Value) -> Value {
         "name": name,
         "input": input
     })
+}
+
+fn stable_freeform_id(prefix: &str, seed: &str) -> String {
+    let digest = Sha256::digest(format!("codex-spur-freeform-v1:{prefix}:{seed}").as_bytes());
+    hex::encode(&digest[..12])
 }
 
 /// Restore freeform tools inside a Responses JSON body (`output` / nested `response`).
@@ -672,8 +682,8 @@ fn restore_freeform_in_output_array(output: Option<&mut Value>) {
     let Some(Value::Array(items)) = output else {
         return;
     };
-    for item in items.iter_mut() {
-        *item = restore_freeform_output_item(item);
+    for (index, item) in items.iter_mut().enumerate() {
+        *item = restore_freeform_output_item_with_seed(item, &format!("response-output-{index}"));
     }
 }
 
@@ -720,7 +730,8 @@ mod tests {
 
     #[test]
     fn extract_for_apply_patch_normalizes() {
-        let args = r#"{"input":"*** Begin Patch ***\n*** Update File: a.py\n+hi\n*** End Patch ***"}"#;
+        let args =
+            r#"{"input":"*** Begin Patch ***\n*** Update File: a.py\n+hi\n*** End Patch ***"}"#;
         let input = extract_freeform_input_for_tool(APPLY_PATCH_TOOL_NAME, args);
         assert_eq!(input.lines().next().unwrap_or(""), "*** Begin Patch");
     }
@@ -735,9 +746,15 @@ mod tests {
             "status": "completed",
             "input": "*** Begin Patch ***\n*** Update File: a.ts\n*** End Patch ***"
         });
-        let restored = restore_freeform_output_item(&item);
+        let restored = restore_freeform_output_item_with_seed(&item, "test-item");
         assert_eq!(
-            restored.get("input").and_then(Value::as_str).unwrap().lines().next().unwrap(),
+            restored
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
             "*** Begin Patch"
         );
     }
@@ -810,14 +827,8 @@ mod tests {
             "_fetch_file",
             "apply_script_edit",
         ] {
-            let item = desktop_tool_call_item(
-                "resp_x",
-                0,
-                name,
-                "call_1",
-                r#"{"x":1}"#,
-                "completed",
-            );
+            let item =
+                desktop_tool_call_item("resp_x", 0, name, "call_1", r#"{"x":1}"#, "completed");
             assert_eq!(
                 item["type"], "function_call",
                 "{name} must stay function_call"
@@ -828,14 +839,8 @@ mod tests {
 
     #[test]
     fn unknown_tool_defaults_to_function_call() {
-        let item = desktop_tool_call_item(
-            "resp_x",
-            0,
-            "some_mcp_tool",
-            "call_1",
-            "{}",
-            "completed",
-        );
+        let item =
+            desktop_tool_call_item("resp_x", 0, "some_mcp_tool", "call_1", "{}", "completed");
         assert_eq!(item["type"], "function_call");
     }
 
@@ -865,7 +870,10 @@ mod tests {
                 .starts_with("*** Begin Patch"),
             "args={args}"
         );
-        assert!(fc.get("input").is_none(), "portable row must not keep freeform input key");
+        assert!(
+            fc.get("input").is_none(),
+            "portable row must not keep freeform input key"
+        );
     }
 
     #[test]
@@ -892,7 +900,7 @@ mod tests {
             "status": "completed"
         });
         let portable = custom_tool_call_to_function_call(&desktop).unwrap();
-        let restored = restore_freeform_output_item(&portable);
+        let restored = restore_freeform_output_item_with_seed(&portable, "test-portable");
         assert_eq!(restored["type"], "custom_tool_call");
         assert_eq!(restored["name"], "apply_patch");
         assert_eq!(restored["call_id"], "call_rt");
@@ -955,7 +963,7 @@ mod tests {
             "name": "apply_patch",
             "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
         });
-        let restored = restore_freeform_output_item(&upstream);
+        let restored = restore_freeform_output_item_with_seed(&upstream, "test-upstream");
         assert_eq!(restored["type"], "custom_tool_call");
         assert_eq!(restored["name"], "apply_patch");
         assert_eq!(restored["call_id"], "call_patch_1");
@@ -973,7 +981,7 @@ mod tests {
             "call_id": "call_1",
             "arguments": "{\"cmd\":\"ls\"}"
         });
-        let restored = restore_freeform_output_item(&upstream);
+        let restored = restore_freeform_output_item_with_seed(&upstream, "test-upstream");
         assert_eq!(restored["type"], "function_call");
         assert_eq!(restored["name"], "exec_command");
     }
@@ -988,8 +996,22 @@ mod tests {
             "name": "apply_patch",
             "input": "*** Begin Patch\n*** End Patch\n"
         });
-        let restored = restore_freeform_output_item(&gold);
+        let restored = restore_freeform_output_item_with_seed(&gold, "test-gold");
         assert_eq!(restored, gold);
+    }
+
+    #[test]
+    fn restore_freeform_missing_ids_uses_seeded_unique_call_ids() {
+        let item = json!({
+            "type": "function_call",
+            "name": "apply_patch",
+            "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+        });
+        let first = restore_freeform_output_item_with_seed(&item, "response-output-0");
+        let second = restore_freeform_output_item_with_seed(&item, "response-output-1");
+        assert_ne!(first["id"], second["id"]);
+        assert_ne!(first["call_id"], second["call_id"]);
+        assert_ne!(first["call_id"], "call_apply_patch");
     }
 
     #[test]

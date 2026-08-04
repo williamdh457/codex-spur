@@ -5,7 +5,9 @@ use reqwest::header::{HeaderMap, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::{CatalogModel, ReasoningEffort, ReasoningProfile, TruncationPolicy};
+use crate::domain::{
+    CatalogModel, ReasoningEffort, ReasoningEffortPreset, ReasoningProfile, TruncationPolicy,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProviderModel {
@@ -191,7 +193,11 @@ impl UpstreamProtocolLane {
 }
 
 /// Resolve the three-lane routing for a provider kind + protocol + model id.
-pub fn upstream_protocol_lane(kind: &str, protocol: &str, upstream_model: &str) -> UpstreamProtocolLane {
+pub fn upstream_protocol_lane(
+    kind: &str,
+    protocol: &str,
+    upstream_model: &str,
+) -> UpstreamProtocolLane {
     let kind = kind.to_ascii_lowercase();
     let protocol = protocol.to_ascii_lowercase();
 
@@ -870,6 +876,49 @@ pub fn apply_reasoning_levels_for_profile(
     }
 }
 
+/// Apply documented model-level reasoning capabilities. This is the normal
+/// catalog path because a provider-level profile alone cannot express K3/K2.7.
+pub fn apply_reasoning_levels_for_route(
+    model: &mut CatalogModel,
+    kind: &str,
+    profile: crate::reasoning_map::ReasoningProfileId,
+    upstream_model: &str,
+) {
+    use crate::reasoning_map::ReasoningProfileId;
+    let capability =
+        crate::reasoning_map::model_reasoning_capability(kind, upstream_model, profile);
+    if kind.eq_ignore_ascii_case("openai")
+        || matches!(
+            profile,
+            ReasoningProfileId::OpenaiNative | ReasoningProfileId::Passthrough
+        ) && !kind.eq_ignore_ascii_case("kimi")
+            && !kind.eq_ignore_ascii_case("xai")
+    {
+        apply_reasoning_levels_for_profile(model, profile, Some(upstream_model));
+        return;
+    }
+    model.supported_reasoning_levels = capability
+        .levels
+        .into_iter()
+        .map(|effort| ReasoningEffortPreset {
+            effort,
+            description: crate::reasoning_map::catalog_level_description_for_model(
+                kind,
+                upstream_model,
+                profile,
+                effort,
+            )
+            .into(),
+        })
+        .collect();
+    model.default_reasoning_level = capability.default_level.or_else(|| {
+        model
+            .supported_reasoning_levels
+            .first()
+            .map(|level| level.effort)
+    });
+}
+
 /// Legacy alias kept for call sites that still reference the old constant name.
 /// Coding catalog rows no longer target this one-liner; see
 /// [`crate::official_prompt_map::apply_official_base_instructions`].
@@ -1066,9 +1115,12 @@ pub fn normalize_catalog_model_for_codex_full_with_profile(
         apply_reasoning_levels_for_profile(model, profile, None);
     }
     if model.default_reasoning_level.is_none()
-        || model
-            .default_reasoning_level
-            .is_some_and(|d| !model.supported_reasoning_levels.iter().any(|l| l.effort == d))
+        || model.default_reasoning_level.is_some_and(|d| {
+            !model
+                .supported_reasoning_levels
+                .iter()
+                .any(|l| l.effort == d)
+        })
     {
         let profile = reasoning_profile_id_for_kind(kind.unwrap_or("custom"));
         model.default_reasoning_level =
@@ -1181,9 +1233,10 @@ pub fn normalize_catalog_model_for_codex_full_with_profile(
     } else {
         model.input_modalities = vec!["text".into(), "image".into()];
         if kind_lower == "kimi" || model.display_name.to_ascii_lowercase().contains("kimi") {
-            model.context_window = Some(262_144);
-            model.max_context_window = Some(262_144);
-            model.auto_compact_token_limit = Some(235_929);
+            let window = kimi_context_window(upstream_s);
+            model.context_window = Some(window);
+            model.max_context_window = Some(window);
+            model.auto_compact_token_limit = Some((window as f64 * 0.9) as i64);
         } else if model.context_window.unwrap_or(0) == 0 {
             model.context_window = Some(128_000);
             model.max_context_window = Some(128_000);
@@ -1365,6 +1418,21 @@ pub fn catalog_model(
     )
 }
 
+/// Context windows returned by the Kimi Code `/models` endpoint.
+///
+/// Kimi Code exposes `k3` (1M) separately from `k3-256k` and the K2.7
+/// Coding routes (256K). Keep this model-specific; `kind = kimi` alone is
+/// not enough to choose a context window.
+pub fn kimi_context_window(upstream_model: &str) -> i64 {
+    let normalized = upstream_model.trim().to_ascii_lowercase();
+    let model = normalized.rsplit(['/', ':']).next().unwrap_or("");
+    if model == "k3" {
+        1_048_576
+    } else {
+        262_144
+    }
+}
+
 pub fn catalog_model_with_profile(
     provider_id: &str,
     kind: &str,
@@ -1379,8 +1447,8 @@ pub fn catalog_model_with_profile(
     let (context_window, max_context_window) = if is_openai_family {
         (Some(272_000), Some(272_000))
     } else if kind == "kimi" {
-        // Match working Nice Switch Kimi surface windows.
-        (Some(262_144), Some(262_144))
+        let window = kimi_context_window(&model.id);
+        (Some(window), Some(window))
     } else if kind == "deepseek" {
         // Official DeepSeek Codex models.json: 1M context for V4 Flash/Pro.
         (Some(1_048_576), Some(1_048_576))
@@ -1508,7 +1576,7 @@ pub fn catalog_model_with_profile(
             "approvals": null
         }));
     }
-    apply_reasoning_levels_for_profile(&mut catalog, profile, Some(&model.id));
+    apply_reasoning_levels_for_route(&mut catalog, kind, profile, &model.id);
     catalog
 }
 
@@ -1753,7 +1821,9 @@ mod tests {
 
     #[test]
     fn deepseek_v4_flash_uses_native_responses_even_if_protocol_says_chat() {
-        assert!(deepseek_model_supports_native_responses("deepseek-v4-flash"));
+        assert!(deepseek_model_supports_native_responses(
+            "deepseek-v4-flash"
+        ));
         assert!(deepseek_model_supports_native_responses(
             "deepseek/deepseek-v4-flash"
         ));
@@ -1922,12 +1992,16 @@ mod tests {
             .get("supported_reasoning_levels")
             .and_then(|v| v.as_array())
             .expect("levels");
-        // Kimi template advertises honest distinct rungs only (not a fake full 8).
+        // K3 exposes its documented three distinct rungs only.
         let efforts: Vec<&str> = levels
             .iter()
             .filter_map(|level| level.get("effort").and_then(|v| v.as_str()))
             .collect();
-        assert_eq!(efforts, vec!["none", "low", "medium", "high"]);
+        assert_eq!(efforts, vec!["low", "high", "max"]);
+        assert_eq!(
+            json.get("default_reasoning_level").and_then(|v| v.as_str()),
+            Some("max")
+        );
         assert_eq!(
             json.get("shell_type").and_then(|v| v.as_str()),
             Some("shell_command")
@@ -1949,7 +2023,10 @@ mod tests {
             .get("slug")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        assert_eq!(slug, "k3.kimi-tian", "expected model.provider slug, got {slug}");
+        assert_eq!(
+            slug, "k3.kimi-tian",
+            "expected model.provider slug, got {slug}"
+        );
         assert!(!slug.contains('/'), "slug must not contain '/'");
         // ChatGPT's GUI expects the complete ModelInfo shape even for empty values.
         assert_eq!(
@@ -1989,7 +2066,15 @@ mod tests {
         // Legacy Spur rows used 90%; official Codex default is 95%.
         model.effective_context_window_percent = 90;
 
-        normalize_catalog_model_for_codex_with_kind(&mut model, 1000, Some("kimi"));
+        normalize_catalog_model_for_codex_full_with_profile(
+            &mut model,
+            1000,
+            Some("kimi"),
+            Some("Chat Completions"),
+            Some("k3"),
+            None,
+            false,
+        );
 
         assert_eq!(model.effective_context_window_percent, 95);
         assert_eq!(
@@ -1997,8 +2082,17 @@ mod tests {
             crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT
         );
         // Auto-compact stays ~90% of raw context (official core clamp).
-        assert_eq!(model.auto_compact_token_limit, Some(235_929));
-        assert_eq!(model.context_window, Some(262_144));
+        assert_eq!(model.auto_compact_token_limit, Some(943_718));
+        assert_eq!(model.context_window, Some(1_048_576));
+    }
+
+    #[test]
+    fn kimi_code_context_windows_follow_upstream_model_ids() {
+        assert_eq!(kimi_context_window("k3"), 1_048_576);
+        assert_eq!(kimi_context_window("kimi/k3"), 1_048_576);
+        assert_eq!(kimi_context_window("k3-256k"), 262_144);
+        assert_eq!(kimi_context_window("kimi-for-coding"), 262_144);
+        assert_eq!(kimi_context_window("kimi-for-coding-highspeed"), 262_144);
     }
 
     #[test]
@@ -2015,14 +2109,17 @@ mod tests {
     #[test]
     fn catalog_publish_slug_is_model_dot_provider() {
         let mut claimed = std::collections::HashSet::new();
-        let first = catalog_publish_slug("p1", "OpenAI Work", "openai", "gpt-5.6-terra", &mut claimed);
-        let second = catalog_publish_slug("p2", "OpenAI Home", "openai", "gpt-5.6-terra", &mut claimed);
+        let first =
+            catalog_publish_slug("p1", "OpenAI Work", "openai", "gpt-5.6-terra", &mut claimed);
+        let second =
+            catalog_publish_slug("p2", "OpenAI Home", "openai", "gpt-5.6-terra", &mut claimed);
         let kimi = catalog_publish_slug("p3", "Kimi", "kimi", "k3", &mut claimed);
         assert_eq!(first, "gpt-5.6-terra.openai-work");
         assert_eq!(second, "gpt-5.6-terra.openai-home");
         assert_eq!(kimi, "k3.kimi");
         // Same label + model → disambiguated
-        let clash = catalog_publish_slug("p4", "OpenAI Work", "openai", "gpt-5.6-terra", &mut claimed);
+        let clash =
+            catalog_publish_slug("p4", "OpenAI Work", "openai", "gpt-5.6-terra", &mut claimed);
         assert!(clash.starts_with("gpt-5.6-terra.openai-work-"));
         assert_eq!(
             desktop_native_model_slug("openai/gpt-5.6-sol"),
@@ -2275,6 +2372,76 @@ mod tests {
             "https://example.com/v1"
         );
         assert!(normalize_base_url("file:///tmp/models").is_err());
+    }
+
+    #[test]
+    fn catalog_reasoning_is_model_specific_for_k3_k27_and_grok() {
+        let k3 = catalog_model_with_profile(
+            "kimi-instance",
+            "kimi",
+            "Kimi",
+            &DiscoveredProviderModel {
+                id: "k3".into(),
+                display_name: "K3".into(),
+                owned_by: None,
+                created_at: None,
+            },
+            crate::reasoning_map::ReasoningProfileId::Kimi,
+            None,
+        );
+        assert_eq!(
+            k3.supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort)
+                .collect::<Vec<_>>(),
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+        assert_eq!(k3.default_reasoning_level, Some(ReasoningEffort::Max));
+
+        let k27 = catalog_model_with_profile(
+            "kimi-instance",
+            "kimi",
+            "Kimi",
+            &DiscoveredProviderModel {
+                id: "kimi-for-coding".into(),
+                display_name: "K2.7".into(),
+                owned_by: None,
+                created_at: None,
+            },
+            crate::reasoning_map::ReasoningProfileId::Kimi,
+            None,
+        );
+        assert_eq!(k27.supported_reasoning_levels.len(), 1);
+
+        let grok = catalog_model_with_profile(
+            "xai-instance",
+            "xai",
+            "Grok",
+            &DiscoveredProviderModel {
+                id: "grok-4.5".into(),
+                display_name: "Grok 4.5".into(),
+                owned_by: None,
+                created_at: None,
+            },
+            crate::reasoning_map::ReasoningProfileId::Xai,
+            None,
+        );
+        assert_eq!(
+            grok.supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort)
+                .collect::<Vec<_>>(),
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High
+            ]
+        );
+        assert_eq!(grok.default_reasoning_level, Some(ReasoningEffort::High));
     }
 
     #[test]

@@ -164,16 +164,13 @@ pub async fn consume_reset_credit(
 }
 
 fn codex_quota_headers(access_token: &str, account_id: &str) -> reqwest::header::HeaderMap {
-    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, ACCEPT};
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {access_token}")) {
         headers.insert(AUTHORIZATION, value);
     }
     if let Ok(value) = HeaderValue::from_str(account_id) {
-        headers.insert(
-            HeaderName::from_static("chatgpt-account-id"),
-            value.clone(),
-        );
+        headers.insert(HeaderName::from_static("chatgpt-account-id"), value.clone());
         // Title-case alias used by some ChatGPT clients.
         if let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id") {
             headers.insert(name, value);
@@ -223,10 +220,7 @@ async fn fetch_first_json(
         {
             Ok(response) if response.status().is_success() => {
                 let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .context("额度接口响应体读取失败")?;
+                let body = response.text().await.context("额度接口响应体读取失败")?;
                 return serde_json::from_str(&body).with_context(|| {
                     format!(
                         "额度接口返回不是 JSON（{status}）：{}",
@@ -270,7 +264,10 @@ fn window_has_signal(window: &RawWindow) -> bool {
 
 /// Map windows onto the Codex 5h / 7d ladder by nearest `limit_window_seconds`
 /// (Sub2API Normalize behaviour). Never force a 7d window into the 5h slot.
-fn select_quota_windows(windows: &[RawWindow], fetched_at: i64) -> (Option<QuotaWindow>, Option<QuotaWindow>) {
+fn select_quota_windows(
+    windows: &[RawWindow],
+    fetched_at: i64,
+) -> (Option<QuotaWindow>, Option<QuotaWindow>) {
     let mut five: Option<(i64, RawWindow)> = None;
     let mut seven: Option<(i64, RawWindow)> = None;
     for window in windows {
@@ -323,10 +320,7 @@ fn to_window(window: RawWindow, fetched_at: i64) -> QuotaWindow {
         window.limit_window_seconds
     } else {
         // Best-effort label when upstream only gave a reset countdown.
-        window
-            .reset_after_seconds
-            .filter(|s| *s > 0)
-            .unwrap_or(0)
+        window.reset_after_seconds.filter(|s| *s > 0).unwrap_or(0)
     };
     QuotaWindow {
         used_percent: used,

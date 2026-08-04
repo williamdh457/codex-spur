@@ -368,9 +368,7 @@ mod tests {
         let mut neutral = base("n");
         neutral.quota_remaining = None;
         neutral.quota_fetched_at = None;
-        assert!(
-            (quota_headroom_factor(&stale, &config.score_weights, now) - 0.5).abs() < 1e-9
-        );
+        assert!((quota_headroom_factor(&stale, &config.score_weights, now) - 0.5).abs() < 1e-9);
         let _ = (stale_score, fresh_score, neutral);
     }
 

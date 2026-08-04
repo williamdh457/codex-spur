@@ -23,10 +23,7 @@ pub fn is_failover_status(status: reqwest::StatusCode) -> bool {
 }
 
 /// Failover check with Sub2API-like `failover_on_400` option.
-pub fn is_failover_status_with_options(
-    status: reqwest::StatusCode,
-    failover_on_400: bool,
-) -> bool {
+pub fn is_failover_status_with_options(status: reqwest::StatusCode, failover_on_400: bool) -> bool {
     let code = status.as_u16();
     if matches!(code, 401 | 402 | 403 | 429 | 529) || status.is_server_error() {
         return true;
@@ -187,8 +184,14 @@ fn parse_retry_after_secs(headers: &HeaderMap) -> Option<i64> {
 /// Prefer exhausted window (used >= 100) reset-after; else soonest positive reset-after.
 fn parse_codex_reset_headers(headers: &HeaderMap, now_unix: i64) -> Option<i64> {
     let windows = [
-        ("x-codex-primary-used-percent", "x-codex-primary-reset-after-seconds"),
-        ("x-codex-secondary-used-percent", "x-codex-secondary-reset-after-seconds"),
+        (
+            "x-codex-primary-used-percent",
+            "x-codex-primary-reset-after-seconds",
+        ),
+        (
+            "x-codex-secondary-used-percent",
+            "x-codex-secondary-reset-after-seconds",
+        ),
         ("x-codex-7d-used-percent", "x-codex-7d-reset-after-seconds"),
         ("x-codex-5h-used-percent", "x-codex-5h-reset-after-seconds"),
     ];
@@ -353,7 +356,8 @@ mod tests {
     #[test]
     fn parses_usage_limit_resets_at() {
         let body = br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":1800000000}}"#;
-        let decision = resolve_rate_limit_cooldown(&HeaderMap::new(), Some(body), 30, 1_700_000_000);
+        let decision =
+            resolve_rate_limit_cooldown(&HeaderMap::new(), Some(body), 30, 1_700_000_000);
         assert_eq!(decision.cooldown_until, 1_800_000_000);
         assert!(decision.is_usage_limit);
     }
@@ -394,8 +398,12 @@ mod tests {
     #[test]
     fn failover_includes_5xx_and_402() {
         assert!(is_failover_status(reqwest::StatusCode::PAYMENT_REQUIRED));
-        assert!(is_failover_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
-        assert!(is_failover_status(reqwest::StatusCode::from_u16(529).unwrap()));
+        assert!(is_failover_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_failover_status(
+            reqwest::StatusCode::from_u16(529).unwrap()
+        ));
         assert!(!is_failover_status(reqwest::StatusCode::BAD_REQUEST));
         assert!(!is_failover_status_with_options(
             reqwest::StatusCode::BAD_REQUEST,

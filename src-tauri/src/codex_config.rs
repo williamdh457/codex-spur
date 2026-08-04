@@ -1127,7 +1127,8 @@ mod tests {
                 sample_model("spur-route-gpt5luna00001", "OpenAI · GPT-5.6-Luna"),
             ],
         };
-        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
+        let result =
+            apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         assert_eq!(result.model_count, 2);
         assert!(result.config_path.starts_with(&publish_dir));
         assert!(!result.config_path.starts_with(&orca_dir));
@@ -1276,7 +1277,8 @@ mod tests {
                 sample_model("spur-route-k2deadbeef002", "Kimi · K2"),
             ],
         };
-        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
+        let result =
+            apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         assert_eq!(result.model_count, 2);
         assert_eq!(
             result.selected_model.as_deref(),
@@ -1417,7 +1419,8 @@ mod tests {
         let catalog = ModelsResponse {
             models: vec![sample_model("gpt-5.6-terra", "GPT-5.6-Terra")],
         };
-        let result = apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
+        let result =
+            apply("http://127.0.0.1:17861/v1", "test-token", &catalog, false).expect("apply");
         assert_eq!(result.model_count, 1);
         std::env::remove_var("CODEX_SPUR_PUBLISH_HOME");
         let _ = fs::remove_dir_all(&dir);

@@ -90,10 +90,8 @@ impl SecretMaterial {
             id_token: string("id_token"),
             session_token: string("session_token"),
             api_key: string("api_key"),
-            agent_runtime_id: string("agent_runtime_id")
-                .or_else(|| string("agentRuntimeId")),
-            agent_private_key: string("agent_private_key")
-                .or_else(|| string("agentPrivateKey")),
+            agent_runtime_id: string("agent_runtime_id").or_else(|| string("agentRuntimeId")),
+            agent_private_key: string("agent_private_key").or_else(|| string("agentPrivateKey")),
             task_id: string("task_id").or_else(|| string("taskId")),
         })
     }
@@ -227,9 +225,7 @@ pub fn parse_session_import(input: &str) -> Result<CanonicalCredential, ImportEr
         .and_then(|a| a.get("id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            crate::openai_oauth::chatgpt_account_id_from_token(&access)
-        });
+        .or_else(|| crate::openai_oauth::chatgpt_account_id_from_token(&access));
     let label = object
         .get("user")
         .and_then(|u| u.get("name"))
@@ -731,8 +727,14 @@ mod tests {
         assert_eq!(parsed[0].email.as_deref(), Some("a@example.com"));
         assert_eq!(parsed[0].account_id.as_deref(), Some("acc-1"));
         assert_eq!(parsed[0].label.as_deref(), Some("Ada"));
-        assert_eq!(parsed[0].secret.access_token.as_deref(), Some("access-only-token"));
-        assert_eq!(parsed[0].secret.session_token.as_deref(), Some("session-only-token"));
+        assert_eq!(
+            parsed[0].secret.access_token.as_deref(),
+            Some("access-only-token")
+        );
+        assert_eq!(
+            parsed[0].secret.session_token.as_deref(),
+            Some("session-only-token")
+        );
         assert!(!parsed[0].refreshable);
         assert_eq!(parsed[0].expires_at, Some(1_792_490_667));
 
@@ -741,8 +743,14 @@ mod tests {
         let session = parse_session_import(input).expect("parse_session_import accepts dump");
         assert_eq!(session.kind, CredentialKind::ChatGptWebSession);
         assert_eq!(session.state, CredentialState::AccessOnly);
-        assert_eq!(session.secret.access_token.as_deref(), Some("access-only-token"));
-        assert_eq!(session.secret.session_token.as_deref(), Some("session-only-token"));
+        assert_eq!(
+            session.secret.access_token.as_deref(),
+            Some("access-only-token")
+        );
+        assert_eq!(
+            session.secret.session_token.as_deref(),
+            Some("session-only-token")
+        );
         assert!(!session.refreshable);
     }
 
@@ -860,8 +868,8 @@ mod tests {
 
     #[test]
     fn parses_flat_api_key_object() {
-        let parsed =
-            parse_json_import(r#"{"api_key":"sk-live-test","provider":"openai"}"#).expect("api key");
+        let parsed = parse_json_import(r#"{"api_key":"sk-live-test","provider":"openai"}"#)
+            .expect("api key");
         assert_eq!(parsed[0].kind, CredentialKind::ApiKey);
         assert_eq!(parsed[0].secret.api_key.as_deref(), Some("sk-live-test"));
     }
@@ -996,9 +1004,18 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].kind, CredentialKind::AgentIdentity);
         assert_eq!(parsed[0].account_id.as_deref(), Some("acct-agent-1"));
-        assert_eq!(parsed[0].secret.access_token.as_deref(), Some("usage-access"));
-        assert_eq!(parsed[0].secret.refresh_token.as_deref(), Some("usage-refresh"));
-        assert_eq!(parsed[0].secret.agent_runtime_id.as_deref(), Some("runtime-xyz"));
+        assert_eq!(
+            parsed[0].secret.access_token.as_deref(),
+            Some("usage-access")
+        );
+        assert_eq!(
+            parsed[0].secret.refresh_token.as_deref(),
+            Some("usage-refresh")
+        );
+        assert_eq!(
+            parsed[0].secret.agent_runtime_id.as_deref(),
+            Some("runtime-xyz")
+        );
         assert!(parsed[0].secret.is_agent_identity());
     }
 }

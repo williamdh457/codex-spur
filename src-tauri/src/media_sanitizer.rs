@@ -11,10 +11,7 @@ pub const UNSUPPORTED_IMAGE_MARKER: &str = "[image omitted: this model only acce
 
 /// Kinds that default to text-only (no vision) unless catalog later overrides.
 pub fn kind_is_text_only_default(kind: &str) -> bool {
-    matches!(
-        kind.to_ascii_lowercase().as_str(),
-        "deepseek" | "minimax"
-    )
+    matches!(kind.to_ascii_lowercase().as_str(), "deepseek" | "minimax")
 }
 
 /// Model id heuristics for text-only (last path segment).

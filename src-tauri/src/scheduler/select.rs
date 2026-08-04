@@ -196,7 +196,9 @@ pub fn select_account(
                                 return Some(SelectOutcome {
                                     credential_id: bound_id.to_string(),
                                     layer: SelectionLayer::Session,
-                                    rebind_previous_response: request.previous_response_id.is_some(),
+                                    rebind_previous_response: request
+                                        .previous_response_id
+                                        .is_some(),
                                     rebind_session: false,
                                     sticky_escaped,
                                 });
@@ -424,7 +426,11 @@ mod tests {
 
     #[test]
     fn previous_response_beats_session_and_load_balance() {
-        let candidates = vec![candidate("a", 1, 0), candidate("b", 1, 0), candidate("c", 1, 0)];
+        let candidates = vec![
+            candidate("a", 1, 0),
+            candidate("b", 1, 0),
+            candidate("c", 1, 0),
+        ];
         let config = PoolSchedulerConfig::default();
         let mut request = req();
         request.previous_response_id = Some("resp_1".into());
@@ -537,7 +543,10 @@ mod tests {
                 a_wins += 1;
             }
         }
-        assert!(a_wins >= 7, "expected high-score account to win most draws, got {a_wins}");
+        assert!(
+            a_wins >= 7,
+            "expected high-score account to win most draws, got {a_wins}"
+        );
     }
 
     #[test]
@@ -547,7 +556,8 @@ mod tests {
         bad.healthy = false;
         let good = candidate("good", 1, 0);
         let candidates = vec![bad, good];
-        let outcome = select_account(&candidates, &PoolSchedulerConfig::default(), &req(), 0).unwrap();
+        let outcome =
+            select_account(&candidates, &PoolSchedulerConfig::default(), &req(), 0).unwrap();
         assert_eq!(outcome.credential_id, "good");
     }
 
@@ -558,7 +568,8 @@ mod tests {
         blocked.healthy = false;
         let good = candidate("good", 1, 0);
         let candidates = vec![blocked, good];
-        let outcome = select_account(&candidates, &PoolSchedulerConfig::default(), &req(), 0).unwrap();
+        let outcome =
+            select_account(&candidates, &PoolSchedulerConfig::default(), &req(), 0).unwrap();
         assert_eq!(outcome.credential_id, "good");
     }
 
@@ -569,7 +580,8 @@ mod tests {
         full.concurrency_limit = 1;
         let free = candidate("free", 1, 0);
         let candidates = vec![full, free];
-        let outcome = select_account(&candidates, &PoolSchedulerConfig::default(), &req(), 0).unwrap();
+        let outcome =
+            select_account(&candidates, &PoolSchedulerConfig::default(), &req(), 0).unwrap();
         assert_eq!(outcome.credential_id, "free");
     }
 
@@ -606,13 +618,8 @@ mod tests {
         let mut ok = candidate("ok", 1, 0);
         ok.quota_remaining = Some(0.5);
         ok.quota_fetched_at = Some(1_700_000_000);
-        let outcome = select_account(
-            &[empty, ok],
-            &PoolSchedulerConfig::default(),
-            &req(),
-            0,
-        )
-        .unwrap();
+        let outcome =
+            select_account(&[empty, ok], &PoolSchedulerConfig::default(), &req(), 0).unwrap();
         assert_eq!(outcome.credential_id, "ok");
     }
 

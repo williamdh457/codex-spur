@@ -418,16 +418,15 @@ impl Storage {
         provider_id: &str,
         profile_id: &str,
     ) -> Result<(), sqlx::Error> {
-        let parsed = crate::reasoning_map::ReasoningProfileId::parse(profile_id).ok_or_else(
-            || sqlx::Error::Protocol(format!("未知推理映射模板：{profile_id}").into()),
-        )?;
-        let result = sqlx::query(
-            "UPDATE providers SET reasoning_profile_id = ? WHERE id = ?",
-        )
-        .bind(parsed.as_str())
-        .bind(provider_id)
-        .execute(&self.pool)
-        .await?;
+        let parsed =
+            crate::reasoning_map::ReasoningProfileId::parse(profile_id).ok_or_else(|| {
+                sqlx::Error::Protocol(format!("未知推理映射模板：{profile_id}").into())
+            })?;
+        let result = sqlx::query("UPDATE providers SET reasoning_profile_id = ? WHERE id = ?")
+            .bind(parsed.as_str())
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         if result.rows_affected() == 0 {
             return Err(sqlx::Error::Protocol("供应商不存在".into()));
         }
@@ -443,16 +442,13 @@ impl Storage {
         provider_id: &str,
         protocol: &str,
     ) -> Result<(), sqlx::Error> {
-        let normalized = crate::providers::normalize_provider_protocol(protocol).ok_or_else(
-            || {
+        let normalized =
+            crate::providers::normalize_provider_protocol(protocol).ok_or_else(|| {
                 sqlx::Error::Protocol(
-                    format!(
-                        "未知上游协议：{protocol}（请选 Responses 或 Chat Completions）"
-                    )
-                    .into(),
+                    format!("未知上游协议：{protocol}（请选 Responses 或 Chat Completions）")
+                        .into(),
                 )
-            },
-        )?;
+            })?;
         let result = sqlx::query("UPDATE providers SET protocol = ? WHERE id = ?")
             .bind(normalized)
             .bind(provider_id)
@@ -940,12 +936,10 @@ impl Storage {
     }
 
     pub async fn touch_relay_api_key(&self, id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE relay_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE relay_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -973,7 +967,8 @@ impl Storage {
         }
         if let Some(bind_lan) = bind_lan {
             cur_lan = bind_lan;
-            self.set_app_setting_json("relay.bind_lan", &cur_lan).await?;
+            self.set_app_setting_json("relay.bind_lan", &cur_lan)
+                .await?;
         }
         Ok((cur_port, cur_lan))
     }
@@ -3091,8 +3086,8 @@ impl Storage {
             return Ok(crate::domain::ConversationPolicy::default());
         };
         let json: String = row.get("value_json");
-        let parsed: crate::domain::ConversationPolicy = serde_json::from_str(&json)
-            .unwrap_or_default();
+        let parsed: crate::domain::ConversationPolicy =
+            serde_json::from_str(&json).unwrap_or_default();
         Ok(parsed.sanitized())
     }
 
@@ -3101,8 +3096,8 @@ impl Storage {
         policy: &crate::domain::ConversationPolicy,
     ) -> Result<crate::domain::ConversationPolicy, sqlx::Error> {
         let policy = policy.sanitized();
-        let json = serde_json::to_string(&policy)
-            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        let json =
+            serde_json::to_string(&policy).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         sqlx::query(
             "INSERT INTO app_settings (key, value_json) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",

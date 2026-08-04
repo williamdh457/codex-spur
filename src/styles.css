@@ -1,24 +1,25 @@
 :root {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, sans-serif;
-  color: #1d1d1f;
-  background: #f7f7f5;
+  color-scheme: dark;
+  color: #f2f2ef;
+  background: #161715;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --canvas: #f7f7f5;
-  --surface: #ffffff;
-  --surface-raised: #fbfbfa;
-  --surface-muted: #f0efeb;
-  --text: #1d1d1f;
-  --secondary: #68686f;
-  --tertiary: #96969e;
-  --border: #dcdcde;
-  --border-subtle: #e9e9e7;
-  --accent: #356f5d;
-  --accent-hover: #2e6252;
-  --selection: #e4f1ec;
-  --success: #2f7d55;
-  --warning: #a66a16;
-  --error: #b9473f;
+  --canvas: #161715;
+  --surface: #1d1f1c;
+  --surface-raised: #232521;
+  --surface-muted: #292b27;
+  --text: #f2f2ef;
+  --secondary: #b1b2ac;
+  --tertiary: #7f817a;
+  --border: #383a35;
+  --border-subtle: #2e302c;
+  --accent: #70a991;
+  --accent-hover: #82b7a1;
+  --selection: #29463b;
+  --success: #66b58a;
+  --warning: #d5a357;
+  --error: #e17a72;
 }
 
 * { box-sizing: border-box; }
@@ -245,25 +246,6 @@ h2 { font-size: 14px; line-height: 20px; }
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    color: #f2f2ef;
-    background: #161715;
-    --canvas: #161715;
-    --surface: #1d1f1c;
-    --surface-raised: #232521;
-    --surface-muted: #292b27;
-    --text: #f2f2ef;
-    --secondary: #b1b2ac;
-    --tertiary: #7f817a;
-    --border: #383a35;
-    --border-subtle: #2e302c;
-    --accent: #70a991;
-    --accent-hover: #82b7a1;
-    --selection: #29463b;
-    --success: #66b58a;
-    --warning: #d5a357;
-    --error: #e17a72;
-  }
   .badge--warning, .inline-warning { color: #efc57e; background: #49371e; }
   .badge--success { color: #90d2aa; background: #234333; }
   .code-preview { border-color: #3a3d38; background: #111310; }

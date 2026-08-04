@@ -234,9 +234,7 @@ pub fn inspect_status() -> KimiTargetStatus {
 }
 
 fn active_flag_path(user_dir: &Path) -> PathBuf {
-    user_dir
-        .join("daimon-share/daimon")
-        .join(ACTIVE_FILE)
+    user_dir.join("daimon-share/daimon").join(ACTIVE_FILE)
 }
 
 pub fn set_publish_active(active: bool) -> Result<()> {
@@ -406,7 +404,11 @@ fn toml_escape(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn build_spur_toml_fragment(models: &[PlannedModel], gateway_base: &str, local_token: &str) -> String {
+fn build_spur_toml_fragment(
+    models: &[PlannedModel],
+    gateway_base: &str,
+    local_token: &str,
+) -> String {
     let mut lines = Vec::new();
     lines.push("".to_string());
     lines.push("# --- Codex Spur (experimental Kimi target) ---".to_string());
@@ -466,7 +468,12 @@ fn strip_spur_toml_section(toml: &str) -> String {
     out
 }
 
-fn merge_runtime_toml(existing: &str, models: &[PlannedModel], gateway_base: &str, token: &str) -> String {
+fn merge_runtime_toml(
+    existing: &str,
+    models: &[PlannedModel],
+    gateway_base: &str,
+    token: &str,
+) -> String {
     let base = strip_spur_toml_section(existing);
     let mut out = base.trim_end().to_string();
     out.push('\n');
@@ -635,10 +642,7 @@ fn strip_spur_from_cache(existing: &Value) -> Result<Value> {
         .as_object_mut()
         .ok_or_else(|| anyhow!("cache 不是对象"))?;
     for (_k, entry) in root.iter_mut() {
-        if let Some(list) = entry
-            .get_mut("models")
-            .and_then(|v| v.as_array_mut())
-        {
+        if let Some(list) = entry.get_mut("models").and_then(|v| v.as_array_mut()) {
             list.retain(|item| {
                 item.get("key")
                     .and_then(Value::as_str)
@@ -712,9 +716,7 @@ fn collect_warnings(status: &KimiTargetStatus, models: &[PlannedModel]) -> Vec<S
         warnings.push("没有已启用的 Spur 模型路由可发布。".into());
     }
     if !status.control_ready {
-        warnings.push(
-            "daimon control 未就绪：发布后可等 Kimi 就绪再点「重新推送列表」。".into(),
-        );
+        warnings.push("daimon control 未就绪：发布后可等 Kimi 就绪再点「重新推送列表」。".into());
     }
     warnings.push(
         "仅写盘不会改在线右下角：请在发布后用路径拦截 DescribeKimiWorkConfig（勿拦 agent-gw），再完全退出重开 Kimi。脚本：scripts/kimi_block_work_model_config.py"
@@ -790,7 +792,10 @@ pub fn apply(
     let status = inspect_status();
     let user_dir = kimi_user_dir();
     if !user_dir.exists() {
-        bail!("Kimi 用户目录不存在：{}（请先启动 Kimi Desktop）", user_dir.display());
+        bail!(
+            "Kimi 用户目录不存在：{}（请先启动 Kimi Desktop）",
+            user_dir.display()
+        );
     }
     let models = plan_models(catalog, routes);
     if models.is_empty() {
@@ -860,7 +865,10 @@ pub fn apply(
     let map_path = user_dir
         .join("daimon-share/daimon")
         .join(".codex-spur-kimi-alias-map.json");
-    atomic_write(&map_path, serde_json::to_string_pretty(&alias_map)?.as_bytes())?;
+    atomic_write(
+        &map_path,
+        serde_json::to_string_pretty(&alias_map)?.as_bytes(),
+    )?;
 
     // Verify cache actually contains spur keys after write.
     let cache_spur = count_spur_models_in_cache(&user_dir).unwrap_or(0);
@@ -901,7 +909,11 @@ pub fn apply(
 }
 
 /// Retry control inject a few times — daimon is often "provisioning" right after launch.
-fn push_models_to_daimon_control_retry(user_dir: &Path, models: &[PlannedModel], attempts: u32) -> bool {
+fn push_models_to_daimon_control_retry(
+    user_dir: &Path,
+    models: &[PlannedModel],
+    attempts: u32,
+) -> bool {
     for i in 0..attempts {
         match push_models_to_daimon_control(user_dir, models) {
             Ok(true) => return true,
@@ -1073,7 +1085,10 @@ fn ws_jsonrpc_call_token_query(
     }
     let header_text = String::from_utf8_lossy(&header_buf);
     if !header_text.contains("101") {
-        bail!("WebSocket upgrade 失败：{}", header_text.lines().next().unwrap_or(""));
+        bail!(
+            "WebSocket upgrade 失败：{}",
+            header_text.lines().next().unwrap_or("")
+        );
     }
     write_ws_text(&mut stream, &serde_json::to_string(request)?)?;
     let body = read_ws_text(&mut stream)?;
@@ -1256,7 +1271,8 @@ mod tests {
 
     #[test]
     fn strip_and_merge_toml_roundtrip() {
-        let base = "default_model = \"k3-agent\"\n\n[providers.daimon-kimi-code]\ntype = \"kimi\"\n";
+        let base =
+            "default_model = \"k3-agent\"\n\n[providers.daimon-kimi-code]\ntype = \"kimi\"\n";
         let models = vec![PlannedModel {
             alias: "spur-deadbeefcafe".into(),
             display_name: "X".into(),

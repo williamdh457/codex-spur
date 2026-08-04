@@ -237,10 +237,11 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
         Some(profile.as_str()),
         false,
     );
-    crate::providers::apply_reasoning_levels_for_profile(
+    crate::providers::apply_reasoning_levels_for_route(
         &mut model,
+        &route.kind,
         profile,
-        Some(route.upstream_model.as_str()),
+        &route.upstream_model,
     );
     // Heal to 模型.供应商 (single-row claim set is fine here).
     let mut claimed = std::collections::HashSet::new();
@@ -254,8 +255,7 @@ pub fn heal_stored_catalog_json(route: &StoredRoute) -> Result<String> {
     if model.display_name.trim().is_empty() {
         model.display_name = route.display_name.clone();
     }
-    let reasoning_profile =
-        crate::providers::reasoning_profile_for(profile, &route.upstream_model);
+    let reasoning_profile = crate::providers::reasoning_profile_for(profile, &route.upstream_model);
     let payload = RouteCatalogPayload {
         model,
         reasoning_profile,
@@ -361,10 +361,11 @@ pub fn build_from_routes_with_policy(
             let mut model = model;
             // Heal stale SQLite rows (camelCase era, technical effort copy, weak meta)
             // so ChatGPT always receives a Nice/CC Switch–compatible catalog shape.
-            let profile = crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
-                .unwrap_or_else(|| {
-                    crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind)
-                });
+            let profile =
+                crate::reasoning_map::ReasoningProfileId::parse(&route.reasoning_profile_id)
+                    .unwrap_or_else(|| {
+                        crate::reasoning_map::ReasoningProfileId::default_for_kind(&route.kind)
+                    });
             crate::providers::normalize_catalog_model_for_codex_full_with_profile(
                 &mut model,
                 1000 + enabled_index,
@@ -374,10 +375,11 @@ pub fn build_from_routes_with_policy(
                 Some(profile.as_str()),
                 openai_full_fidelity,
             );
-            crate::providers::apply_reasoning_levels_for_profile(
+            crate::providers::apply_reasoning_levels_for_route(
                 &mut model,
+                &route.kind,
                 profile,
-                Some(route.upstream_model.as_str()),
+                &route.upstream_model,
             );
             // Canonical public id: 模型.供应商 (Codex + relay). Dual-key legacy forms.
             let opaque =
@@ -423,6 +425,24 @@ pub fn build_from_routes_with_policy(
             };
             // Publish key + dual-keys so in-flight sessions on old slugs still route.
             targets.insert(published.clone(), target.clone());
+            // Z Code 3.5.3 recognizes K3 only when the public id contains
+            // `kimi-k3`; retain the ordinary Codex slug and add an alias.
+            if route.kind.eq_ignore_ascii_case("kimi")
+                && matches!(
+                    route.upstream_model.trim().to_ascii_lowercase().as_str(),
+                    "k3" | "kimi-k3"
+                )
+            {
+                let zcode_k3_alias = format!(
+                    "kimi-k3.{}",
+                    crate::providers::provider_part_for_slug(
+                        &route.provider_name,
+                        &route.kind,
+                        &route.provider_id,
+                    )
+                );
+                targets.insert(zcode_k3_alias, target.clone());
+            }
             if opaque != published {
                 targets.insert(opaque, target.clone());
             }
@@ -430,8 +450,7 @@ pub fn build_from_routes_with_policy(
                 targets.insert(legacy, target.clone());
             }
             // Desktop-native bare slug (gpt-5.6-sol) for older threads.
-            if let Some(native) =
-                crate::providers::desktop_native_model_slug(&route.upstream_model)
+            if let Some(native) = crate::providers::desktop_native_model_slug(&route.upstream_model)
             {
                 if native != published {
                     targets
@@ -792,8 +811,7 @@ mod tests {
 
     #[test]
     fn strict_validation_checks_every_model_and_required_empty_arrays() {
-        let neutral =
-            crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS.to_string();
+        let neutral = crate::official_prompt_map::CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS.to_string();
         let mut first = placeholder_model("spur-route-first".into(), "First".into());
         let mut second = placeholder_model("spur-route-second".into(), "Second".into());
         first.base_instructions = neutral.clone();
@@ -857,7 +875,8 @@ mod tests {
         let mut codex_only = stale_slash_route("p1", "OpenAI", "gpt-5.6-sol", "Sol", "openai");
         codex_only.enabled = true;
         codex_only.relay_enabled = false;
-        let mut relay_only = stale_slash_route("p2", "DeepSeek", "deepseek-v4-flash", "Flash", "deepseek");
+        let mut relay_only =
+            stale_slash_route("p2", "DeepSeek", "deepseek-v4-flash", "Flash", "deepseek");
         relay_only.enabled = false;
         relay_only.relay_enabled = true;
         let mut both = stale_slash_route("p3", "Grok", "grok-4.5", "Grok", "xai");
@@ -867,8 +886,12 @@ mod tests {
             build_from_routes(&[codex_only, relay_only, both]).expect("build");
         assert_eq!(catalog.models.len(), 2, "codex catalog = enabled only");
         assert_eq!(relay.models.len(), 2, "relay catalog = relay_enabled only");
-        assert!(targets.values().any(|t| t.relay_enabled && !t.codex_enabled));
-        assert!(targets.values().any(|t| t.codex_enabled && !t.relay_enabled));
+        assert!(targets
+            .values()
+            .any(|t| t.relay_enabled && !t.codex_enabled));
+        assert!(targets
+            .values()
+            .any(|t| t.codex_enabled && !t.relay_enabled));
         assert!(targets.values().any(|t| t.codex_enabled && t.relay_enabled));
     }
 

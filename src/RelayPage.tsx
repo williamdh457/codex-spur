@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createRelayApiKey,
   deleteRelayApiKey,
+  applyZcodePublish,
   getApiRelayStatus,
   listModelRoutes,
   listRelayApiKeys,
@@ -296,6 +297,20 @@ export function RelayPage() {
               启动反代
             </button>
           )}
+          <button
+            type="button"
+            className="button button--secondary"
+            disabled={busy}
+            onClick={() =>
+              void run(async () => {
+                const outcome = await applyZcodePublish();
+                setMessageTone("ok");
+                setMessage(`已同步 ${outcome.modelCount} 个模型到 Z Code；请重启或重新加载 Z Code。`);
+              })
+            }
+          >
+            同步到 Z Code
+          </button>
           <label className="inline-field">
             端口
             <input

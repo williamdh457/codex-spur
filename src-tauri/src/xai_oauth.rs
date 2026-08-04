@@ -239,7 +239,10 @@ impl XaiOAuthManager {
                 interval_secs: Some(entry.interval_secs),
             }),
             "slow_down" => {
-                let next = entry.interval_secs.saturating_add(5).max(DEFAULT_INTERVAL_SECS);
+                let next = entry
+                    .interval_secs
+                    .saturating_add(5)
+                    .max(DEFAULT_INTERVAL_SECS);
                 {
                     let mut pending = self.pending.write().await;
                     if let Some(slot) = pending.get_mut(device_code) {
@@ -345,9 +348,8 @@ pub async fn refresh_xai_tokens(refresh_token: &str) -> Result<DeviceLoginTokens
     }
 
     let (account_id, email) = extract_identity(&payload);
-    let account_id = account_id.unwrap_or_else(|| {
-        format!("xai-{}", short_fingerprint(&payload.access_token))
-    });
+    let account_id =
+        account_id.unwrap_or_else(|| format!("xai-{}", short_fingerprint(&payload.access_token)));
     let expires_at = payload
         .expires_in
         .map(|secs| chrono_now_secs().saturating_add(secs as i64))
@@ -412,9 +414,12 @@ fn urlencoding_encode(value: &str) -> String {
 fn extract_identity(tokens: &OAuthTokenResponse) -> (Option<String>, Option<String>) {
     let mut account_id = None;
     let mut email = None;
-    for token in [tokens.id_token.as_deref(), Some(tokens.access_token.as_str())]
-        .into_iter()
-        .flatten()
+    for token in [
+        tokens.id_token.as_deref(),
+        Some(tokens.access_token.as_str()),
+    ]
+    .into_iter()
+    .flatten()
     {
         if let Some(claims) = parse_jwt_payload(token) {
             if account_id.is_none() {

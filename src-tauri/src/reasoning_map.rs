@@ -24,6 +24,104 @@ pub enum ReasoningProfileId {
     Passthrough,
 }
 
+/// The concrete upstream mechanism for a specific route.  Provider templates are
+/// still useful fallbacks, but K3/K2.7/Grok have materially different contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningUpstreamMode {
+    ResponsesReasoningEffort,
+    ChatReasoningEffort,
+    ThinkingToggle,
+    AlwaysOn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelReasoningCapability {
+    pub selectable: bool,
+    pub levels: Vec<ReasoningEffort>,
+    pub default_level: Option<ReasoningEffort>,
+    pub upstream_mode: ReasoningUpstreamMode,
+}
+
+fn model_tail(model_id: &str) -> String {
+    model_id
+        .trim()
+        .to_ascii_lowercase()
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Resolve documented model-specific behavior before falling back to a provider
+/// template. Do not infer this from a display name: only stable upstream ids.
+pub fn model_reasoning_capability(
+    kind: &str,
+    upstream_model: &str,
+    profile: ReasoningProfileId,
+) -> ModelReasoningCapability {
+    let model = model_tail(upstream_model);
+    if kind.eq_ignore_ascii_case("kimi") {
+        if model == "k3" || model == "kimi-k3" {
+            return ModelReasoningCapability {
+                selectable: true,
+                levels: vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max,
+                ],
+                default_level: Some(ReasoningEffort::Max),
+                upstream_mode: ReasoningUpstreamMode::ChatReasoningEffort,
+            };
+        }
+        if matches!(
+            model.as_str(),
+            "kimi-for-coding" | "kimi-k2.7-code" | "kimi-k2.7-code-highspeed"
+        ) {
+            return ModelReasoningCapability {
+                selectable: false,
+                levels: vec![ReasoningEffort::Medium],
+                default_level: Some(ReasoningEffort::Medium),
+                upstream_mode: ReasoningUpstreamMode::AlwaysOn,
+            };
+        }
+        if matches!(model.as_str(), "kimi-k2.6" | "kimi-k2.5") {
+            return ModelReasoningCapability {
+                selectable: true,
+                levels: vec![ReasoningEffort::None, ReasoningEffort::Medium],
+                default_level: Some(ReasoningEffort::Medium),
+                upstream_mode: ReasoningUpstreamMode::ThinkingToggle,
+            };
+        }
+    }
+    if kind.eq_ignore_ascii_case("xai") && model.starts_with("grok-4.5") {
+        return ModelReasoningCapability {
+            selectable: true,
+            levels: vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ],
+            default_level: Some(ReasoningEffort::High),
+            upstream_mode: ReasoningUpstreamMode::ResponsesReasoningEffort,
+        };
+    }
+    ModelReasoningCapability {
+        selectable: true,
+        levels: catalog_reasoning_levels(profile)
+            .into_iter()
+            .map(|level| level.effort)
+            .collect(),
+        default_level: Some(default_reasoning_level(profile)),
+        upstream_mode: match profile {
+            ReasoningProfileId::Deepseek
+            | ReasoningProfileId::Minimax
+            | ReasoningProfileId::Glm
+            | ReasoningProfileId::Qwen => ReasoningUpstreamMode::ThinkingToggle,
+            _ => ReasoningUpstreamMode::ResponsesReasoningEffort,
+        },
+    }
+}
+
 impl ReasoningProfileId {
     pub const ALL: [Self; 9] = [
         Self::OpenaiNative,
@@ -75,7 +173,8 @@ impl ReasoningProfileId {
             "xai" => Self::Xai,
             "minimax" => Self::Minimax,
             // custom / opencode-go / unknown: user should pick; default GPT-oriented.
-            "custom" | "opencode-go" | _ => Self::OpenaiNative,
+            "custom" | "opencode-go" => Self::OpenaiNative,
+            _ => Self::OpenaiNative,
         }
     }
 
@@ -208,7 +307,9 @@ pub fn patch_for(profile: ReasoningProfileId, codex_effort: &str) -> UpstreamRea
         },
         ReasoningProfileId::Xai => match effort {
             // Grok 4.5 cannot disable reasoning — clamp none/minimal to low.
-            Some("none") | Some("minimal") | Some("low") => UpstreamReasoningPatch::effort_only("low"),
+            Some("none") | Some("minimal") | Some("low") => {
+                UpstreamReasoningPatch::effort_only("low")
+            }
             Some("medium") => UpstreamReasoningPatch::effort_only("medium"),
             Some("high") | Some("xhigh") | Some("max") | Some("ultra") => {
                 UpstreamReasoningPatch::effort_only("high")
@@ -286,6 +387,74 @@ pub fn patch_for(profile: ReasoningProfileId, codex_effort: &str) -> UpstreamRea
             },
             None => UpstreamReasoningPatch::omit(),
         },
+    }
+}
+
+/// Resolve an upstream patch for a route. This is deliberately separate from
+/// `patch_for`: a provider profile cannot accurately describe K3 and K2.7.
+pub fn patch_for_model(
+    kind: &str,
+    upstream_model: &str,
+    profile: ReasoningProfileId,
+    codex_effort: &str,
+) -> UpstreamReasoningPatch {
+    let effort = normalize_codex_effort(codex_effort);
+    let capability = model_reasoning_capability(kind, upstream_model, profile);
+    match capability.upstream_mode {
+        ReasoningUpstreamMode::AlwaysOn => UpstreamReasoningPatch::omit(),
+        ReasoningUpstreamMode::ChatReasoningEffort
+            if kind.eq_ignore_ascii_case("kimi")
+                && matches!(model_tail(upstream_model).as_str(), "k3" | "kimi-k3") =>
+        {
+            let upstream = match effort {
+                Some("low") => "low",
+                Some("max") | Some("xhigh") | Some("ultra") => "max",
+                // K3 cannot disable thinking and has no medium level.
+                Some("none") | Some("minimal") | Some("medium") | Some("high") | None => "high",
+                _ => "high",
+            };
+            UpstreamReasoningPatch {
+                responses_effort: None,
+                chat_reasoning_effort: Some(upstream),
+                thinking_type: None,
+                enable_thinking: None,
+                omit_reasoning: false,
+            }
+        }
+        ReasoningUpstreamMode::ThinkingToggle
+            if kind.eq_ignore_ascii_case("kimi")
+                && matches!(
+                    model_tail(upstream_model).as_str(),
+                    "kimi-k2.6" | "kimi-k2.5"
+                ) =>
+        {
+            let disabled = matches!(effort, Some("none") | Some("minimal"));
+            UpstreamReasoningPatch {
+                responses_effort: None,
+                chat_reasoning_effort: None,
+                thinking_type: Some(if disabled { "disabled" } else { "enabled" }),
+                enable_thinking: None,
+                omit_reasoning: true,
+            }
+        }
+        ReasoningUpstreamMode::ResponsesReasoningEffort
+            if kind.eq_ignore_ascii_case("xai")
+                && model_tail(upstream_model).starts_with("grok-4.5") =>
+        {
+            let upstream = match effort {
+                Some("none") | Some("minimal") | Some("low") => "low",
+                Some("medium") => "medium",
+                _ => "high",
+            };
+            UpstreamReasoningPatch {
+                responses_effort: Some(upstream),
+                chat_reasoning_effort: None,
+                thinking_type: None,
+                enable_thinking: None,
+                omit_reasoning: false,
+            }
+        }
+        _ => patch_for(profile, codex_effort),
     }
 }
 
@@ -415,6 +584,51 @@ pub fn catalog_reasoning_levels(profile: ReasoningProfileId) -> Vec<ReasoningEff
         .collect()
 }
 
+pub fn catalog_level_description_for_model(
+    kind: &str,
+    upstream_model: &str,
+    profile: ReasoningProfileId,
+    effort: ReasoningEffort,
+) -> &'static str {
+    let capability = model_reasoning_capability(kind, upstream_model, profile);
+    match (capability.upstream_mode, effort) {
+        (ReasoningUpstreamMode::ChatReasoningEffort, ReasoningEffort::Low)
+            if kind.eq_ignore_ascii_case("kimi") =>
+        {
+            "Kimi K3 low reasoning effort"
+        }
+        (ReasoningUpstreamMode::ChatReasoningEffort, ReasoningEffort::High)
+            if kind.eq_ignore_ascii_case("kimi") =>
+        {
+            "Kimi K3 high reasoning effort"
+        }
+        (ReasoningUpstreamMode::ChatReasoningEffort, ReasoningEffort::Max)
+            if kind.eq_ignore_ascii_case("kimi") =>
+        {
+            "Kimi K3 maximum reasoning effort"
+        }
+        (ReasoningUpstreamMode::AlwaysOn, _) if kind.eq_ignore_ascii_case("kimi") => {
+            "Thinking always enabled by this Kimi model"
+        }
+        (ReasoningUpstreamMode::ResponsesReasoningEffort, ReasoningEffort::Low)
+            if kind.eq_ignore_ascii_case("xai") =>
+        {
+            "Grok low reasoning (cannot fully disable)"
+        }
+        (ReasoningUpstreamMode::ResponsesReasoningEffort, ReasoningEffort::Medium)
+            if kind.eq_ignore_ascii_case("xai") =>
+        {
+            "Grok medium reasoning"
+        }
+        (ReasoningUpstreamMode::ResponsesReasoningEffort, ReasoningEffort::High)
+            if kind.eq_ignore_ascii_case("xai") =>
+        {
+            "Grok high reasoning"
+        }
+        _ => catalog_level_description(profile, effort),
+    }
+}
+
 fn catalog_level_description(profile: ReasoningProfileId, effort: ReasoningEffort) -> &'static str {
     match (profile, effort) {
         (ReasoningProfileId::Deepseek, ReasoningEffort::None) => "Disable thinking",
@@ -457,7 +671,10 @@ pub fn default_reasoning_level(profile: ReasoningProfileId) -> ReasoningEffort {
 }
 
 /// Apply a patch to a Responses-style request (`reasoning.effort` + optional thinking fields).
-pub fn apply_patch_to_responses_request(request: &mut serde_json::Value, patch: &UpstreamReasoningPatch) {
+pub fn apply_patch_to_responses_request(
+    request: &mut serde_json::Value,
+    patch: &UpstreamReasoningPatch,
+) {
     let Some(object) = request.as_object_mut() else {
         return;
     };
@@ -583,5 +800,39 @@ mod tests {
     fn kimi_none_does_not_emit_chat_effort() {
         let patch = patch_for(ReasoningProfileId::Kimi, "none");
         assert!(patch.chat_reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn kimi_k3_uses_its_documented_three_levels_and_clamps_legacy_values() {
+        let capability = model_reasoning_capability("kimi", "k3", ReasoningProfileId::Kimi);
+        assert_eq!(
+            capability.levels,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+        assert_eq!(capability.default_level, Some(ReasoningEffort::Max));
+        assert_eq!(
+            patch_for_model("kimi", "k3", ReasoningProfileId::Kimi, "none").chat_reasoning_effort,
+            Some("high")
+        );
+        assert_eq!(
+            patch_for_model("kimi", "k3", ReasoningProfileId::Kimi, "xhigh").chat_reasoning_effort,
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn kimi_k27_drops_effort_and_grok_45_clamps_without_disabling() {
+        let fixed = patch_for_model("kimi", "kimi-for-coding", ReasoningProfileId::Kimi, "max");
+        assert!(fixed.omit_reasoning);
+
+        let low = patch_for_model("xai", "grok-4.5", ReasoningProfileId::Xai, "none");
+        assert_eq!(low.responses_effort, Some("low"));
+        let high = patch_for_model("xai", "grok-4.5", ReasoningProfileId::Xai, "ultra");
+        assert_eq!(high.responses_effort, Some("high"));
+        assert!(high.chat_reasoning_effort.is_none());
     }
 }

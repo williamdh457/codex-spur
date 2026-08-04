@@ -16,14 +16,16 @@ mod openai_oauth;
 mod opencode_go;
 pub mod providers;
 mod proxy;
-mod reasoning_map;
-mod tool_roundtrip;
 mod quota;
+mod reasoning_map;
 mod scheduler;
 pub mod storage;
+mod thread_history;
+mod tool_roundtrip;
 mod upstream_errors;
 pub mod vault;
 mod xai_oauth;
+mod zcode_target;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -35,6 +37,7 @@ use domain::{
     CodexBindingStatus, CredentialSummary, DeleteCredentialResult, ModelRouteSummary,
     OpenAiQuotaSnapshot, OpenCodeGoCredentialStatus, PoolMemberDetail, ProviderRouting,
     ProviderSummary, ProxyRequestEvent, ProxyStatus, RelayApiKeyCreated, RelayApiKeySummary,
+    ThreadHistoryHealthReport,
 };
 use scheduler::PoolSchedulerConfig;
 use tauri::{
@@ -108,7 +111,10 @@ impl AppState {
             proxy_secret,
         )
         .await?;
-        let (relay_port, relay_bind_lan) = storage.get_relay_settings().await.unwrap_or((17_862, false));
+        let (relay_port, relay_bind_lan) = storage
+            .get_relay_settings()
+            .await
+            .unwrap_or((17_862, false));
         // Ensure at least one client key exists so users can copy a secret after first start.
         if storage
             .list_relay_api_keys()
@@ -152,10 +158,7 @@ impl AppState {
         if published_models == 0 {
             attention_items.push("添加供应商并拉取模型后，才能应用到 Codex。".into());
         }
-        let conversation_policy = storage
-            .get_conversation_policy()
-            .await
-            .unwrap_or_default();
+        let conversation_policy = storage.get_conversation_policy().await.unwrap_or_default();
         let snapshot = AppSnapshot {
             proxy: ProxyStatus {
                 running: true,
@@ -417,7 +420,9 @@ fn relay_api_key_secret_path(data_dir: &std::path::Path, id: &str) -> Option<std
         || id.contains('/')
         || id.contains('\\')
         || id.contains("..")
-        || id.chars().any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        || id
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
     {
         return None;
     }
@@ -921,6 +926,15 @@ async fn apply_kimi_publish(
     state: State<'_, AppState>,
 ) -> Result<kimi_target::KimiPublishOutcome, String> {
     kimi_publish_core(&state).await
+}
+
+#[tauri::command]
+async fn apply_zcode_publish(
+    state: State<'_, AppState>,
+) -> Result<zcode_target::ZcodePublishOutcome, String> {
+    state.rebuild_runtime().await?;
+    let routes = state.routes.read().await.clone();
+    zcode_target::apply(&routes).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2739,7 +2753,10 @@ async fn reveal_relay_api_key(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Option<String>, String> {
-    let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let keys = state
         .storage
         .list_relay_api_keys()
@@ -2771,7 +2788,10 @@ async fn reveal_default_relay_api_key(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     // Prefer first key's per-id file (covers post-bootstrap creates).
     if let Ok(keys) = state.storage.list_relay_api_keys().await {
         for key in keys {
@@ -3695,6 +3715,11 @@ async fn clear_proxy_request_events(state: State<'_, AppState>) -> Result<(), St
 }
 
 #[tauri::command]
+async fn inspect_thread_history(thread_id: String) -> Result<ThreadHistoryHealthReport, String> {
+    thread_history::inspect(&thread_id).await
+}
+
+#[tauri::command]
 async fn get_diagnostics_max_events(state: State<'_, AppState>) -> Result<i64, String> {
     state
         .storage
@@ -3872,6 +3897,7 @@ pub fn run() {
             kimi_target_status,
             preview_kimi_publish,
             apply_kimi_publish,
+            apply_zcode_publish,
             restore_kimi_publish,
             reapply_kimi_model_list,
             enable_kimi_publish,
@@ -3943,6 +3969,7 @@ pub fn run() {
             update_pool_scheduler_config,
             list_proxy_request_events,
             clear_proxy_request_events,
+            inspect_thread_history,
             get_diagnostics_max_events,
             set_diagnostics_max_events,
             restart_proxy,

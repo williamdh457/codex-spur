@@ -224,6 +224,44 @@ pub struct ProxyRequestEvent {
     pub error_summary: Option<String>,
 }
 
+/// Read-only integrity summary for one Codex Desktop rollout. The report never
+/// includes prompt text, tool arguments, tool outputs, credentials, or tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadHistoryHealthReport {
+    pub thread_id: String,
+    pub rollout_path: String,
+    pub rollout_bytes: u64,
+    pub sha256: String,
+    pub parsed_rows: u64,
+    pub invalid_complete_lines: u64,
+    pub trailing_partial_line: bool,
+    pub compaction_events: u64,
+    pub turn_starts: u64,
+    pub turn_finishes: u64,
+    pub active_turns: u64,
+    pub tool_calls: u64,
+    pub tool_outputs: u64,
+    pub missing_outputs: u64,
+    pub orphan_outputs: u64,
+    pub duplicate_call_ids: u64,
+    pub duplicate_output_call_ids: u64,
+    pub duplicate_response_item_ids: u64,
+    pub missing_call_ids: u64,
+    pub timeline: Vec<ThreadHistoryTimelineEntry>,
+    pub timeline_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadHistoryTimelineEntry {
+    pub timestamp: String,
+    /// `command`, `file_change`, `web_search`, or `tool`.
+    pub category: String,
+    pub tool_name: String,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolMemberDetail {
@@ -399,8 +437,7 @@ impl ConversationPolicy {
     /// True when Desktop should request OpenAI-native encrypted cloud compact
     /// and Spur must not intercept those compact beats with spur1.
     pub fn uses_openai_cloud_compact(self) -> bool {
-        matches!(self.mid_thread, MidThreadModelPolicy::StickyNoSwitch)
-            && self.openai_cloud_compact
+        matches!(self.mid_thread, MidThreadModelPolicy::StickyNoSwitch) && self.openai_cloud_compact
     }
 
     /// True when the user opts into **fixed same-factory threads** (不中途换模型).

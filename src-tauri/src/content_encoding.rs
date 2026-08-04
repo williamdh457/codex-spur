@@ -161,8 +161,7 @@ mod tests {
     fn decompresses_gzip() {
         use std::io::Write;
         let payload = br#"{"ok":true}"#;
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(payload).unwrap();
         let compressed = encoder.finish().unwrap();
         let decoded = decompress_body("gzip", &compressed).unwrap().unwrap();

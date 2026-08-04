@@ -114,15 +114,9 @@ impl OfficialBasePromptKind {
 
     pub fn source_label(self) -> &'static str {
         match self {
-            Self::Gpt56Sol => {
-                "openai/codex models.json#gpt-5.6-sol base_instructions"
-            }
-            Self::Gpt56Terra => {
-                "openai/codex models.json#gpt-5.6-terra base_instructions"
-            }
-            Self::Gpt56Luna => {
-                "openai/codex models.json#gpt-5.6-luna base_instructions"
-            }
+            Self::Gpt56Sol => "openai/codex models.json#gpt-5.6-sol base_instructions",
+            Self::Gpt56Terra => "openai/codex models.json#gpt-5.6-terra base_instructions",
+            Self::Gpt56Luna => "openai/codex models.json#gpt-5.6-luna base_instructions",
             Self::Gpt56TerraLunaShared => {
                 "openai/codex models.json#gpt-5.6-terra base_instructions (shared for non-Sol)"
             }
@@ -136,11 +130,7 @@ fn normalize_model_token(raw: &str) -> String {
 
 fn tail_model_token(raw: &str) -> String {
     let n = normalize_model_token(raw);
-    n.rsplit(['/', ':'])
-        .next()
-        .unwrap_or(&n)
-        .trim()
-        .to_string()
+    n.rsplit(['/', ':']).next().unwrap_or(&n).trim().to_string()
 }
 
 /// True when this catalog row is GPT-5.6 Sol (official slug / display / upstream).
@@ -554,7 +544,9 @@ mod tests {
     fn unrestricted_and_neutral_need_heal() {
         assert!(needs_base_instructions_heal(""));
         assert!(needs_base_instructions_heal("You are Codex."));
-        assert!(needs_base_instructions_heal(CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS));
+        assert!(needs_base_instructions_heal(
+            CC_SWITCH_NEUTRAL_BASE_INSTRUCTIONS
+        ));
         assert!(needs_base_instructions_heal(
             "[MODE: UNRESTRICTED]\n\nFIRST-PASS NORMALIZER:\n- foo"
         ));

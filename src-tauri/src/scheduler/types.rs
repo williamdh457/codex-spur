@@ -367,10 +367,7 @@ impl PoolSchedulerConfig {
             self.fallback_max_waiting = 1000;
         }
         self.overload_529_cooldown_secs = self.overload_529_cooldown_secs.clamp(1, 86_400);
-        for value in [
-            &mut self.quota_auto_pause_5h,
-            &mut self.quota_auto_pause_7d,
-        ] {
+        for value in [&mut self.quota_auto_pause_5h, &mut self.quota_auto_pause_7d] {
             if !value.is_finite() || *value < 0.0 {
                 *value = 0.0;
             }
