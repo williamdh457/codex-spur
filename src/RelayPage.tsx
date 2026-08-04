@@ -305,7 +305,9 @@ export function RelayPage() {
               void run(async () => {
                 const outcome = await applyZcodePublish();
                 setMessageTone("ok");
-                setMessage(`已同步 ${outcome.modelCount} 个模型到 Z Code；请重启或重新加载 Z Code。`);
+                setMessage(
+                  `已同步 ${outcome.modelCount} 个反代模型到 Z Code，清理 ${outcome.removedModelCount} 个旧条目；请重启或重新加载 Z Code。`,
+                );
               })
             }
           >

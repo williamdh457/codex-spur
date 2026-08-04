@@ -441,12 +441,13 @@ export async function setApiRelaySettings(input: {
 
 export type ZcodePublishOutcome = {
   modelCount: number;
+  removedModelCount: number;
   configPath: string;
   backupPath: string;
   warnings: string[];
 };
 
-/** Sync currently published Spur routes and reasoning capabilities into Z Code. */
+/** Sync relay-enabled Spur routes and reasoning capabilities into Z Code. */
 export async function applyZcodePublish(): Promise<ZcodePublishOutcome> {
   return invoke<ZcodePublishOutcome>("apply_zcode_publish");
 }
