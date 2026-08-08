@@ -94,7 +94,20 @@ pub struct ModelRouteSummary {
     /// User-facing provider instance name (`providers.name`).
     pub provider_name: String,
     pub upstream_model: String,
+    /// Discovered / upstream short label (not necessarily the published picker name).
     pub display_name: String,
+    /// User override for published display name (Codex + Z Code). Empty/null = official default.
+    pub display_name_override: Option<String>,
+    /// Official default published label (`供应商 · 模型` for Codex-style).
+    pub default_display_name: String,
+    /// Effective published label: override if set, else default.
+    pub effective_display_name: String,
+    /// Effective context window tokens (override or official default).
+    pub context_window: i64,
+    /// User override for context window. Null = official default.
+    pub context_window_override: Option<i64>,
+    /// Official default context window for this kind/upstream.
+    pub default_context_window: i64,
     /// Publish into Codex App model catalog / picker.
     pub enabled: bool,
     /// Expose via the local API relay (Responses reverse-proxy).
@@ -544,6 +557,14 @@ pub struct CodexApplyOutcome {
     pub model_labels: Vec<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Relay models published into Z Code during the same Review & Apply.
+    /// `None` when Z Code was skipped (not configured / write failed softly).
+    #[serde(default)]
+    pub zcode_model_count: Option<u32>,
+    #[serde(default)]
+    pub zcode_removed_model_count: Option<u32>,
+    #[serde(default)]
+    pub zcode_config_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

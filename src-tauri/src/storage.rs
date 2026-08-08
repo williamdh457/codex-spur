@@ -33,6 +33,10 @@ pub struct StoredRoute {
     pub kind: String,
     pub upstream_model: String,
     pub display_name: String,
+    /// User override for published display name (Codex + Z Code). None = official default.
+    pub display_name_override: Option<String>,
+    /// User override for context window tokens. None = official default.
+    pub context_window_override: Option<i64>,
     pub enabled: bool,
     /// Third-party API relay surface (independent of Codex catalog publish).
     pub relay_enabled: bool,
@@ -541,9 +545,9 @@ impl Storage {
 
     pub async fn list_routes(&self, enabled_only: bool) -> Result<Vec<StoredRoute>, sqlx::Error> {
         let query = if enabled_only {
-            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, COALESCE(mr.relay_enabled, 0) AS relay_enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.display_name_override, mr.context_window_override, mr.enabled, COALESCE(mr.relay_enabled, 0) AS relay_enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id WHERE mr.enabled = 1 ORDER BY p.name, mr.display_name"
         } else {
-            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.enabled, COALESCE(mr.relay_enabled, 0) AS relay_enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
+            "SELECT mr.id, mr.provider_id, p.name AS provider_name, COALESCE(NULLIF(p.kind, ''), p.id) AS kind, mr.upstream_model, mr.display_name, mr.display_name_override, mr.context_window_override, mr.enabled, COALESCE(mr.relay_enabled, 0) AS relay_enabled, mr.catalog_json, p.protocol, COALESCE(p.base_url, '') AS base_url, p.entry_category, p.reasoning_profile_id FROM model_routes mr JOIN providers p ON p.id = mr.provider_id ORDER BY p.name, mr.display_name"
         };
         let rows = sqlx::query(query).fetch_all(&self.pool).await?;
         Ok(rows
@@ -557,6 +561,16 @@ impl Storage {
                         .flatten()
                         .as_deref(),
                 );
+                let display_name_override = row
+                    .try_get::<Option<String>, _>("display_name_override")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| crate::providers::normalize_display_name_override(Some(&value)));
+                let context_window_override = row
+                    .try_get::<Option<i64>, _>("context_window_override")
+                    .ok()
+                    .flatten()
+                    .filter(|value| *value > 0);
                 StoredRoute {
                     id: row.get("id"),
                     provider_id: row.get("provider_id"),
@@ -564,6 +578,8 @@ impl Storage {
                     kind,
                     upstream_model: row.get("upstream_model"),
                     display_name: row.get("display_name"),
+                    display_name_override,
+                    context_window_override,
                     enabled: row.get::<i64, _>("enabled") != 0,
                     relay_enabled: row.get::<i64, _>("relay_enabled") != 0,
                     catalog_json: row.get("catalog_json"),
@@ -687,6 +703,40 @@ impl Storage {
             }
         }
         Ok(updated)
+    }
+
+    /// Set or clear the published display-name override (empty → official default).
+    pub async fn set_route_display_name_override(
+        &self,
+        route_id: &str,
+        display_name: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let normalized = crate::providers::normalize_display_name_override(display_name);
+        sqlx::query(
+            "UPDATE model_routes SET display_name_override = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(normalized)
+        .bind(route_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Set or clear the context-window override (None / ≤0 → official default).
+    pub async fn set_route_context_window_override(
+        &self,
+        route_id: &str,
+        context_window: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        let normalized = context_window.filter(|value| *value > 0);
+        sqlx::query(
+            "UPDATE model_routes SET context_window_override = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(normalized)
+        .bind(route_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn set_route_enabled(
@@ -953,6 +1003,19 @@ impl Storage {
             .await?
             .unwrap_or(false);
         Ok((port, bind_lan))
+    }
+
+    /// Whether the API relay should start with the app. Default true (desired-on).
+    pub async fn get_relay_desired_running(&self) -> Result<bool, sqlx::Error> {
+        Ok(self
+            .get_app_setting_bool("relay.desired_running")
+            .await?
+            .unwrap_or(true))
+    }
+
+    pub async fn set_relay_desired_running(&self, desired: bool) -> Result<(), sqlx::Error> {
+        self.set_app_setting_json("relay.desired_running", &desired)
+            .await
     }
 
     pub async fn set_relay_settings(
@@ -3148,12 +3211,45 @@ impl Storage {
                         title: route.display_name.clone(),
                         mappings: Vec::new(),
                     });
+                let bare = {
+                    let model = serde_json::from_str::<RouteCatalogPayload>(&route.catalog_json)
+                        .map(|payload| payload.model)
+                        .ok();
+                    crate::catalog::catalog_model_label_for_route(
+                        &route,
+                        model.as_ref(),
+                    )
+                };
+                let default_display_name = crate::catalog::format_catalog_display_name_for_route(
+                    &route.provider_name,
+                    &bare,
+                );
+                let display_name_override = route.display_name_override.clone();
+                let effective_display_name = crate::providers::effective_display_name(
+                    display_name_override.as_deref(),
+                    &default_display_name,
+                );
+                let default_context_window = crate::providers::default_context_window(
+                    &route.kind,
+                    &route.upstream_model,
+                );
+                let context_window = crate::providers::effective_context_window(
+                    &route.kind,
+                    &route.upstream_model,
+                    route.context_window_override,
+                );
                 Ok(ModelRouteSummary {
                     id: route.id,
                     provider_id: route.provider_id,
                     provider_name: route.provider_name,
                     upstream_model: route.upstream_model,
                     display_name: route.display_name,
+                    display_name_override,
+                    default_display_name,
+                    effective_display_name,
+                    context_window,
+                    context_window_override: route.context_window_override,
+                    default_context_window,
                     enabled: route.enabled,
                     relay_enabled: route.relay_enabled,
                     protocol: route.protocol,
@@ -3967,5 +4063,30 @@ mod relay_storage_tests {
         let (port2, lan2) = storage.get_relay_settings().await.expect("reload");
         assert_eq!(port2, 19_001);
         assert!(lan2);
+    }
+
+    #[tokio::test]
+    async fn relay_desired_running_defaults_true_and_roundtrips() {
+        let storage = open_temp_storage().await;
+        assert!(storage
+            .get_relay_desired_running()
+            .await
+            .expect("default desired"));
+        storage
+            .set_relay_desired_running(false)
+            .await
+            .expect("set false");
+        assert!(!storage
+            .get_relay_desired_running()
+            .await
+            .expect("reload false"));
+        storage
+            .set_relay_desired_running(true)
+            .await
+            .expect("set true");
+        assert!(storage
+            .get_relay_desired_running()
+            .await
+            .expect("reload true"));
     }
 }

@@ -167,15 +167,18 @@ pub fn deepseek_route_uses_chat_completions(_protocol: &str, upstream_model: &st
 /// 2. [`ResponsesNative`] — pure Responses hosts. Protocol is `/responses`
 ///    passthrough. **DeepSeek V4 Flash/Pro** keeps freeform (official DS Codex
 ///    script). **xAI/Grok** and **custom Responses** strip freeform (CCS
-///    NativeResponses shell path).
+///    NativeResponses shell path). OpenCode Go `gpt-5.6-luna` also lands here.
 /// 3. [`ChatCompletionsBridge`] — CC Switch `openai_chat` / **ProxyChat**: rewrite
-///    Responses↔Chat Completions for Kimi / MiniMax / OpenCode Go / most custom
-///    OpenAI-compatible gateways; catalog **keeps** freeform `apply_patch`.
+///    Responses↔Chat Completions for Kimi / MiniMax / most OpenCode Go models /
+///    most custom OpenAI-compatible gateways; catalog **keeps** freeform `apply_patch`.
+/// 4. [`AnthropicMessagesBridge`] — Responses↔Anthropic Messages for OpenCode Go
+///    MiniMax / Qwen models (`POST …/messages`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamProtocolLane {
     OpenAiOfficial,
     ResponsesNative,
     ChatCompletionsBridge,
+    AnthropicMessagesBridge,
 }
 
 impl UpstreamProtocolLane {
@@ -183,16 +186,25 @@ impl UpstreamProtocolLane {
         matches!(self, Self::ChatCompletionsBridge)
     }
 
+    pub fn uses_anthropic_messages_bridge(self) -> bool {
+        matches!(self, Self::AnthropicMessagesBridge)
+    }
+
+    pub fn uses_responses_upstream(self) -> bool {
+        matches!(self, Self::OpenAiOfficial | Self::ResponsesNative)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenAiOfficial => "OpenAI official Responses",
             Self::ResponsesNative => "Responses native (DeepSeek-style)",
             Self::ChatCompletionsBridge => "Chat Completions bridge (CC Switch-style)",
+            Self::AnthropicMessagesBridge => "Anthropic Messages bridge (OpenCode Go)",
         }
     }
 }
 
-/// Resolve the three-lane routing for a provider kind + protocol + model id.
+/// Resolve upstream routing for a provider kind + protocol + model id.
 pub fn upstream_protocol_lane(
     kind: &str,
     protocol: &str,
@@ -223,10 +235,27 @@ pub fn upstream_protocol_lane(
         };
     }
 
-    // 3) CC Switch Chat Completions bridge
-    if matches!(kind.as_str(), "kimi" | "minimax" | "opencode-go") {
+    // 3) CC Switch Chat Completions bridge (standalone MiniMax stays Chat to its own API)
+    if matches!(kind.as_str(), "kimi" | "minimax") {
         return UpstreamProtocolLane::ChatCompletionsBridge;
     }
+
+    // OpenCode Go is a tri-protocol gateway: route by model id (official docs).
+    // Chat is the default; Luna → /responses; MiniMax/Qwen → /messages.
+    if kind == "opencode-go" {
+        return match crate::opencode_go::wire_protocol_for_model(upstream_model) {
+            crate::opencode_go::GoWireProtocol::Responses => {
+                UpstreamProtocolLane::ResponsesNative
+            }
+            crate::opencode_go::GoWireProtocol::AnthropicMessages => {
+                UpstreamProtocolLane::AnthropicMessagesBridge
+            }
+            crate::opencode_go::GoWireProtocol::ChatCompletions => {
+                UpstreamProtocolLane::ChatCompletionsBridge
+            }
+        };
+    }
+
     if kind == "custom" {
         // Explicit Responses protocol → native lane; otherwise Chat bridge.
         return if protocol.contains("response") {
@@ -998,7 +1027,9 @@ pub fn catalog_advertises_freeform_apply_patch_with_profile(
         return true;
     }
     match upstream_protocol_lane(kind, protocol, upstream_model) {
-        UpstreamProtocolLane::OpenAiOfficial | UpstreamProtocolLane::ChatCompletionsBridge => true,
+        UpstreamProtocolLane::OpenAiOfficial
+        | UpstreamProtocolLane::ChatCompletionsBridge
+        | UpstreamProtocolLane::AnthropicMessagesBridge => true,
         // CCS NativeResponses without OpenAI template: shell edits.
         UpstreamProtocolLane::ResponsesNative => false,
     }
@@ -1433,6 +1464,97 @@ pub fn kimi_context_window(upstream_model: &str) -> i64 {
     }
 }
 
+/// Official default context window shared by Codex catalog and Z Code projection.
+///
+/// User overrides sit beside this value; when unset, both publish targets use it.
+pub fn default_context_window(kind: &str, upstream_model: &str) -> i64 {
+    let kind = kind.trim();
+    let upstream = upstream_model.trim();
+    let is_openai_family =
+        kind.eq_ignore_ascii_case("openai")
+            || upstream.contains("gpt-5")
+            || upstream.contains("gpt-4");
+    if is_openai_family {
+        272_000
+    } else if kind.eq_ignore_ascii_case("kimi") {
+        kimi_context_window(upstream)
+    } else if kind.eq_ignore_ascii_case("deepseek") {
+        1_048_576
+    } else if kind.eq_ignore_ascii_case("xai") {
+        if upstream.to_ascii_lowercase().contains("build") {
+            256_000
+        } else {
+            500_000
+        }
+    } else {
+        128_000
+    }
+}
+
+/// ~90% of raw window — same clamp Codex uses for auto-compact.
+pub fn auto_compact_token_limit_for(window: i64) -> i64 {
+    ((window as f64) * 0.9) as i64
+}
+
+/// Resolve effective context window: positive override wins, else official default.
+pub fn effective_context_window(
+    kind: &str,
+    upstream_model: &str,
+    override_tokens: Option<i64>,
+) -> i64 {
+    match override_tokens {
+        Some(value) if value > 0 => value,
+        _ => default_context_window(kind, upstream_model),
+    }
+}
+
+/// Apply a resolved window onto a catalog model (context + max + auto-compact).
+pub fn apply_catalog_context_window(model: &mut CatalogModel, window: i64) {
+    let window = window.max(1);
+    model.context_window = Some(window);
+    model.max_context_window = Some(window);
+    model.auto_compact_token_limit = Some(auto_compact_token_limit_for(window));
+    model.effective_context_window_percent =
+        crate::domain::DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT;
+}
+
+/// Trim user display-name override; empty → None (restore official default).
+pub fn normalize_display_name_override(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Official Z Code model label when the user has not set a display-name override.
+pub fn default_zcode_display_name(kind: &str, upstream_model: &str) -> String {
+    let kind = kind.trim();
+    let upstream = upstream_model.trim();
+    if kind.eq_ignore_ascii_case("kimi")
+        && matches!(
+            upstream.to_ascii_lowercase().as_str(),
+            "k3" | "kimi-k3"
+        )
+    {
+        "Kimi code · K3".to_string()
+    } else if kind.eq_ignore_ascii_case("kimi")
+        && matches!(
+            upstream.to_ascii_lowercase().as_str(),
+            "kimi-for-coding" | "kimi-k2.7-code"
+        )
+    {
+        "Kimi code · K2.7 Coding".to_string()
+    } else {
+        upstream.to_string()
+    }
+}
+
+/// Effective published display name for Codex / Z Code (one override covers both).
+pub fn effective_display_name(override_name: Option<&str>, official_default: &str) -> String {
+    normalize_display_name_override(override_name)
+        .unwrap_or_else(|| official_default.trim().to_string())
+}
+
 pub fn catalog_model_with_profile(
     provider_id: &str,
     kind: &str,
@@ -1444,26 +1566,10 @@ pub fn catalog_model_with_profile(
     // GPT-class models used with ChatGPT backend expect larger windows; others keep 128k default.
     let is_openai_family =
         kind == "openai" || model.id.contains("gpt-5") || model.id.contains("gpt-4");
-    let (context_window, max_context_window) = if is_openai_family {
-        (Some(272_000), Some(272_000))
-    } else if kind == "kimi" {
-        let window = kimi_context_window(&model.id);
-        (Some(window), Some(window))
-    } else if kind == "deepseek" {
-        // Official DeepSeek Codex models.json: 1M context for V4 Flash/Pro.
-        (Some(1_048_576), Some(1_048_576))
-    } else if kind == "xai" {
-        // Grok Build ~256k; Grok 4.5 ~500k — use the larger window so catalog
-        // does not under-advertise; proxy does not enforce this client-side.
-        if model.id.contains("build") {
-            (Some(256_000), Some(256_000))
-        } else {
-            (Some(500_000), Some(500_000))
-        }
-    } else {
-        (Some(128_000), Some(128_000))
-    };
-    let auto_compact = context_window.map(|window| (window as f64 * 0.9) as i64);
+    let window = default_context_window(kind, &model.id);
+    let context_window = Some(window);
+    let max_context_window = Some(window);
+    let auto_compact = Some(auto_compact_token_limit_for(window));
     // Canonical id: 模型.供应商 (Codex picker + API relay share this).
     let slug = model_provider_dotted_slug(&model.id, provider_label, kind, provider_id);
     // Prefer the instance's stored protocol (custom Responses vs Chat); fall back to kind default.
@@ -1894,6 +2000,42 @@ mod tests {
     }
 
     #[test]
+    fn opencode_go_upstream_lane_splits_by_model() {
+        assert_eq!(
+            upstream_protocol_lane("opencode-go", "Chat Completions", "gpt-5.6-luna"),
+            UpstreamProtocolLane::ResponsesNative
+        );
+        assert_eq!(
+            upstream_protocol_lane("opencode-go", "Chat Completions", "minimax-m2.7"),
+            UpstreamProtocolLane::AnthropicMessagesBridge
+        );
+        assert_eq!(
+            upstream_protocol_lane("opencode-go", "Chat Completions", "qwen3.7-max"),
+            UpstreamProtocolLane::AnthropicMessagesBridge
+        );
+        // Go's deepseek-v4-flash stays on Chat (unlike native deepseek kind).
+        assert_eq!(
+            upstream_protocol_lane("opencode-go", "Chat Completions", "deepseek-v4-flash"),
+            UpstreamProtocolLane::ChatCompletionsBridge
+        );
+        assert!(
+            catalog_advertises_freeform_apply_patch(
+                "opencode-go",
+                "Chat Completions",
+                "minimax-m2.7"
+            ),
+            "Anthropic bridge should keep freeform in catalog"
+        );
+        // Default OpenCode Go profile is openai_native → freeform stays on for Luna.
+        assert!(catalog_advertises_freeform_apply_patch_with_profile(
+            "opencode-go",
+            "Chat Completions",
+            "gpt-5.6-luna",
+            Some("openai_native"),
+        ));
+    }
+
+    #[test]
     fn xai_kind_meta_and_subscription_catalog() {
         let meta = kind_meta("xai").expect("xai kind");
         assert_eq!(meta.0, "Grok");
@@ -2093,6 +2235,34 @@ mod tests {
         assert_eq!(kimi_context_window("k3-256k"), 262_144);
         assert_eq!(kimi_context_window("kimi-for-coding"), 262_144);
         assert_eq!(kimi_context_window("kimi-for-coding-highspeed"), 262_144);
+    }
+
+    #[test]
+    fn default_and_effective_context_windows_are_shared() {
+        assert_eq!(default_context_window("openai", "gpt-5.6-sol"), 272_000);
+        assert_eq!(default_context_window("deepseek", "deepseek-v4-flash"), 1_048_576);
+        assert_eq!(default_context_window("kimi", "k3"), 1_048_576);
+        assert_eq!(default_context_window("xai", "grok-code-fast-1-build"), 256_000);
+        assert_eq!(default_context_window("xai", "grok-4.5"), 500_000);
+        assert_eq!(default_context_window("custom", "foo"), 128_000);
+        assert_eq!(
+            effective_context_window("deepseek", "deepseek-v4-flash", Some(123_456)),
+            123_456
+        );
+        assert_eq!(
+            effective_context_window("deepseek", "deepseek-v4-flash", Some(0)),
+            1_048_576
+        );
+        assert_eq!(
+            effective_display_name(Some("  工作模型  "), "DeepSeek · flash"),
+            "工作模型"
+        );
+        assert_eq!(
+            effective_display_name(Some("   "), "DeepSeek · flash"),
+            "DeepSeek · flash"
+        );
+        assert_eq!(default_zcode_display_name("kimi", "k3"), "Kimi code · K3");
+        assert_eq!(default_zcode_display_name("custom", "foo"), "foo");
     }
 
     #[test]

@@ -74,7 +74,20 @@ export type ModelRouteSummary = {
   /** User-facing provider instance name. */
   providerName: string;
   upstreamModel: string;
+  /** Discovered / upstream short label (not always the published picker name). */
   displayName: string;
+  /** User override for published display name (Codex + Z Code). null = official default. */
+  displayNameOverride: string | null;
+  /** Official default published label (`供应商 · 模型`). */
+  defaultDisplayName: string;
+  /** Effective published label: override if set, else default. */
+  effectiveDisplayName: string;
+  /** Effective context window tokens (override or official default). */
+  contextWindow: number;
+  /** User override for context window. null = official default. */
+  contextWindowOverride: number | null;
+  /** Official default context window for this kind/upstream. */
+  defaultContextWindow: number;
   /** Publish into Codex App model picker. */
   enabled: boolean;
   /** Expose via local API relay (Responses reverse-proxy). */
@@ -421,6 +434,10 @@ export type CodexApplyOutcome = {
   selectedModel: string | null;
   modelLabels?: string[];
   warnings?: string[];
+  /** Relay models written into Z Code during the same Review & Apply. */
+  zcodeModelCount?: number | null;
+  zcodeRemovedModelCount?: number | null;
+  zcodeConfigPath?: string | null;
 };
 
 /** Experimental Kimi Desktop publisher status (config/cache only). */

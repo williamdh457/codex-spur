@@ -6,6 +6,43 @@ use zeroize::Zeroizing;
 
 pub const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
+/// OpenCode Go is a tri-protocol gateway on one base URL.
+/// Route by upstream model id (official Go docs), not by provider protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoWireProtocol {
+    /// Most models: Grok / GLM / Kimi / DeepSeek / MiMo / Hy3.
+    ChatCompletions,
+    /// `gpt-5.6-luna` only (OpenAI Responses API).
+    Responses,
+    /// MiniMax + Qwen families (Anthropic Messages API).
+    AnthropicMessages,
+}
+
+/// Pick the upstream wire for an OpenCode Go model id.
+///
+/// Bare catalog ids (`kimi-k3`) and prefixed forms (`opencode-go/kimi-k3`) both work.
+/// Default is Chat Completions — including `deepseek-v4-flash` on Go (unlike Spur's
+/// native DeepSeek kind, which uses Responses for V4 Flash).
+pub fn wire_protocol_for_model(upstream_model: &str) -> GoWireProtocol {
+    let id = upstream_model.trim().to_ascii_lowercase();
+    let tail = id.rsplit(['/', ':']).next().unwrap_or(&id);
+
+    // Official Go docs: only gpt-5.6-luna uses /responses.
+    if matches!(tail, "gpt-5.6-luna" | "gpt-5-6-luna")
+        || tail.starts_with("gpt-5.6-luna")
+        || tail.starts_with("gpt-5-6-luna")
+    {
+        return GoWireProtocol::Responses;
+    }
+
+    // Official Go docs: MiniMax + Qwen → Anthropic /messages.
+    if tail.starts_with("minimax") || tail.starts_with("qwen") {
+        return GoWireProtocol::AnthropicMessages;
+    }
+
+    GoWireProtocol::ChatCompletions
+}
+
 #[derive(Debug, Deserialize)]
 struct AuthFile {
     #[serde(rename = "opencode-go")]
@@ -93,5 +130,57 @@ mod tests {
                 .to_string()
                 .contains("为空")
         );
+    }
+
+    #[test]
+    fn wire_protocol_routes_by_model_family() {
+        assert_eq!(
+            wire_protocol_for_model("gpt-5.6-luna"),
+            GoWireProtocol::Responses
+        );
+        assert_eq!(
+            wire_protocol_for_model("opencode-go/gpt-5.6-luna"),
+            GoWireProtocol::Responses
+        );
+        assert_eq!(
+            wire_protocol_for_model("gpt-5-6-luna"),
+            GoWireProtocol::Responses
+        );
+
+        for id in [
+            "minimax-m3",
+            "minimax-m2.7",
+            "minimax-m2.5",
+            "qwen3.8-max",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.6-plus",
+            "qwen3.5-plus",
+            "OpenCode-Go/Qwen3.7-Max",
+        ] {
+            assert_eq!(
+                wire_protocol_for_model(id),
+                GoWireProtocol::AnthropicMessages,
+                "{id}"
+            );
+        }
+
+        for id in [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "grok-4.5",
+            "glm-5.2",
+            "kimi-k3",
+            "kimi-k2.7-code",
+            "mimo-v2.5",
+            "hy3",
+            "hy3-preview",
+        ] {
+            assert_eq!(
+                wire_protocol_for_model(id),
+                GoWireProtocol::ChatCompletions,
+                "{id}"
+            );
+        }
     }
 }

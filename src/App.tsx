@@ -44,6 +44,8 @@ import {
   restorePreviousCodexConfig,
   setConversationPolicy,
   setDiagnosticsMaxEvents,
+  setModelContextWindow,
+  setModelDisplayName,
   setModelEnabled,
   setModelRelayEnabled,
   setProviderReasoningProfile,
@@ -2533,7 +2535,7 @@ function ReasoningTable({ route }: { route: ModelRouteSummary }) {
         <strong>{route.reasoningProfile.title}</strong>
         <small>Codex 八档 → 上游（Catalog 只展示可区分子集）</small>
       </div>
-      <div className="mapping-grid" role="table" aria-label={`${route.displayName} 推理映射`}>
+      <div className="mapping-grid" role="table" aria-label={`${modelListLabel(route)} 推理映射`}>
         {route.reasoningProfile.mappings.map((mapping) => (
           <div className="mapping-row" role="row" key={mapping.codexEffort}>
             <code>{mapping.codexEffort}</code><span aria-hidden="true">→</span><strong>{mapping.upstreamEffort}</strong><small>{mapping.explanation}</small>
@@ -2544,12 +2546,205 @@ function ReasoningTable({ route }: { route: ModelRouteSummary }) {
   );
 }
 
-/** Models list title: human label `供应商 · 模型` (machine id stays 模型.供应商). */
+/** Models list title: override or official `供应商 · 模型` (machine id stays 模型.供应商). */
 function modelListLabel(route: ModelRouteSummary): string {
+  const effective = (route.effectiveDisplayName || "").trim();
+  if (effective) return effective;
+  const fallback = (route.defaultDisplayName || "").trim();
+  if (fallback) return fallback;
   const model = (route.upstreamModel || route.displayName || route.id).trim();
   const provider = (route.providerName || route.providerId).trim();
   if (provider && model) return `${provider} · ${model}`;
   return model || provider || route.id;
+}
+
+function formatTokenCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "—";
+  if (value >= 1_000_000) {
+    const millions = value / 1_000_000;
+    return `${Number.isInteger(millions) ? millions.toFixed(0) : millions.toFixed(1)}M`;
+  }
+  if (value >= 1_000) {
+    const thousands = value / 1_000;
+    return `${Number.isInteger(thousands) ? thousands.toFixed(0) : thousands.toFixed(1)}k`;
+  }
+  return String(value);
+}
+
+function ModelSettingsCard({
+  route,
+  busy,
+  onSaved,
+  onError,
+}: {
+  route: ModelRouteSummary;
+  busy: boolean;
+  onSaved: (routes: ModelRouteSummary[], message: string) => void;
+  onError: (message: string) => void;
+}) {
+  const [displayName, setDisplayName] = useState(route.displayNameOverride ?? "");
+  const [contextWindow, setContextWindow] = useState(
+    route.contextWindowOverride != null ? String(route.contextWindowOverride) : "",
+  );
+  const [saving, setSaving] = useState<"name" | "context" | null>(null);
+
+  useEffect(() => {
+    setDisplayName(route.displayNameOverride ?? "");
+    setContextWindow(
+      route.contextWindowOverride != null ? String(route.contextWindowOverride) : "",
+    );
+  }, [route.id, route.displayNameOverride, route.contextWindowOverride]);
+
+  const saveDisplayName = async (nextRaw: string) => {
+    if (busy || saving) return;
+    const trimmed = nextRaw.trim();
+    const current = (route.displayNameOverride ?? "").trim();
+    if (trimmed === current) return;
+    setSaving("name");
+    try {
+      const routes = await setModelDisplayName(route.id, trimmed.length > 0 ? trimmed : null);
+      onSaved(
+        routes,
+        trimmed.length > 0
+          ? "已保存显示名。写入 Codex / Z Code 请到概览「Review & Apply」。"
+          : "已恢复官方显示名。写入 Codex / Z Code 请到概览「Review & Apply」。",
+      );
+    } catch (caught) {
+      onError(caught instanceof Error ? caught.message : String(caught));
+      setDisplayName(route.displayNameOverride ?? "");
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const saveContextWindow = async (nextRaw: string) => {
+    if (busy || saving) return;
+    const trimmed = nextRaw.trim();
+    if (trimmed.length === 0) {
+      if (route.contextWindowOverride == null) return;
+      setSaving("context");
+      try {
+        const routes = await setModelContextWindow(route.id, null);
+        onSaved(routes, "已恢复官方上下文长度。写入 Codex / Z Code 请到概览「Review & Apply」。");
+      } catch (caught) {
+        onError(caught instanceof Error ? caught.message : String(caught));
+        setContextWindow(
+          route.contextWindowOverride != null ? String(route.contextWindowOverride) : "",
+        );
+      } finally {
+        setSaving(null);
+      }
+      return;
+    }
+    const parsed = Number(trimmed.replace(/[_,\s]/g, ""));
+    if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+      onError("上下文长度请输入正整数 tokens，或留空恢复官方默认。");
+      setContextWindow(
+        route.contextWindowOverride != null ? String(route.contextWindowOverride) : "",
+      );
+      return;
+    }
+    if (route.contextWindowOverride === parsed) return;
+    setSaving("context");
+    try {
+      const routes = await setModelContextWindow(route.id, parsed);
+      onSaved(
+        routes,
+        `已保存上下文长度 ${formatTokenCount(parsed)}。写入 Codex / Z Code 请到概览「Review & Apply」。`,
+      );
+    } catch (caught) {
+      onError(caught instanceof Error ? caught.message : String(caught));
+      setContextWindow(
+        route.contextWindowOverride != null ? String(route.contextWindowOverride) : "",
+      );
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  return (
+    <div className="reasoning-card model-settings-card">
+      <div className="reasoning-card__header">
+        <strong>模型设置</strong>
+        <small>显示名与上下文同时影响 Codex / Z Code</small>
+      </div>
+      <div className="model-settings-card__body">
+        <label className="field">
+          <span>显示名</span>
+          <input
+            type="text"
+            value={displayName}
+            placeholder={route.defaultDisplayName || modelListLabel(route)}
+            disabled={busy || saving !== null}
+            onChange={(event) => setDisplayName(event.target.value)}
+            onBlur={() => void saveDisplayName(displayName)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.currentTarget.blur();
+              }
+            }}
+          />
+          <small className="field__hint">
+            默认 {route.defaultDisplayName || "供应商 · 模型"}
+            {route.displayNameOverride ? " · 已自定义" : ""}
+          </small>
+        </label>
+        <div className="model-settings-card__actions">
+          <button
+            type="button"
+            className="button button--ghost"
+            disabled={busy || saving !== null || !route.displayNameOverride}
+            onClick={() => {
+              setDisplayName("");
+              void saveDisplayName("");
+            }}
+          >
+            恢复官方显示名
+          </button>
+        </div>
+        <label className="field">
+          <span>上下文长度（tokens）</span>
+          <input
+            type="text"
+            inputMode="numeric"
+            value={contextWindow}
+            placeholder={String(route.defaultContextWindow || "")}
+            disabled={busy || saving !== null}
+            onChange={(event) => setContextWindow(event.target.value)}
+            onBlur={() => void saveContextWindow(contextWindow)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.currentTarget.blur();
+              }
+            }}
+          />
+          <small className="field__hint">
+            默认 {formatTokenCount(route.defaultContextWindow)} · 当前有效{" "}
+            {formatTokenCount(route.contextWindow)}
+            {route.contextWindowOverride != null ? " · 已自定义" : ""}
+          </small>
+        </label>
+        <div className="model-settings-card__actions">
+          <button
+            type="button"
+            className="button button--ghost"
+            disabled={busy || saving !== null || route.contextWindowOverride == null}
+            onClick={() => {
+              setContextWindow("");
+              void saveContextWindow("");
+            }}
+          >
+            恢复官方上下文
+          </button>
+        </div>
+        <p className="caption model-settings-card__note">
+          写入 Codex / Z Code 需 Review & Apply；Z Code 仅同步反代已开启模型。机器 id 仍为{" "}
+          <code>{route.id}</code>。
+          {saving ? " · 保存中…" : ""}
+        </p>
+      </div>
+    </div>
+  );
 }
 
 function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> }) {
@@ -2557,6 +2752,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
   /** Which side is focused (highlight); both tables stay mounted. */
   const [focus, setFocus] = useState<"codex" | "relay">("codex");
   const [query, setQuery] = useState("");
+  /** Expanded settings panel key: `codex:<id>` or `relay:<id>`. */
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
@@ -2579,6 +2775,12 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
   );
   const codexCount = routes.filter((route) => route.enabled).length;
   const relayCount = routes.filter((route) => route.relayEnabled).length;
+
+  const toggleExpanded = (scope: "codex" | "relay", routeId: string) => {
+    const key = `${scope}:${routeId}`;
+    setExpanded((current) => (current === key ? null : key));
+    setFocus(scope);
+  };
 
   const toggleCodex = async (route: ModelRouteSummary) => {
     if (busyId) return;
@@ -2651,6 +2853,16 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
     }
   };
 
+  const onSettingsSaved = async (nextRoutes: ModelRouteSummary[], message: string) => {
+    setRoutes(nextRoutes);
+    setNotice({ tone: "ok", text: message });
+    try {
+      await refreshSnapshot();
+    } catch {
+      // Snapshot refresh is best-effort; list already updated.
+    }
+  };
+
   return (
     <div className="page-stack">
       <section className="panel">
@@ -2676,7 +2888,6 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
             className={`model-scope__btn${focus === "relay" ? " model-scope__btn--active" : ""}`}
             onClick={() => {
               setFocus("relay");
-              setExpanded(null);
               setNotice(null);
             }}
           >
@@ -2686,7 +2897,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
           </button>
         </div>
         <p className="caption model-scope__hint">
-          左侧表控制 Codex 发布，右侧表控制反代库存。两套开关互不共用。启动反代与 API Key 在侧栏「反代」。
+          左侧表控制 Codex 发布，右侧表控制反代库存。点击模型行可改显示名与上下文长度；开关只负责启用。启动反代与 API Key 在侧栏「反代」。
         </p>
       </section>
 
@@ -2748,6 +2959,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
                 {filtered.map((route) => {
                   const busy = busyId === route.id;
                   const selected = route.enabled;
+                  const panelOpen = expanded === `codex:${route.id}`;
                   return (
                     <div
                       className={`model-item ${selected ? "model-item--enabled" : ""}`}
@@ -2770,12 +2982,17 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
                           type="button"
                           className="model-row__select"
                           disabled={busyId !== null}
-                          onClick={() => void toggleCodex(route)}
+                          aria-expanded={panelOpen}
+                          onClick={() => toggleExpanded("codex", route.id)}
                         >
                           <span className="data-row__main">
                             <strong>{modelListLabel(route)}</strong>
                             <small>
-                              <code>{route.id}</code> · {route.protocol}
+                              <code>{route.id}</code> · {route.protocol} ·{" "}
+                              {formatTokenCount(route.contextWindow)}
+                              {route.displayNameOverride || route.contextWindowOverride != null
+                                ? " · 已自定义"
+                                : ""}
                               {busy ? " · 更新中…" : ""}
                             </small>
                           </span>
@@ -2786,13 +3003,23 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
                         <button
                           type="button"
                           className="button button--ghost"
-                          aria-expanded={expanded === route.id}
-                          onClick={() => setExpanded(expanded === route.id ? null : route.id)}
+                          aria-expanded={panelOpen}
+                          onClick={() => toggleExpanded("codex", route.id)}
                         >
-                          推理映射
+                          {panelOpen ? "收起" : "设置"}
                         </button>
                       </div>
-                      {expanded === route.id ? <ReasoningTable route={route} /> : null}
+                      {panelOpen ? (
+                        <>
+                          <ModelSettingsCard
+                            route={route}
+                            busy={busyId !== null}
+                            onSaved={(next, message) => void onSettingsSaved(next, message)}
+                            onError={(message) => setNotice({ tone: "error", text: message })}
+                          />
+                          <ReasoningTable route={route} />
+                        </>
+                      ) : null}
                     </div>
                   );
                 })}
@@ -2820,6 +3047,7 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
                 {filtered.map((route) => {
                   const busy = busyId === route.id;
                   const selected = route.relayEnabled;
+                  const panelOpen = expanded === `relay:${route.id}`;
                   return (
                     <div
                       className={`model-item ${selected ? "model-item--enabled" : ""}`}
@@ -2842,12 +3070,17 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
                           type="button"
                           className="model-row__select"
                           disabled={busyId !== null}
-                          onClick={() => void toggleRelay(route)}
+                          aria-expanded={panelOpen}
+                          onClick={() => toggleExpanded("relay", route.id)}
                         >
                           <span className="data-row__main">
                             <strong>{modelListLabel(route)}</strong>
                             <small>
-                              <code>{route.id}</code> · {route.protocol}
+                              <code>{route.id}</code> · {route.protocol} ·{" "}
+                              {formatTokenCount(route.contextWindow)}
+                              {route.displayNameOverride || route.contextWindowOverride != null
+                                ? " · 已自定义"
+                                : ""}
                               {busy ? " · 更新中…" : ""}
                             </small>
                           </span>
@@ -2855,14 +3088,30 @@ function ModelsPage({ refreshSnapshot }: { refreshSnapshot: () => Promise<void> 
                         <span className="badge badge--neutral">
                           {route.providerName.trim() || route.providerId}
                         </span>
+                        <button
+                          type="button"
+                          className="button button--ghost"
+                          aria-expanded={panelOpen}
+                          onClick={() => toggleExpanded("relay", route.id)}
+                        >
+                          {panelOpen ? "收起" : "设置"}
+                        </button>
                       </div>
+                      {panelOpen ? (
+                        <ModelSettingsCard
+                          route={route}
+                          busy={busyId !== null}
+                          onSaved={(next, message) => void onSettingsSaved(next, message)}
+                          onError={(message) => setNotice({ tone: "error", text: message })}
+                        />
+                      ) : null}
                     </div>
                   );
                 })}
               </div>
             )}
             <p className="caption model-table-panel__footer">
-              展示名为 供应商 · 模型；对外 id 为 模型.供应商。服务与 Client Key 请到侧栏「反代」。
+              展示名默认为 供应商 · 模型（可自定义）；对外 id 为 模型.供应商。服务与 Client Key 请到侧栏「反代」。
             </p>
           </section>
         </div>
@@ -4461,9 +4710,22 @@ export default function App() {
           `${pathNote}${customNote}：已发布 ${outcome.modelCount} 个模型（${listed}）。打开 ChatGPT 后在「高级 → 模型」中应能看到完整列表。`,
         );
       }
+      if (outcome.zcodeModelCount != null) {
+        const removed = outcome.zcodeRemovedModelCount ?? 0;
+        pushToast(
+          "success",
+          `已同步 ${outcome.zcodeModelCount} 个反代模型到 Z Code${
+            removed > 0 ? `（清理 ${removed} 个旧条目）` : ""
+          }；请重启或重新加载 Z Code。`,
+        );
+      }
       for (const warning of outcome.warnings ?? []) {
         if (/仍在运行|Cmd\+Q|完全退出/.test(warning)) {
           // Already surfaced as the hard error toast above.
+          continue;
+        }
+        // Z Code success path already toasts above; keep only soft-fail / reload notes.
+        if (/请在 Z Code 中重新加载|Z Code 仅显示反代已开启/.test(warning)) {
           continue;
         }
         pushToast("warning", warning);

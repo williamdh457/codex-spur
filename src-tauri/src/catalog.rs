@@ -27,6 +27,10 @@ pub struct RouteTarget {
     pub codex_enabled: bool,
     /// Exposed on the local API relay surface.
     pub relay_enabled: bool,
+    /// User override for published display name (Codex + Z Code). None = official default.
+    pub display_name_override: Option<String>,
+    /// User override for context window tokens. None = official default.
+    pub context_window_override: Option<i64>,
 }
 
 pub type SharedCatalog = Arc<RwLock<ModelsResponse>>;
@@ -283,6 +287,10 @@ fn bare_model_label(display: &str) -> &str {
 }
 
 /// DESIGN.md default: every Codex picker row is `供应商 · 模型`.
+pub fn format_catalog_display_name_for_route(provider_name: &str, model_label: &str) -> String {
+    format_catalog_display_name(provider_name, model_label)
+}
+
 fn format_catalog_display_name(provider_name: &str, model_label: &str) -> String {
     let provider = provider_name.trim();
     let bare = bare_model_label(model_label);
@@ -296,11 +304,11 @@ fn format_catalog_display_name(provider_name: &str, model_label: &str) -> String
 }
 
 /// Prefer native short names; otherwise bare label from catalog / route / upstream id.
-fn catalog_model_label(route: &StoredRoute, model: &CatalogModel) -> String {
+pub fn catalog_model_label_for_route(route: &StoredRoute, model: Option<&CatalogModel>) -> String {
     if let Some(native) = crate::providers::desktop_native_model_slug(&route.upstream_model) {
         return desktop_native_short_label(native).to_string();
     }
-    let from_model = model.display_name.trim();
+    let from_model = model.map(|m| m.display_name.trim()).unwrap_or("");
     let from_route = route.display_name.trim();
     let raw = if !from_model.is_empty() {
         from_model
@@ -310,6 +318,10 @@ fn catalog_model_label(route: &StoredRoute, model: &CatalogModel) -> String {
         route.upstream_model.as_str()
     };
     bare_model_label(raw).to_string()
+}
+
+fn catalog_model_label(route: &StoredRoute, model: &CatalogModel) -> String {
+    catalog_model_label_for_route(route, Some(model))
 }
 
 /// Build Codex catalog, relay catalog, and unified proxy route map.
@@ -395,13 +407,24 @@ pub fn build_from_routes_with_policy(
                 crate::providers::legacy_route_slug(&route.provider_id, &route.upstream_model);
             let previous_slug = model.slug.clone();
             model.slug = published.clone();
-            // Human label stays "供应商 · 模型"; machine id is model.provider.
-            let label = format_catalog_display_name(
+            // Human label: user override wins; else official "供应商 · 模型".
+            let official_label = format_catalog_display_name(
                 &route.provider_name,
                 &catalog_model_label(route, &model),
             );
+            let label = crate::providers::effective_display_name(
+                route.display_name_override.as_deref(),
+                &official_label,
+            );
             model.display_name = label.clone();
             model.description = Some(label);
+            // Context window: heal may rewrite kind defaults; user override wins after.
+            let window = crate::providers::effective_context_window(
+                &route.kind,
+                &route.upstream_model,
+                route.context_window_override,
+            );
+            crate::providers::apply_catalog_context_window(&mut model, window);
             let base_url = if route.kind.eq_ignore_ascii_case("xai") {
                 // Runtime resolve so OAuth subscription never sticks on api.x.ai
                 // even if a row was not yet migrated.
@@ -422,6 +445,8 @@ pub fn build_from_routes_with_policy(
                 reasoning_profile_id: profile.as_str().to_string(),
                 codex_enabled: route.enabled,
                 relay_enabled: route.relay_enabled,
+                display_name_override: route.display_name_override.clone(),
+                context_window_override: route.context_window_override,
             };
             // Publish key + dual-keys so in-flight sessions on old slugs still route.
             targets.insert(published.clone(), target.clone());
@@ -614,6 +639,8 @@ mod tests {
             kind: kind.into(),
             upstream_model: upstream.into(),
             display_name: display.into(),
+            display_name_override: None,
+            context_window_override: None,
             enabled: true,
             relay_enabled: false,
             catalog_json,
@@ -640,6 +667,44 @@ mod tests {
             format_catalog_display_name("Kimi tian", "K3"),
             "Kimi tian · K3"
         );
+    }
+
+    #[test]
+    fn build_from_routes_honors_display_and_context_overrides() {
+        let mut route = stale_slash_route(
+            "custom-1",
+            "My Custom",
+            "my-model",
+            "My Custom · my-model",
+            "custom",
+        );
+        route.display_name_override = Some("工作模型".into());
+        route.context_window_override = Some(200_000);
+        let (catalog, _relay, _targets) = build_from_routes(&[route]).expect("build catalog");
+        assert_eq!(catalog.models.len(), 1);
+        let model = &catalog.models[0];
+        assert_eq!(model.display_name, "工作模型");
+        assert_eq!(model.context_window, Some(200_000));
+        assert_eq!(model.max_context_window, Some(200_000));
+        assert_eq!(
+            model.auto_compact_token_limit,
+            Some(crate::providers::auto_compact_token_limit_for(200_000))
+        );
+    }
+
+    #[test]
+    fn build_from_routes_override_survives_kind_context_heal() {
+        let mut route = stale_slash_route(
+            "deepseek-1",
+            "DeepSeek",
+            "deepseek-v4-flash",
+            "DeepSeek · deepseek-v4-flash",
+            "deepseek",
+        );
+        route.context_window_override = Some(300_000);
+        let (catalog, _, _) = build_from_routes(&[route]).expect("build catalog");
+        assert_eq!(catalog.models[0].context_window, Some(300_000));
+        assert_eq!(catalog.models[0].max_context_window, Some(300_000));
     }
 
     #[test]

@@ -29,6 +29,8 @@ coverage/
 # Misc
 *.swp
 *~
+# Local agent session plans (not product source)
+.zcode/
 # Website deployment output and local release binaries
 website/dist/
 website/public/downloads/*.dmg

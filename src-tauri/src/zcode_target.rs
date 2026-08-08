@@ -156,30 +156,17 @@ fn model_entry(routes: &HashMap<String, RouteTarget>, target: &RouteTarget) -> (
         &target.upstream_model,
         profile(target),
     );
-    let context = if target.kind.eq_ignore_ascii_case("kimi") {
-        crate::providers::kimi_context_window(&target.upstream_model)
-    } else if target.kind.eq_ignore_ascii_case("xai") {
-        500_000
-    } else {
-        128_000
-    };
-    let name = if target.kind.eq_ignore_ascii_case("kimi")
-        && matches!(
-            target.upstream_model.trim().to_ascii_lowercase().as_str(),
-            "k3" | "kimi-k3"
-        )
-    {
-        "Kimi code · K3".to_string()
-    } else if target.kind.eq_ignore_ascii_case("kimi")
-        && matches!(
-            target.upstream_model.trim().to_ascii_lowercase().as_str(),
-            "kimi-for-coding" | "kimi-k2.7-code"
-        )
-    {
-        "Kimi code · K2.7 Coding".to_string()
-    } else {
-        target.upstream_model.clone()
-    };
+let context = crate::providers::effective_context_window(
+        &target.kind,
+        &target.upstream_model,
+        target.context_window_override,
+    );
+    let official_name =
+        crate::providers::default_zcode_display_name(&target.kind, &target.upstream_model);
+    let name = crate::providers::effective_display_name(
+        target.display_name_override.as_deref(),
+        &official_name,
+    );
     let mut model = json!({
         "name": name,
         "limit": { "context": context },
@@ -504,6 +491,8 @@ mod tests {
             reasoning_profile_id: ReasoningProfileId::default_for_kind(kind).as_str().into(),
             codex_enabled: true,
             relay_enabled: false,
+            display_name_override: None,
+            context_window_override: None,
         }
     }
 
@@ -536,6 +525,27 @@ mod tests {
             json!(["low", "medium", "high"])
         );
         assert_eq!(model["reasoning"]["defaultVariant"], "high");
+        assert_eq!(model["limit"]["context"], 500_000);
+        assert_eq!(model["name"], "grok-4.5");
+    }
+
+    #[test]
+    fn model_entry_uses_shared_defaults_and_overrides() {
+        let mut routes = HashMap::new();
+        let deepseek = route("deepseek", "deepseek-v4-flash");
+        routes.insert("deepseek-v4-flash.kimi-code".into(), deepseek.clone());
+        let (_, model) = model_entry(&routes, &deepseek);
+        // Unified default with Codex (1M), not the old Z Code-only 128k.
+        assert_eq!(model["limit"]["context"], 1_048_576);
+        assert_eq!(model["name"], "deepseek-v4-flash");
+
+        let mut custom = route("custom", "my-model");
+        custom.display_name_override = Some("工作模型".into());
+        custom.context_window_override = Some(200_000);
+        routes.insert("my-model.kimi-code".into(), custom.clone());
+        let (_, model) = model_entry(&routes, &custom);
+        assert_eq!(model["name"], "工作模型");
+        assert_eq!(model["limit"]["context"], 200_000);
     }
 
     #[test]

@@ -201,6 +201,8 @@ impl AppState {
         };
         // Older builds left system proxy → 127.0.0.1:17862 which breaks Kimi entirely.
         clear_residual_kimi_system_proxy_if_needed();
+        // API relay defaults to on; explicit Stop persists desired_running=false.
+        state.maybe_autostart_relay().await;
         Ok(state)
     }
 
@@ -363,6 +365,7 @@ impl AppState {
                 relay.bind_lan = bind_lan;
                 relay.runtime = Some(runtime);
                 relay.last_error = None;
+                let _ = self.storage.set_relay_desired_running(true).await;
             }
             Err(error) => {
                 let mut relay = self.relay.write().await;
@@ -381,7 +384,27 @@ impl AppState {
             }
             relay.last_error = None;
         }
+        let _ = self.storage.set_relay_desired_running(false).await;
         self.relay_status_inner().await
+    }
+
+    /// Soft-start relay at bootstrap when desired_running is true (default).
+    /// Bind failures are recorded in last_error and do not fail app startup.
+    async fn maybe_autostart_relay(&self) {
+        let desired = self
+            .storage
+            .get_relay_desired_running()
+            .await
+            .unwrap_or(true);
+        if !desired {
+            return;
+        }
+        if let Err(error) = self.start_relay_inner().await {
+            let mut relay = self.relay.write().await;
+            if relay.last_error.is_none() {
+                relay.last_error = Some(error);
+            }
+        }
     }
 }
 
@@ -775,7 +798,10 @@ async fn preview_codex_apply(state: State<'_, AppState>) -> Result<ApplyPreview,
 }
 
 #[tauri::command]
-async fn apply_codex_config(state: State<'_, AppState>) -> Result<CodexApplyOutcome, String> {
+async fn apply_codex_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodexApplyOutcome, String> {
     let snapshot = state.snapshot.read().await;
     let base_url = snapshot
         .proxy
@@ -821,6 +847,34 @@ async fn apply_codex_config(state: State<'_, AppState>) -> Result<CodexApplyOutc
             "applied",
         )
         .await;
+
+    // Same Review & Apply also projects relay-enabled routes into Z Code.
+    // Soft-fail: Codex is the primary write; missing/broken Z Code must not roll it back.
+    let mut zcode_model_count = None;
+    let mut zcode_removed_model_count = None;
+    let mut zcode_config_path = None;
+    {
+        let routes = state.routes.read().await.clone();
+        let endpoint = resolve_zcode_relay_endpoint(&app, &state).await;
+        match zcode_target::apply(&routes, endpoint) {
+            Ok(zcode) => {
+                zcode_model_count = Some(zcode.model_count);
+                zcode_removed_model_count = Some(zcode.removed_model_count);
+                zcode_config_path = Some(zcode.config_path);
+                for warning in zcode.warnings {
+                    if !result.warnings.iter().any(|item| item == &warning) {
+                        result.warnings.push(warning);
+                    }
+                }
+            }
+            Err(error) => {
+                result.warnings.push(format!(
+                    "Z Code 未同步：{error}（Codex 已写入；可稍后重试 Review & Apply，或手动同步 SPUR）"
+                ));
+            }
+        }
+    }
+
     {
         let mut snapshot = state.snapshot.write().await;
         let proxy_running = snapshot.proxy.running;
@@ -855,6 +909,9 @@ async fn apply_codex_config(state: State<'_, AppState>) -> Result<CodexApplyOutc
         selected_model: result.selected_model,
         model_labels: result.model_labels,
         warnings: result.warnings,
+        zcode_model_count,
+        zcode_removed_model_count,
+        zcode_config_path,
     })
 }
 
@@ -2610,6 +2667,69 @@ async fn set_model_relay_enabled(
     list_model_routes(state).await
 }
 
+/// Max accepted user context-window override (tokens). Protects against typos.
+const MAX_CONTEXT_WINDOW_OVERRIDE: i64 = 10_000_000;
+
+#[tauri::command]
+async fn set_model_display_name(
+    state: State<'_, AppState>,
+    route_id: String,
+    display_name: Option<String>,
+) -> Result<Vec<ModelRouteSummary>, String> {
+    state
+        .storage
+        .set_route_display_name_override(&route_id, display_name.as_deref())
+        .await
+        .map_err(|error| error.to_string())?;
+    // Rebuild so live relay catalog / route map pick up the new label immediately.
+    // Disk write for Codex + Z Code still requires Review & Apply.
+    state.rebuild_runtime().await?;
+    {
+        let mut snapshot = state.snapshot.write().await;
+        if snapshot.binding.state == "applied" {
+            let msg = "模型显示名已变更：请再次点击 Review & Apply，然后完全退出 ChatGPT 再打开，右下角才会刷新。";
+            if !snapshot.attention_items.iter().any(|item| item == msg) {
+                snapshot.attention_items.push(msg.into());
+            }
+        }
+    }
+    list_model_routes(state).await
+}
+
+#[tauri::command]
+async fn set_model_context_window(
+    state: State<'_, AppState>,
+    route_id: String,
+    context_window: Option<i64>,
+) -> Result<Vec<ModelRouteSummary>, String> {
+    if let Some(value) = context_window {
+        if value <= 0 {
+            return Err("上下文长度必须大于 0，或留空恢复官方默认。".into());
+        }
+        if value > MAX_CONTEXT_WINDOW_OVERRIDE {
+            return Err(format!(
+                "上下文长度过大（上限 {MAX_CONTEXT_WINDOW_OVERRIDE} tokens）。"
+            ));
+        }
+    }
+    state
+        .storage
+        .set_route_context_window_override(&route_id, context_window)
+        .await
+        .map_err(|error| error.to_string())?;
+    state.rebuild_runtime().await?;
+    {
+        let mut snapshot = state.snapshot.write().await;
+        if snapshot.binding.state == "applied" {
+            let msg = "模型上下文长度已变更：请再次点击 Review & Apply，然后完全退出 ChatGPT 再打开，右下角才会刷新。";
+            if !snapshot.attention_items.iter().any(|item| item == msg) {
+                snapshot.attention_items.push(msg.into());
+            }
+        }
+    }
+    list_model_routes(state).await
+}
+
 #[tauri::command]
 async fn get_api_relay_status(state: State<'_, AppState>) -> Result<ApiRelayStatus, String> {
     state.relay_status_inner().await
@@ -3972,6 +4092,8 @@ pub fn run() {
             set_active_pool,
             set_model_enabled,
             set_model_relay_enabled,
+            set_model_display_name,
+            set_model_context_window,
             get_api_relay_status,
             start_api_relay,
             stop_api_relay,

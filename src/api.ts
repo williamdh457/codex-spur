@@ -405,6 +405,30 @@ export async function setModelRelayEnabled(
   return invoke<ModelRouteSummary[]>("set_model_relay_enabled", { routeId, enabled });
 }
 
+/** Set or clear published display-name override (empty/null → official default). */
+export async function setModelDisplayName(
+  routeId: string,
+  displayName: string | null,
+): Promise<ModelRouteSummary[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<ModelRouteSummary[]>("set_model_display_name", {
+    routeId,
+    displayName,
+  });
+}
+
+/** Set or clear context-window override tokens (null → official default). */
+export async function setModelContextWindow(
+  routeId: string,
+  contextWindow: number | null,
+): Promise<ModelRouteSummary[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<ModelRouteSummary[]>("set_model_context_window", {
+    routeId,
+    contextWindow,
+  });
+}
+
 export async function getApiRelayStatus(): Promise<ApiRelayStatus> {
   if (!isTauriRuntime()) {
     return {

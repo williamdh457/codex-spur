@@ -25,23 +25,23 @@ Spur **不是** 把 Grok/Kimi 变成 GPT，也 **不是** 修改 `ChatGPT.app`�
 
 ---
 
-## 2. 总架构：三车道（Three Lanes）
+## 2. 总架构：上游车道（Lanes）
 
-实现：`providers::UpstreamProtocolLane` + `proxy::handle` 分支。
+实现：`providers::UpstreamProtocolLane` + `proxy` 分发分支。
 
 ```
 Codex App  ──POST /v1/responses──►  Spur 本地代理
                                       │
-                    ┌─────────────────┼─────────────────┐
-                    ▼                 ▼                   ▼
-            OpenAiOfficial    ResponsesNative     ChatCompletionsBridge
-            (官方 OpenAI)     (Responses 透传+port)  (CCS 式大桥)
-                    │                 │                   │
-                    ▼                 ▼                   ▼
-              OpenAI 后端      xAI/Grok/DS Flash     Kimi/MiniMax/…
-              /responses       /responses             /chat/completions
-                    │                 │                   │
-                    └──────── 回程统一成 Responses 形状 ───┘
+          ┌───────────────┬───────────┼────────────┬────────────────┐
+          ▼               ▼           ▼            ▼                │
+   OpenAiOfficial  ResponsesNative  ChatBridge  AnthropicMessages   │
+   (官方 OpenAI)   (Responses 透传)  (CCS 式桥)   (OpenCode Go)       │
+          │               │           │            │                │
+          ▼               ▼           ▼            ▼                │
+    OpenAI 后端    xAI/DS Flash/    Kimi/…/      MiniMax/Qwen        │
+    /responses     Go Luna         /chat/…      Go /messages        │
+          │               │           │            │                │
+          └──────── 回程统一成 Responses 形状 ───────┘                │
                                       │
                                       ▼
                                  Codex App
@@ -55,9 +55,14 @@ Codex App  ──POST /v1/responses──►  Spur 本地代理
 | `xai`（含 OAuth CLI proxy / API Key） | **ResponsesNative**（强制，忽略错误 protocol） |
 | `deepseek` + V4 Flash/Pro 等原生模型 | **ResponsesNative** |
 | `deepseek` + 旧 chat 模型 id | **ChatCompletionsBridge** |
-| `kimi` / `minimax` / `opencode-go` | **ChatCompletionsBridge** |
+| `kimi` / `minimax`（独立供应商） | **ChatCompletionsBridge** |
+| `opencode-go` + `gpt-5.6-luna` | **ResponsesNative** → `/responses` |
+| `opencode-go` + MiniMax / Qwen | **AnthropicMessagesBridge** → `/messages` |
+| `opencode-go` + 其它模型（含 Go 上的 DeepSeek/Grok/Kimi…） | **ChatCompletionsBridge** → `/chat/completions` |
 | `custom` 且 protocol 含 `response` | **ResponsesNative** |
 | `custom` 其它 / protocol 含 `chat` / 默认 | **ChatCompletionsBridge** |
+
+OpenCode Go 模型分流实现：`opencode_go::wire_protocol_for_model`。
 
 ### 2.2 请求入口公共步骤
 
@@ -68,6 +73,7 @@ Codex App  ──POST /v1/responses──►  Spur 本地代理
    - 例外：OpenAI + 用户开启 cloud compact → 透传官方密文 compact。
 4. 按车道：
    - Chat 桥 → `forward_chat_compatible`；
+   - Anthropic 桥 → `forward_anthropic_messages_compatible`；
    - 否则 → `map_reasoning` + `sanitize_responses_request_for_upstream` + `forward_responses_compatible`。
 5. 媒体：部分 kind 剥离图片。
 
@@ -198,7 +204,7 @@ message | function_call | function_call_output
 
 ## 5. 车道 C：Chat Completions Bridge（Responses → Chat → Responses）
 
-**适用**：Kimi、MiniMax、OpenCode Go、多数 custom、旧 DeepSeek chat。
+**适用**：Kimi、独立 MiniMax、OpenCode Go 的 Chat 族模型、多数 custom、旧 DeepSeek chat。
 
 参考行为：CC Switch `openai_chat` / Nice Switch transform，**独立实现**（不拷 LGPL/源码）。
 
@@ -362,8 +368,10 @@ Codex App 同线程切换模型会 **整段重放 input[]**。已知失败：
 | DeepSeek Flash/Pro | Native | /responses | 是 | 是 | 是 | 类官方 DS 脚本 |
 | DeepSeek 旧 chat | Chat 桥 | /chat/completions | nested function | 桥内 map | 是 | |
 | Kimi | Chat 桥 | /chat/completions | nested function | 桥内 map | 是 | system collapse |
-| MiniMax | Chat 桥 | /chat/completions | nested function | 桥内 map | 是 | 官方亦有 Responses；Spur 仍硬编码桥 |
-| OpenCode Go | Chat 桥 | /chat/completions | nested function | 桥内 map | 是 | |
+| MiniMax | Chat 桥 | /chat/completions | nested function | 桥内 map | 是 | 独立 MiniMax API；官方亦有 Responses；Spur 仍硬编码桥 |
+| OpenCode Go（默认） | Chat 桥 | /chat/completions | nested function | 桥内 map | 是 | Grok/GLM/Kimi/DeepSeek/MiMo/Hy3 |
+| OpenCode Go Luna | Native | /responses | 是 | 否（keep freeform） | 是 | `gpt-5.6-luna` |
+| OpenCode Go MiniMax/Qwen | Anthropic 桥 | /messages | input_schema tools | 桥内 map | 是 | Bearer + x-api-key |
 | custom + Responses | Native | /responses | 是 | 是 | 是 | |
 | custom 默认 | Chat 桥 | /chat/completions | nested function | 桥内 map | 是 | |
 
@@ -373,10 +381,12 @@ Codex App 同线程切换模型会 **整段重放 input[]**。已知失败：
 
 | 主题 | 位置 |
 |------|------|
-| 三车道枚举与路由 | `src-tauri/src/providers.rs` → `UpstreamProtocolLane`, `upstream_protocol_lane` |
-| 请求分发 | `src-tauri/src/proxy.rs` → responses handler 内 compact / chat / responses 分支 |
+| 车道枚举与路由 | `src-tauri/src/providers.rs` → `UpstreamProtocolLane`, `upstream_protocol_lane` |
+| OpenCode Go 模型分流 | `src-tauri/src/opencode_go.rs` → `wire_protocol_for_model` |
+| 请求分发 | `src-tauri/src/proxy.rs` → responses handler 内 compact / chat / anthropic / responses 分支 |
 | Responses 转发 | `forward_responses_compatible` |
 | Chat 桥转发 | `forward_chat_compatible`, `responses_to_chat_completions` |
+| Anthropic 桥转发 | `forward_anthropic_messages_compatible`, `responses_to_anthropic_messages` |
 | tools port | `port_codex_tools`, `sanitize_responses_tools_for_upstream`, `responses_tools_to_chat_tools` |
 | input sanitize (non-OpenAI) | `sanitize_responses_input_for_upstream` |
 | input sanitize (OpenAI) | `sanitize_openai_responses_input` |

@@ -43,6 +43,7 @@ Plus: **local-only encrypted credential store**, opaque stable route slugs (no a
 - **Primary runtime consumer:** Codex App / ChatGPT Desktop GUI (`model_provider = "codex_select"`, localhost proxy, catalog slugs). Session truth often lives in Codex rollouts (`~/.codex/sessions/**`, `state_5.sqlite`), not only terminal logs.
 - **Operator rituals:** add provider instance → fetch models → Models page enable (Codex and/or 反代) → Overview **Review & Apply** → fully quit and reopen Codex when required.
 - **Models page scopes:** two peer destinations — **Codex** (catalog publish into official picker) and **反代** (Responses transit). Selection state is independent per scope.
+- **Per-model publish metadata:** each route may override **display name** and **context window** (defaults = official heuristics / `供应商 · 模型`). One override covers both Codex catalog and Z Code projection; disk write still requires **Review & Apply**. Z Code only receives `relay_enabled` routes.
 - **Menu bar / tray:** proxy status and keep-alive while main window is closed.
 - **Codex paths:** macOS `~/.codex`; Windows `%USERPROFILE%\.codex`. App data: macOS `~/Library/Application Support/com.codexspur.desktop/`; Windows `%APPDATA%\com.codexspur.desktop\`.
 - **Secondary surface:** marketing/docs site under `website/` and bilingual READMEs — not the operator’s primary work surface.
@@ -57,7 +58,7 @@ Plus: **local-only encrypted credential store**, opaque stable route slugs (no a
 - Pool vs Fixed routing for multi-account OpenAI; affinity and load-aware selection with lease release on cancel/error/complete.
 - Eight-level reasoning map per route (`none` … `ultra`) with truthful clamps.
 - OpenAI quota windows by `limit_window_seconds` (5h / 7d); reset-credit with confirmation, idempotency, audit.
-- API 反代: separate process surface, client keys, optional model allowlists, optional LAN bind.
+- API 反代: separate process surface; defaults to on at app launch (`relay.desired_running`, explicit Stop remembers off); client keys; model enablement on Models page; optional LAN bind.
 - Apply flow: preview/diff, advisory lock, backup, atomic write, journal/recover; never empty TOML fallback on parse failure.
 
 **Hard constraints (product law):**
@@ -78,8 +79,9 @@ Plus: **local-only encrypted credential store**, opaque stable route slugs (no a
 | Codex scope | Publish route into Codex native model picker via catalog + `codex_select` |
 | 反代 / API relay | Expose route as local OpenAI Responses transit for third-party clients |
 | Provider instance | User-facing configured provider row (CC Switch–style) |
-| Review & Apply | Explicit, previewed write of Codex config + catalog |
+| Review & Apply | Explicit, previewed write of Codex config + catalog; also projects relay-enabled models into Z Code |
 | spur-route / route slug | Stable opaque model id shown to Codex / clients |
+| Display / context override | Optional per-route published label and context tokens; null restores official defaults |
 
 **Open / not claimed:** commercial SLAs, multi-user cloud sync, signed notarization as always-on default for public DMG (releases may be ad-hoc / unnotarized — operational fact for install UX, not a design aesthetic).
 

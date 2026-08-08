@@ -4,12 +4,26 @@ All notable changes to Codex Spur are documented in this file.
 
 ## [Unreleased]
 
-## [0.1.14] - 2026-08-04
+## [0.1.14] - 2026-08-09
+
+### Features
+
+- **模型显示名 / 上下文长度可覆盖**: 模型页点击行展开设置，可改发布显示名与上下文 tokens（默认官方启发式：`供应商 · 模型`、OpenAI 272k / DeepSeek 1M / Kimi 分模型 / xAI 分档 / 其它 128k）。一套覆盖同时影响 Codex catalog 与 Z Code；落盘仍走 **Review & Apply**。Z Code 上下文默认与 Codex 对齐。迁移 `0012_model_route_overrides.sql`；重新拉取模型不丢 override。
+
+### Changed
+
+- **反代页双区切换 + 默认开启**: 侧栏「反代」顶部用与模型页同款大卡片切换 **基础信息**（启停 / Base URL / 可反代模型 / 接入说明）与 **API Key**；默认落在基础信息。应用启动时 API 反代默认拉起（`relay.desired_running` 缺省 true）；用户显式停止后跨重启保持关闭。接入说明收进基础信息面板，去掉右下角 FAB。
+- **Review & Apply 一并同步 Z Code**: 顶部「Review & Apply」写入 Codex 后，自动把反代已开启的模型投影到 Z Code（`codex-spur-responses` / 已有 SPUR 供应商）。反代页去掉「同步到 Z Code」按钮；Z Code 未配置或写入失败时 soft-fail，不回滚 Codex。
 
 ### Fixed
 
-- **Z Code 同步自动创建/复用 SPUR 供应商**: 「同步到 Z Code」不再硬依赖固定 provider id。会复用已有 UUID / 本地 `17862` 反代供应商，显示名统一为 **SPUR**；没有则新建。Grok 4.5 写入 `low / medium / high` Thought Level 与 `reasoningEffort` patch。
+- **Z Code 同步自动创建/复用 SPUR 供应商**: 同步不再硬依赖固定 provider id。会复用已有 UUID / 本地 `17862` 反代供应商，显示名统一为 **SPUR**；没有则新建。Grok 4.5 写入 `low / medium / high` Thought Level 与 `reasoningEffort` patch。
 - **Z Code 仅同步反代已开启模型**: 与 Codex picker 解耦；关闭反代后再同步会清理旧条目，避免 stale 模型。
+- **OpenCode Go 三协议按模型分流**: 官方 Go 网关在同一 Base URL 上混用三种协议。Spur 不再把全部 `opencode-go` 模型硬编码到 Chat Completions 桥；按上游 model id 路由：
+  - **Chat Completions**（默认）— Grok / GLM / Kimi / DeepSeek / MiMo / Hy3 等 → `/chat/completions`
+  - **Responses native** — `gpt-5.6-luna` → `/responses`
+  - **Anthropic Messages 桥** — MiniMax / Qwen → `/messages`（Bearer + `x-api-key` + `anthropic-version`）
+  - 注意：Go 上的 `deepseek-v4-flash` 仍走 Chat（与原生 `deepseek` kind 的 Responses 路径不同）。已有 OpenCode Go 实例无需迁移，请求时按模型自动分流。
 - **ChatGPT Official / API Key 对齐 CC Switch Responses 工具标准**: `kind=openai`（Official OAuth / 多账号 JSON 订阅 / API Key，入口无关）统一 **Responses** 车道、**不 port** Codex-native tools、catalog `apply_patch_tool_type=freeform`、**`supports_parallel_tool_calls=true`**（官方 `models_cache` / Nice Switch GPT 行）。function_call / custom_tool_call 历史原样保留。其余供应商仍按 CCS：ProxyChat freeform；NativeResponses（xAI / custom Responses）剥 freeform。
 - **会话策略驱动 OpenAI 全量工具广告**: **不中途换模型** 时，ChatGPT Official-class catalog 额外广告 `web_search_tool_type=text_and_image`、`supports_search_tool`、`tool_mode=code_mode_only`（贴近 CC Switch Official/API Key）。**允许中途换** 时保持多厂安全广告（无 web_search / code_mode）。切换策略会 rebuild catalog；需 Review & Apply 写入 Desktop。
 - **OpenAI 中转站 = Official 档**: 自定义供应商若推理模板为 **`openai_native`（OpenAI Codex 原生）** 或 **`openai_compat`（OpenAI 兼容）**（如橙子便宜），catalog + 代理按 ChatGPT Official 处理：freeform / parallel / sticky 全量工具；代理 **不 port** Codex-native tools（与 `kind=openai` 相同）。其它模板的 custom Responses 仍走 CCS NativeResponses。
@@ -26,7 +40,6 @@ All notable changes to Codex Spur are documented in this file.
 ### Packaging
 
 - macOS Apple Silicon DMG for **0.1.14**（ad-hoc signed, not notarized）。
-
 
 ## [0.1.13] - 2026-08-01
 
